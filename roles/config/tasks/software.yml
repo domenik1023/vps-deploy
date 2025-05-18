@@ -9,6 +9,7 @@
       - git
       - jq
       - net-tools
+      - nano
     state: present
     update_cache: true
 
