@@ -1,0 +1,7 @@
+- name: Basic VPS Hardening with SSH Key Only and Custom Port
+  hosts: all
+  become: true
+  tasks:
+    - name: Include Role
+      ansible.builtin.include_role:
+        name: config

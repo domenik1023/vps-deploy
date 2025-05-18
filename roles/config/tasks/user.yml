@@ -1,0 +1,19 @@
+- name: Set language to English
+  community.general.locale_gen:
+    name: "en_US.UTF-8"
+    state: present
+
+- name: Allow 'domenik1023' passwordless sudo
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/domenik1023
+    content: "domenik1023 ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+
+- name: Ensure user 'domenik1023' exists with custom password
+  ansible.builtin.user:
+    name: domenik1023
+    shell: /bin/bash
+    create_home: true
+    password: "$6$r24riXZ7oTkzTNbO$N/YYayK9aeRfK/fEmnw1UFGuoVSpF.8XeNwKACjDB12mzAnABqgH/vSC4K2cGJaPFSuUr6dpU4ya1e24cYBss/"

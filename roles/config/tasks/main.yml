@@ -1,0 +1,16 @@
+- name: Include Task User
+  ansible.builtin.include_tasks:
+    file: user.yml
+
+- name: Include Task Hardening
+  ansible.builtin.include_tasks:
+    file: hardening.yml
+
+- name: Include Task Software
+  ansible.builtin.include_tasks:
+    file: software.yml
+
+- name: Everything Done now Restarting SSH service
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted

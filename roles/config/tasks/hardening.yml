@@ -1,0 +1,85 @@
+- name: Update all packages
+  ansible.builtin.apt:
+    upgrade: dist
+    update_cache: true
+
+- name: Ensure UFW is installed
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+
+- name: Allow SSH port in UFW
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+
+- name: Allow custom SSH port in UFW
+  community.general.ufw:
+    rule: allow
+    port: "22822"
+    proto: tcp
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+
+- name: Make sure ssh.socket.d exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/ssh.socket.d/
+    state: directory
+    mode: "0755"
+
+- name: Set SSH port to 22822
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?Port "
+    line: "Port 22822 # Does not Work on Ubuntu Change the socket!"
+    state: present
+
+- name: Override ssh.socket to use port 22822
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssh.socket.d/override.conf
+    content: |
+      [Socket]
+      ListenStream=
+      ListenStream=22822
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Disable root login over SSH
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PermitRootLogin"
+    line: "PermitRootLogin no"
+    state: present
+
+- name: Disable password authentication
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PasswordAuthentication"
+    line: "PasswordAuthentication no"
+    state: present
+
+- name: Ensure PubkeyAuthentication is enabled
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PubkeyAuthentication"
+    line: "PubkeyAuthentication yes"
+    state: present
+
+- name: Lock the root account (no password, no login)
+  ansible.builtin.user:
+    name: root
+    password: "*"
+    shell: /usr/sbin/nologin
