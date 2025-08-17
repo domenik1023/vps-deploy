@@ -10,7 +10,9 @@
   ansible.builtin.include_tasks:
     file: software.yml
 
-- name: Everything Done now Restarting SSH service
+- name: Everything Done now Restarting SSH service # noqa []
   ansible.builtin.systemd:
     name: ssh
     state: restarted
+  register: restart_result
+  ignore_errors: true

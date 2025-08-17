@@ -29,29 +29,32 @@
     name: fail2ban
     state: present
 
-- name: Make sure ssh.socket.d exists
-  ansible.builtin.file:
-    path: /etc/systemd/system/ssh.socket.d/
-    state: directory
-    mode: "0755"
+- name: SSH Block
+  when: "'local' not in group_names"
+  block:
+    - name: Make sure ssh.socket.d exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/ssh.socket.d/
+        state: directory
+        mode: "0755"
 
-- name: Set SSH port to 22822
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?Port "
-    line: "Port 22822 # Does not Work on Ubuntu Change the socket!"
-    state: present
+    - name: Set SSH port to 22822
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?Port "
+        line: "Port 22822 # Does not Work on Ubuntu Change the socket!"
+        state: present
 
-- name: Override ssh.socket to use port 22822
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/ssh.socket.d/override.conf
-    content: |
-      [Socket]
-      ListenStream=
-      ListenStream=22822
-    owner: root
-    group: root
-    mode: "0644"
+    - name: Override ssh.socket to use port 22822
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ssh.socket.d/override.conf
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream=22822
+        owner: root
+        group: root
+        mode: "0644"
 
 - name: Reload systemd daemon
   ansible.builtin.systemd:
