@@ -1,14 +1,19 @@
+# --- Packages / updates ---
 - name: Update all packages
   ansible.builtin.apt:
     upgrade: dist
     update_cache: true
 
-- name: Ensure UFW is installed
+- name: Ensure base packages are installed
   ansible.builtin.apt:
-    name: ufw
+    name:
+      - openssh-server
+      - ufw
+      - fail2ban
     state: present
 
-- name: Allow SSH port in UFW
+# --- UFW ---
+- name: Allow SSH port in UFW (22 – temporary/backdoor)
   community.general.ufw:
     rule: allow
     port: "22"
@@ -24,65 +29,95 @@
   community.general.ufw:
     state: enabled
 
-- name: Install fail2ban
-  ansible.builtin.apt:
-    name: fail2ban
-    state: present
+# --- Fail2ban minimal jail for sshd on custom port ---
+- name: Configure fail2ban jail for sshd
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/sshd-local.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [sshd]
+      enabled   = true
+      port      = 22822
+      banaction = ufw
+      maxretry  = 5
+      findtime  = 10m
+      bantime   = 1h
+  register: f2b_jail
 
+# --- SSH Block ---
 - name: SSH Block
   when: "'local' not in group_names"
   block:
-    - name: Make sure ssh.socket.d exists
+    - name: Ensure sshd_config.d exists
       ansible.builtin.file:
-        path: /etc/systemd/system/ssh.socket.d/
+        path: /etc/ssh/sshd_config.d
         state: directory
         mode: "0755"
 
-    - name: Set SSH port to 22822
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: "^#?Port "
-        line: "Port 22822 # Does not Work on Ubuntu Change the socket!"
-        state: present
-
-    - name: Override ssh.socket to use port 22822
+    - name: Set SSH port via drop-in
       ansible.builtin.copy:
-        dest: /etc/systemd/system/ssh.socket.d/override.conf
-        content: |
-          [Socket]
-          ListenStream=
-          ListenStream=22822
+        dest: /etc/ssh/sshd_config.d/10-port.conf
         owner: root
         group: root
         mode: "0644"
+        content: |
+          Port 22822
+      register: ssh_port_conf
 
-- name: Reload systemd daemon
+    - name: Hardening options via drop-in
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/20-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          X11Forwarding no
+      register: ssh_hardening_conf
+
+    # Kill socket activation so sshd binds the port itself
+    - name: Disable and mask ssh.socket
+      ansible.builtin.systemd:
+        name: ssh.socket
+        state: stopped
+        enabled: false
+        masked: true
+        daemon_reload: true
+      register: ssh_socket_state
+      failed_when: false  # ok if the unit doesn't exist
+
+    - name: Validate sshd config (no output means OK)
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Ensure ssh service enabled and running
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+        daemon_reload: true
+      register: ssh_service_started
+
+    - name: Restart ssh if config changed
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_conf.changed or ssh_hardening_conf.changed
+
+# --- Apply service restarts for fail2ban if needed ---
+- name: Restart fail2ban if jail changed
   ansible.builtin.systemd:
-    daemon_reload: true
+    name: fail2ban
+    state: restarted
+  when: f2b_jail.changed
 
-- name: Disable root login over SSH
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PermitRootLogin"
-    line: "PermitRootLogin no"
-    state: present
-
-- name: Disable password authentication
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PasswordAuthentication"
-    line: "PasswordAuthentication no"
-    state: present
-
-- name: Ensure PubkeyAuthentication is enabled
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PubkeyAuthentication"
-    line: "PubkeyAuthentication yes"
-    state: present
-
+# --- Root lockdown (keep last; ensure you have another sudo user!) ---
 - name: Lock the root account (no password, no login)
   ansible.builtin.user:
     name: root
-    password: "*"
+    password: "!"        # locked
     shell: /usr/sbin/nologin
