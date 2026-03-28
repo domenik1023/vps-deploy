@@ -1,0 +1,13 @@
+# This file should be encrypted with ansible-vault:
+#   ansible-vault encrypt group_vars/all/vault.yml
+#
+# To edit after encryption:
+#   ansible-vault edit group_vars/all/vault.yml
+#
+# To run the playbook with vault:
+#   ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-vault-pass
+#
+# Generate a new sha512-crypt password hash with:
+#   python3 -c "from passlib.hash import sha512_crypt; print(sha512_crypt.hash('yourpassword'))"
+
+vault_admin_password: "REPLACE_WITH_SHA512_HASH"

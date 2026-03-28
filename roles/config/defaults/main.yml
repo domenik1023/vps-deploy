@@ -1,0 +1,19 @@
+# --- User ---
+admin_user: domenik1023
+# admin_password must be defined in group_vars/all/vault.yml (ansible-vault encrypted)
+# Set it as: vault_admin_password: "<sha512-crypt hash>"
+admin_password: "{{ vault_admin_password }}"
+
+# --- SSH ---
+ssh_port: 22822
+# ssh_old_port is the standard port opened during initial bootstrap.
+# It is explicitly denied by hardening tasks once the custom port is confirmed.
+ssh_old_port: 22
+
+# --- Fail2ban ---
+fail2ban_maxretry: 5
+fail2ban_findtime: 10m
+fail2ban_bantime: 1h
+
+# --- Docker ---
+docker_data_dir: /mnt/docker

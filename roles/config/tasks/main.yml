@@ -1,18 +1,15 @@
-- name: Include Task User
+- name: Include user tasks
   ansible.builtin.include_tasks:
     file: user.yml
 
-- name: Include Task Hardening
+- name: Include hardening tasks
   ansible.builtin.include_tasks:
     file: hardening.yml
 
-- name: Include Task Software
+- name: Include sysctl kernel hardening tasks
+  ansible.builtin.include_tasks:
+    file: sysctl.yml
+
+- name: Include software tasks
   ansible.builtin.include_tasks:
     file: software.yml
-
-- name: Everything Done now Restarting SSH service # noqa []
-  ansible.builtin.systemd:
-    name: ssh
-    state: restarted
-  register: restart_result
-  ignore_errors: true
