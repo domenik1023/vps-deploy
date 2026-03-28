@@ -13,23 +13,26 @@
     state: present
 
 # --- UFW ---
-- name: Allow SSH port in UFW (22 – temporary/backdoor)
+# Rate-limit the custom SSH port (blocks IPs exceeding 6 connections/30s at the kernel level)
+- name: Rate-limit custom SSH port in UFW
   community.general.ufw:
-    rule: allow
-    port: "22"
-    proto: tcp
-
-- name: Allow custom SSH port in UFW
-  community.general.ufw:
-    rule: allow
-    port: "22822"
+    rule: limit
+    port: "{{ ssh_port }}"
     proto: tcp
 
 - name: Enable UFW
   community.general.ufw:
     state: enabled
 
-# --- Fail2ban minimal jail for sshd on custom port ---
+# Close the standard SSH port once the firewall is active.
+# This runs on every play and is idempotent (deleting a non-existent rule is a no-op).
+- name: Deny standard SSH port (port 22)
+  community.general.ufw:
+    rule: deny
+    port: "{{ ssh_old_port }}"
+    proto: tcp
+
+# --- Fail2ban jail for sshd on custom port ---
 - name: Configure fail2ban jail for sshd
   ansible.builtin.copy:
     dest: /etc/fail2ban/jail.d/sshd-local.conf
@@ -39,15 +42,15 @@
     content: |
       [sshd]
       enabled   = true
-      port      = 22822
+      port      = {{ ssh_port }}
       banaction = ufw
-      maxretry  = 5
-      findtime  = 10m
-      bantime   = 1h
+      maxretry  = {{ fail2ban_maxretry }}
+      findtime  = {{ fail2ban_findtime }}
+      bantime   = {{ fail2ban_bantime }}
   register: f2b_jail
 
-# --- SSH Block ---
-- name: SSH Block
+# --- SSH hardening (skipped for local test hosts to prevent lockout) ---
+- name: SSH hardening block
   when: "'local' not in group_names"
   block:
     - name: Ensure sshd_config.d exists
@@ -63,7 +66,7 @@
         group: root
         mode: "0644"
         content: |
-          Port 22822
+          Port {{ ssh_port }}
       register: ssh_port_conf
 
     - name: Hardening options via drop-in
@@ -77,6 +80,11 @@
           PasswordAuthentication no
           PubkeyAuthentication yes
           X11Forwarding no
+          AllowUsers {{ admin_user }}
+          MaxAuthTries 3
+          LoginGraceTime 30
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
       register: ssh_hardening_conf
 
     # Kill socket activation so sshd binds the port itself
@@ -87,20 +95,18 @@
         enabled: false
         masked: true
         daemon_reload: true
-      register: ssh_socket_state
       failed_when: false  # ok if the unit doesn't exist
 
-    - name: Validate sshd config (no output means OK)
+    - name: Validate sshd config
       ansible.builtin.command: sshd -t
       changed_when: false
 
-    - name: Ensure ssh service enabled and running
+    - name: Ensure ssh service is enabled and running
       ansible.builtin.systemd:
         name: ssh
         enabled: true
         state: started
         daemon_reload: true
-      register: ssh_service_started
 
     - name: Restart ssh if config changed
       ansible.builtin.systemd:
@@ -108,16 +114,16 @@
         state: restarted
       when: ssh_port_conf.changed or ssh_hardening_conf.changed
 
-# --- Apply service restarts for fail2ban if needed ---
+# --- Fail2ban restart if jail changed ---
 - name: Restart fail2ban if jail changed
   ansible.builtin.systemd:
     name: fail2ban
     state: restarted
   when: f2b_jail.changed
 
-# --- Root lockdown (keep last; ensure you have another sudo user!) ---
+# --- Root lockdown (keep last; ensure admin user has sudo before this runs) ---
 - name: Lock the root account (no password, no login)
   ansible.builtin.user:
     name: root
-    password: "!"        # locked
+    password: "!"
     shell: /usr/sbin/nologin

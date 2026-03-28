@@ -3,17 +3,18 @@
     name: "en_US.UTF-8"
     state: present
 
-- name: Allow 'domenik1023' passwordless sudo
+- name: Allow admin user passwordless sudo
   ansible.builtin.copy:
-    dest: /etc/sudoers.d/domenik1023
-    content: "domenik1023 ALL=(ALL) NOPASSWD:ALL\n"
+    dest: "/etc/sudoers.d/{{ admin_user }}"
+    content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
     owner: root
     group: root
     mode: "0440"
+    validate: "visudo -cf %s"
 
-- name: Ensure user 'domenik1023' exists with custom password
+- name: Ensure admin user exists
   ansible.builtin.user:
-    name: domenik1023
+    name: "{{ admin_user }}"
     shell: /bin/bash
     create_home: true
-    password: "$6$r24riXZ7oTkzTNbO$N/YYayK9aeRfK/fEmnw1UFGuoVSpF.8XeNwKACjDB12mzAnABqgH/vSC4K2cGJaPFSuUr6dpU4ya1e24cYBss/"
+    password: "{{ admin_password }}"

@@ -1,6 +1,6 @@
 # --- SYSTEM PREPARATION & UPDATES ---
 
-- name: Install Essential Software and Maintenance Tools
+- name: Install essential software and maintenance tools
   ansible.builtin.apt:
     name:
       - apt-transport-https
@@ -14,11 +14,12 @@
       - nano
       - unattended-upgrades  # Enables automated security updates
       - apt-listchanges      # Logs changes for automated updates
+      - chrony               # NTP time synchronisation
     state: present
     update_cache: true
 
 # 20auto-upgrades is the standard file to toggle the periodic update timer
-- name: Configure Auto-Updates (Daily)
+- name: Configure auto-updates (daily)
   ansible.builtin.copy:
     dest: /etc/apt/apt.conf.d/20auto-upgrades
     content: |
@@ -27,11 +28,19 @@
       APT::Periodic::AutocleanInterval "7";
     owner: root
     group: root
-    mode: '0644'
+    mode: "0644"
+
+# --- NTP ---
+
+- name: Ensure chrony is enabled and running
+  ansible.builtin.service:
+    name: chronyd
+    enabled: true
+    state: started
 
 # --- DOCKER CLEANUP & INSTALLATION ---
 
-# Removes old or default distro versions of Docker to avoid binary conflicts
+# Removes old or distro-packaged versions of Docker to avoid binary conflicts
 - name: Remove conflicting container packages
   ansible.builtin.apt:
     name:
@@ -62,7 +71,7 @@
   ansible.builtin.apt:
     update_cache: true
 
-- name: Install Official Docker Engine packages
+- name: Install official Docker engine packages
   ansible.builtin.apt:
     name:
       - docker-ce
@@ -72,6 +81,30 @@
       - docker-compose-plugin
     state: present
 
+# --- DOCKER SECURITY CONFIGURATION ---
+
+# Enables live-restore (containers keep running on daemon restart),
+# enforces log rotation, and enables user namespace remapping for isolation.
+- name: Configure Docker daemon security options
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {
+        "live-restore": true,
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        },
+        "userns-remap": "default",
+        "no-new-privileges": true
+      }
+  register: docker_daemon_conf
+  notify: Restart Docker
+
 # --- POST-INSTALLATION CONFIGURATION ---
 
 - name: Ensure Docker service is enabled and started
@@ -80,17 +113,17 @@
     enabled: true
     state: started
 
-# Allows the user to run docker commands without 'sudo'
-- name: Add user 'domenik1023' to docker group
+# Allows the admin user to run docker commands without sudo
+- name: Add admin user to docker group
   ansible.builtin.user:
-    name: domenik1023
+    name: "{{ admin_user }}"
     groups: docker
     append: true
 
-# Standardizing a mount point for Docker volumes/data
-- name: Create persistent Docker directory
+# Standardised mount point for Docker volumes / persistent data
+- name: Create persistent Docker data directory
   ansible.builtin.file:
-    path: /mnt/docker
+    path: "{{ docker_data_dir }}"
     state: directory
     owner: root
     group: root

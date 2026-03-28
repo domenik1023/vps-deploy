@@ -1,0 +1,48 @@
+# Kernel hardening via sysctl.
+# Parameters are written to a drop-in file and applied with sysctl --system.
+
+- name: Write kernel hardening sysctl config
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # --- Network: spoofing / source routing protection ---
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+
+      # --- SYN flood protection ---
+      net.ipv4.tcp_syncookies = 1
+
+      # --- ICMP hardening ---
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+      net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+      # --- Redirect protection ---
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+
+      # --- Log suspicious packets ---
+      net.ipv4.conf.all.log_martians = 1
+      net.ipv4.conf.default.log_martians = 1
+
+      # --- Address space layout randomization ---
+      kernel.randomize_va_space = 2
+
+      # --- Restrict kernel pointer exposure ---
+      kernel.kptr_restrict = 1
+
+      # --- Restrict dmesg to root ---
+      kernel.dmesg_restrict = 1
+  register: sysctl_conf
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  when: sysctl_conf.changed
+  changed_when: true
