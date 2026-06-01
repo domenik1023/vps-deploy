@@ -13,6 +13,20 @@
     state: present
 
 # --- UFW ---
+# Open the port the active Ansible SSH session is using BEFORE enabling UFW.
+# Without this, `ufw enable` activates default-deny incoming and instantly
+# drops the live session, leaving the host unreachable mid-play.
+#
+# Use `allow` (not `limit`) — UFW's limit rule rejects with
+# icmp-port-unreachable once >6 new connections hit in 30s, which Ansible
+# trips easily by reconnecting per task. The new ssh_port still gets
+# `limit` below for production protection.
+- name: Allow current SSH port in UFW (bootstrap, prevents lockout)
+  community.general.ufw:
+    rule: allow
+    port: "{{ ansible_port | default(22) }}"
+    proto: tcp
+
 # Rate-limit the custom SSH port (blocks IPs exceeding 6 connections/30s at the kernel level)
 - name: Rate-limit custom SSH port in UFW
   community.general.ufw:
@@ -23,14 +37,6 @@
 - name: Enable UFW
   community.general.ufw:
     state: enabled
-
-# Close the standard SSH port once the firewall is active.
-# This runs on every play and is idempotent (deleting a non-existent rule is a no-op).
-- name: Deny standard SSH port (port 22)
-  community.general.ufw:
-    rule: deny
-    port: "{{ ssh_old_port }}"
-    proto: tcp
 
 # --- Fail2ban jail for sshd on custom port ---
 - name: Configure fail2ban jail for sshd
@@ -113,6 +119,19 @@
         name: ssh
         state: restarted
       when: ssh_port_conf.changed or ssh_hardening_conf.changed
+      register: ssh_restarted
+
+    # After sshd moves to the new port, subsequent tasks must reconnect there.
+    - name: Switch ansible_port to the new SSH port for the rest of the play
+      ansible.builtin.set_fact:
+        ansible_port: "{{ ssh_port }}"
+      when: ssh_restarted is changed
+
+    - name: Wait for sshd on the new port
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 30
+      when: ssh_restarted is changed
 
 # --- Fail2ban restart if jail changed ---
 - name: Restart fail2ban if jail changed
@@ -120,6 +139,30 @@
     name: fail2ban
     state: restarted
   when: f2b_jail.changed
+
+# Lock down the old SSH port now that sshd has moved to {{ ssh_port }}.
+# Skipped for local hosts because the hardening block above didn't move sshd,
+# so denying port 22 would lock us out.
+- name: Tighten UFW on old SSH port
+  when:
+    - "'local' not in group_names"
+    - ssh_old_port != ssh_port
+  block:
+    # Remove the bootstrap allow before adding the deny — UFW evaluates
+    # rules in order and "first match wins", so a leftover allow would
+    # shadow the deny.
+    - name: Remove bootstrap allow rule for old SSH port
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_old_port }}"
+        proto: tcp
+        delete: true
+
+    - name: Deny standard SSH port (port 22)
+      community.general.ufw:
+        rule: deny
+        port: "{{ ssh_old_port }}"
+        proto: tcp
 
 # --- Root lockdown (keep last; ensure admin user has sudo before this runs) ---
 - name: Lock the root account (no password, no login)
