@@ -39,13 +39,13 @@ vps-deploy/
 
 ## Prerequisites
 
-1. Target host is running Ubuntu (tested on 22.04/24.04)
+1. Target host is running Ubuntu (tested on 22.04/24.04/26.04)
 2. SSH access as root (or a user with sudo) is available on port 22 for the initial run
 3. Your public key is present in `~/.ssh/domenik1023.pub` (or adjust the private key path below)
 4. Python 3 is installed on the target host
 5. Ansible collections installed locally:
    ```bash
-   ansible-galaxy collection install community.general ansible.posix
+   ansible-galaxy collection install -r requirements.yml
    ```
 
 ## Secrets Setup (Ansible Vault)
