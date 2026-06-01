@@ -16,9 +16,14 @@
 # Open the port the active Ansible SSH session is using BEFORE enabling UFW.
 # Without this, `ufw enable` activates default-deny incoming and instantly
 # drops the live session, leaving the host unreachable mid-play.
+#
+# Use `allow` (not `limit`) — UFW's limit rule rejects with
+# icmp-port-unreachable once >6 new connections hit in 30s, which Ansible
+# trips easily by reconnecting per task. The new ssh_port still gets
+# `limit` below for production protection.
 - name: Allow current SSH port in UFW (bootstrap, prevents lockout)
   community.general.ufw:
-    rule: limit
+    rule: allow
     port: "{{ ansible_port | default(22) }}"
     proto: tcp
 
@@ -148,7 +153,7 @@
     # shadow the deny.
     - name: Remove bootstrap allow rule for old SSH port
       community.general.ufw:
-        rule: limit
+        rule: allow
         port: "{{ ssh_old_port }}"
         proto: tcp
         delete: true
