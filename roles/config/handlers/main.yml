@@ -2,3 +2,13 @@
   ansible.builtin.service:
     name: docker
     state: restarted
+
+- name: Restart CrowdSec
+  ansible.builtin.service:
+    name: crowdsec
+    state: restarted
+
+- name: Restart CrowdSec bouncer
+  ansible.builtin.service:
+    name: "{{ crowdsec_firewall_bouncer }}"
+    state: restarted

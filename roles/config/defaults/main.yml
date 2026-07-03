@@ -17,3 +17,22 @@ fail2ban_bantime: 1h
 
 # --- Docker ---
 docker_data_dir: /mnt/docker
+
+# --- CrowdSec ---
+# Collections to install (parsers + scenarios); crowdsecurity/linux bundles sshd.
+crowdsec_collections:
+  - crowdsecurity/linux
+# UFW on Ubuntu drives netfilter via iptables-nft, so the iptables bouncer
+# variant is the right fit. Switch to crowdsec-firewall-bouncer-nftables for
+# pure-nftables setups.
+crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-iptables
+
+# Central LAPI server this agent reports to. Machine credentials and the
+# bouncer API key must be pre-created on that server:
+#   cscli machines add <login> --password '<password>'
+#   cscli bouncers add <name>
+crowdsec_lapi_url: "https://lapi.example.com:8080"
+crowdsec_lapi_login: "{{ inventory_hostname }}"
+# Secrets live in group_vars/all/vault.yml (ansible-vault encrypted)
+crowdsec_lapi_password: "{{ vault_crowdsec_lapi_password }}"
+crowdsec_bouncer_api_key: "{{ vault_crowdsec_bouncer_api_key }}"
