@@ -1,0 +1,132 @@
+# --- CROWDSEC INSTALLATION (agent-only, central LAPI) ---
+# This host runs CrowdSec as a log processor only. Alerts are pushed to the
+# central LAPI server ({{ crowdsec_lapi_url }}) and the firewall bouncer pulls
+# its ban decisions from there, so bans propagate across all machines.
+#
+# Prerequisites on the LAPI server (once per host):
+#   cscli machines add <login> --password '<password>'
+#   cscli bouncers add <host>-firewall-bouncer   -> yields the bouncer API key
+#
+# Uses the official CrowdSec packagecloud repository (distro packages are
+# outdated) with the signed-by keyring pattern, same as the Docker repo.
+
+- name: Ensure /etc/apt/keyrings exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download CrowdSec GPG key
+  ansible.builtin.get_url:
+    url: https://packagecloud.io/crowdsec/crowdsec/gpgkey
+    dest: /etc/apt/keyrings/crowdsec.asc
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: Add CrowdSec APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/crowdsec.asc] https://packagecloud.io/crowdsec/crowdsec/ubuntu {{ ansible_distribution_release }} main"
+    state: present
+    filename: crowdsec
+
+- name: Install CrowdSec agent
+  ansible.builtin.apt:
+    name: crowdsec
+    state: present
+    update_cache: true
+
+- name: Install CrowdSec firewall bouncer
+  ansible.builtin.apt:
+    name: "{{ crowdsec_firewall_bouncer }}"
+    state: present
+
+# --- CENTRAL LAPI WIRING ---
+# config.yaml.local overlays config.yaml, so package upgrades never revert
+# this. Disabling the API server turns the local daemon into a pure agent;
+# CAPI signal push is handled by the central LAPI server.
+- name: Disable local API server (agent-only mode)
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/config.yaml.local
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      api:
+        server:
+          enable: false
+  notify: Restart CrowdSec
+
+- name: Point agent at the central LAPI server
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/local_api_credentials.yaml
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      url: {{ crowdsec_lapi_url }}
+      login: {{ crowdsec_lapi_login }}
+      password: {{ crowdsec_lapi_password }}
+  no_log: true
+  notify: Restart CrowdSec
+
+# The bouncer package auto-registers against a local LAPI, which doesn't
+# exist here. The .local overlay redirects it to the central LAPI with a
+# key pre-created there via `cscli bouncers add`.
+- name: Point firewall bouncer at the central LAPI server
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      api_url: {{ crowdsec_lapi_url }}
+      api_key: {{ crowdsec_bouncer_api_key }}
+  no_log: true
+  notify: Restart CrowdSec bouncer
+
+# --- ACQUISITION ---
+# Minimal Ubuntu images may not ship rsyslog, so /var/log/auth.log can be
+# missing. Read sshd authentication events straight from the journal to be
+# independent of rsyslog.
+- name: Configure journald acquisition for sshd
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/acquis.d/sshd-journald.yaml
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      source: journalctl
+      journalctl_filter:
+        - "_SYSTEMD_UNIT=ssh.service"
+      labels:
+        type: syslog
+  notify: Restart CrowdSec
+
+# --- COLLECTIONS ---
+# Parsers/scenarios run on the agent, so collections are installed locally
+# even in central-LAPI mode. crowdsecurity/linux bundles sshd + syslog.
+# An installed collection materialises as /etc/crowdsec/collections/<name>.yaml,
+# which serves as the idempotency guard here.
+- name: Install CrowdSec collections
+  ansible.builtin.command: "cscli collections install {{ item }}"
+  args:
+    creates: "/etc/crowdsec/collections/{{ item | basename }}.yaml"
+  loop: "{{ crowdsec_collections }}"
+  notify: Restart CrowdSec
+
+# --- SERVICES ---
+- name: Ensure CrowdSec service is enabled and running
+  ansible.builtin.service:
+    name: crowdsec
+    enabled: true
+    state: started
+
+- name: Ensure CrowdSec firewall bouncer is enabled and running
+  ansible.builtin.service:
+    name: "{{ crowdsec_firewall_bouncer }}"
+    enabled: true
+    state: started

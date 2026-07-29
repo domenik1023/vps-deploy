@@ -11,3 +11,11 @@
 #   python3 -c "from passlib.hash import sha512_crypt; print(sha512_crypt.hash('yourpassword'))"
 
 vault_admin_password: "REPLACE_WITH_SHA512_HASH"
+
+# CrowdSec central LAPI credentials.
+# Create on the LAPI server with:
+#   cscli machines add <login> --password '<password>'
+vault_crowdsec_lapi_password: "REPLACE_WITH_LAPI_MACHINE_PASSWORD"
+# Create on the LAPI server with:
+#   cscli bouncers add <host>-firewall-bouncer
+vault_crowdsec_bouncer_api_key: "REPLACE_WITH_BOUNCER_API_KEY"

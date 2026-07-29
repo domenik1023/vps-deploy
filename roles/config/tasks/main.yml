@@ -13,3 +13,7 @@
 - name: Include software tasks
   ansible.builtin.include_tasks:
     file: software.yml
+
+- name: Include CrowdSec tasks
+  ansible.builtin.include_tasks:
+    file: crowdsec.yml

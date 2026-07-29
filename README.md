@@ -7,6 +7,7 @@ Hardens a fresh Ubuntu VPS with:
 - SSH key-only authentication on a custom port (22822), with port 22 denied after hardening
 - UFW firewall with connection-rate limiting on the SSH port
 - Fail2ban intrusion detection (bans after 5 failed attempts)
+- CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
 - Docker Engine with security daemon config (log rotation, live-restore, user namespace remap)
@@ -34,7 +35,8 @@ vps-deploy/
             ├── user.yml              # Admin user + sudo setup
             ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
             ├── sysctl.yml            # Kernel parameter hardening
-            └── software.yml          # Docker, NTP, auto-updates
+            ├── software.yml          # Docker, NTP, auto-updates
+            └── crowdsec.yml          # CrowdSec agent + firewall bouncer
 ```
 
 ## Prerequisites
@@ -82,6 +84,12 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `docker_data_dir` | `/mnt/docker` | Mount point for Docker volumes |
+| `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
+| `crowdsec_firewall_bouncer` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
+| `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
+| `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
+| `crowdsec_lapi_password` | `{{ vault_crowdsec_lapi_password }}` | Machine password (from vault) |
+| `crowdsec_bouncer_api_key` | `{{ vault_crowdsec_bouncer_api_key }}` | Bouncer API key (from vault) |
 
 ## Usage
 
@@ -116,4 +124,11 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
 ## Notes
 
 - The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing
+- CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
+- CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. Before the first run, provision credentials **on the LAPI server**:
+  ```bash
+  cscli machines add <inventory_hostname> --password '<password>'   # -> vault_crowdsec_lapi_password
+  cscli bouncers add <host>-firewall-bouncer                        # -> vault_crowdsec_bouncer_api_key
+  ```
+  CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
 - `host_key_checking` is disabled in `ansible.cfg` for the initial connection; use `ssh-keyscan` to pre-populate `known_hosts` in production environments
