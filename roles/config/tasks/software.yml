@@ -106,25 +106,17 @@
 
 # --- DOCKER SECURITY CONFIGURATION ---
 
-# Enables live-restore (containers keep running on daemon restart),
-# enforces log rotation, and enables user namespace remapping for isolation.
+# Enables live-restore (containers keep running on daemon restart), enforces
+# log rotation and blocks privilege escalation inside containers. User
+# namespace remapping is opt-in via docker_userns_remap - see the comment on
+# that variable for why it is not on by default.
 - name: Configure Docker daemon security options
   ansible.builtin.copy:
     dest: /etc/docker/daemon.json
     owner: root
     group: root
     mode: "0644"
-    content: |
-      {
-        "live-restore": true,
-        "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "10m",
-          "max-file": "3"
-        },
-        "userns-remap": "default",
-        "no-new-privileges": true
-      }
+    content: "{{ (docker_daemon_options | combine({'userns-remap': docker_userns_remap}) if docker_userns_remap | length > 0 else docker_daemon_options) | to_nice_json }}\n"
   register: docker_daemon_conf
   notify: Restart Docker
 

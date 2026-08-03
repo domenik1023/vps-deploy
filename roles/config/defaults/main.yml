@@ -18,6 +18,27 @@ fail2ban_bantime: 1h
 # --- Docker ---
 docker_data_dir: /mnt/docker
 
+# Written to /etc/docker/daemon.json.
+docker_daemon_options:
+  live-restore: true
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: "3"
+  no-new-privileges: true
+
+# User namespace remapping maps container root to an unprivileged host UID,
+# which is good isolation but breaks any container that bind-mounts
+# /var/run/docker.sock - the socket is root:docker, and remapped root is
+# neither. Container managers run that way (Komodo Periphery, Portainer,
+# Watchtower, a Traefik docker provider), so it is off by default.
+#
+# It also moves the data root to /var/lib/docker/<subuid>.<subgid>/, so
+# toggling it hides every container, image and volume created under the other
+# setting. Set to "default" only on hosts that run no such container, and
+# expect to migrate their data.
+docker_userns_remap: ""
+
 # --- CrowdSec ---
 # Installed on internet-facing hosts only; the [local] group is skipped in
 # tasks/main.yml, same as the SSH hardening tasks.

@@ -10,7 +10,7 @@ Hardens a fresh Ubuntu VPS with:
 - CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
-- Docker Engine with security daemon config (log rotation, live-restore, user namespace remap)
+- Docker Engine with security daemon config (log rotation, live-restore, no-new-privileges; optional user namespace remap)
 - Chrony NTP for accurate system time
 - Daily unattended security upgrades
 
@@ -174,6 +174,8 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `docker_data_dir` | `/mnt/docker` | Mount point for Docker volumes |
+| `docker_daemon_options` | log rotation, live-restore, no-new-privileges | Contents of `/etc/docker/daemon.json` |
+| `docker_userns_remap` | `""` (off) | Set to `"default"` for user namespace remapping — see the note below |
 | `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
@@ -217,6 +219,15 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
 
 ## Notes
 
+- **Docker user namespace remapping is off by default.** It maps container root
+  to an unprivileged host UID, which breaks any container that bind-mounts
+  `/var/run/docker.sock` — the socket is `root:docker` and remapped root is
+  neither, so container managers (Komodo Periphery, Portainer, Watchtower, a
+  Traefik docker provider) fail with permission errors. It also relocates the
+  data root to `/var/lib/docker/<subuid>.<subgid>/`, so turning it on or off
+  hides every container, image and volume created under the other setting;
+  the old data is still on disk under the other path. Enable it per host with
+  `docker_userns_remap: "default"` only where nothing needs the socket.
 - The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing, and skips CrowdSec, which only belongs on internet-facing hosts
 - CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
 - CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
