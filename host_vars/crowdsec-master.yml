@@ -1,0 +1,12 @@
+# Central CrowdSec LAPI, running in Docker on the LAN.
+#
+# This host is never configured by the playbook - main.yml runs against
+# all:!lapi. It exists purely as the delegate_to target that mints agent
+# machine credentials and bouncer API keys, so it only needs to be reachable
+# over SSH with sudo rights (enough to run `docker exec`).
+#
+# The matching crowdsec_lapi_* settings live in the role defaults rather than
+# here, because they are read in the *agent's* variable scope while the task
+# delegates to this host.
+ansible_host: 192.168.2.2
+ansible_port: 22

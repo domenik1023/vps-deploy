@@ -38,7 +38,9 @@ crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
 # the bouncer API key are created there by running cscli over delegation, so
 # no CrowdSec secret is ever stored in the vault. Existing working credentials
 # are reused; they are only rotated when missing, stale or rejected.
-crowdsec_lapi_host: "192.168.2.2"
+# Inventory name, not an address: delegation resolves it through the inventory
+# so the host's own connection settings in host_vars apply.
+crowdsec_lapi_host: "crowdsec-master"
 # Set when the LAPI runs in a Docker container on that host: cscli is then
 # invoked inside the container instead of on the host itself.
 crowdsec_lapi_docker_container: "crowdsec-master-crowdsec-1"

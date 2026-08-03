@@ -19,11 +19,16 @@ Hardens a fresh Ubuntu VPS with:
 ```
 vps-deploy/
 ├── main.yml                          # Entry point
-├── inventory                         # Host definitions (vps / local groups)
+├── inventory                         # Host names, grouped (vps / local / lapi)
 ├── ansible.cfg                       # Ansible settings
 ├── group_vars/
 │   └── all/
 │       └── vault.yml                 # Encrypted secrets (ansible-vault)
+├── host_vars/
+│   ├── vps1.yml                      # Address, SSH port, per-host overrides
+│   ├── vps2.yml
+│   ├── testvm.yml
+│   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
     └── config/
         ├── defaults/
@@ -131,6 +136,30 @@ cannot do the job: it can register a machine (`POST /v1/watchers`) only when
 auto-registration is enabled on the server, and it has no endpoint at all for
 creating a bouncer — bouncer keys exist only in the LAPI database.
 
+## Inventory and Host Variables
+
+`inventory` lists host *names* and their groups; everything host-specific —
+address, SSH port, per-host overrides — lives in `host_vars/<name>.yml`:
+
+```ini
+[vps]
+vps1
+vps2
+```
+
+```yaml
+# host_vars/vps1.yml
+ansible_host: 195.128.100.90
+ansible_port: 22          # 22822 once hardening has run
+```
+
+Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
+derive from `inventory_hostname`, so the name is what the host registers as on
+the central LAPI — `vps1` and `vps1-firewall-bouncer` rather than a bare IP.
+Renaming a host that is already registered makes it register again under the
+new name; delete the leftovers on the master with `cscli machines delete` and
+`cscli bouncers delete`.
+
 ## Configuration
 
 All tunable values live in `roles/config/defaults/main.yml`:
@@ -177,7 +206,7 @@ ansible-playbook main.yml -i inventory \
   -u domenik1023
 ```
 
-Update the inventory `ansible_port` to `22822` for VPS hosts after the first run.
+Update `ansible_port` to `22822` in `host_vars/<name>.yml` for each VPS after its first run.
 
 ### Dry run (check mode)
 
