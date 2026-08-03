@@ -14,6 +14,10 @@
   ansible.builtin.include_tasks:
     file: software.yml
 
+# Skipped for local test hosts: they sit behind NAT, see none of the internet
+# noise CrowdSec exists to catch, and each one would still consume a machine
+# registration and a bouncer key on the central LAPI.
 - name: Include CrowdSec tasks
   ansible.builtin.include_tasks:
     file: crowdsec.yml
+  when: crowdsec_enabled | bool

@@ -19,6 +19,10 @@ fail2ban_bantime: 1h
 docker_data_dir: /mnt/docker
 
 # --- CrowdSec ---
+# Internet-facing hosts only. Local hosts are skipped by default, matching the
+# SSH hardening tasks; set to true per host or group to install it anyway.
+crowdsec_enabled: "{{ 'local' not in group_names }}"
+
 # Collections to install (parsers + scenarios); crowdsecurity/linux bundles sshd.
 crowdsec_collections:
   - crowdsecurity/linux
