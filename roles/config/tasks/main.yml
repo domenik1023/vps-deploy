@@ -20,4 +20,4 @@
 - name: Include CrowdSec tasks
   ansible.builtin.include_tasks:
     file: crowdsec.yml
-  when: crowdsec_enabled | bool
+  when: "'local' not in group_names"

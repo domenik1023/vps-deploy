@@ -73,12 +73,10 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
 
 ## CrowdSec Credentials
 
-CrowdSec is installed on internet-facing hosts only — `crowdsec_enabled`
-defaults to skipping the `[local]` group, the same way SSH hardening does.
-Local hosts sit behind NAT and see none of the traffic CrowdSec exists to
-catch, and each would still consume a machine registration and a bouncer key on
-the central LAPI. Set `crowdsec_enabled: true` on a host or group to install it
-there anyway, or `false` to skip an external host.
+CrowdSec is installed on internet-facing hosts only: the `[local]` group is
+skipped, the same way SSH hardening skips it. Local hosts sit behind NAT and
+see none of the traffic CrowdSec exists to catch, and each would still consume
+a machine registration and a bouncer key on the central LAPI.
 
 Each agent needs two secrets from the central LAPI server: a machine
 login/password and a firewall bouncer API key. There are two ways to get them.
@@ -161,7 +159,6 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `docker_data_dir` | `/mnt/docker` | Mount point for Docker volumes |
-| `crowdsec_enabled` | `{{ 'local' not in group_names }}` | Install CrowdSec — internet-facing hosts only by default |
 | `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
 | `crowdsec_firewall_bouncer` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
@@ -206,7 +203,7 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
 
 ## Notes
 
-- The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing, and skips CrowdSec (see `crowdsec_enabled`)
+- The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing, and skips CrowdSec, which only belongs on internet-facing hosts
 - CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
 - CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
 - `host_key_checking` is disabled in `ansible.cfg` for the initial connection; use `ssh-keyscan` to pre-populate `known_hosts` in production environments
