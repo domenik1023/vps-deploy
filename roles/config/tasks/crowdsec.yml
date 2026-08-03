@@ -97,6 +97,30 @@
   no_log: true
   notify: Restart CrowdSec
 
+# A chain the bouncer cannot find aborts its startup, and `-t` runs the same
+# initialisation, so the config test fails too and systemd never starts the
+# unit. Probe first and configure only what is actually there.
+- name: Check which IPv4-only bouncer chains exist on this host
+  ansible.builtin.command:
+    argv: [iptables, --numeric, --list, "{{ item }}"]
+  loop: "{{ crowdsec_bouncer_iptables_v4_chains }}"
+  register: crowdsec_v4_chain_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Keep only the IPv4 chains that exist
+  ansible.builtin.set_fact:
+    crowdsec_bouncer_v4_chains_present: "{{ crowdsec_v4_chain_probe.results | selectattr('rc', 'eq', 0) | map(attribute='item') | list }}"
+
+- name: Report IPv4 chains skipped because this host does not have them
+  ansible.builtin.debug:
+    msg: >-
+      Not enforcing CrowdSec bans in
+      {{ crowdsec_bouncer_iptables_v4_chains | difference(crowdsec_bouncer_v4_chains_present) | join(', ') }}
+      - absent on this host. Traffic through those chains stays unfiltered.
+  when: crowdsec_bouncer_v4_chains_present | length < crowdsec_bouncer_iptables_v4_chains | length
+
 # The bouncer package auto-registers against a local LAPI, which doesn't
 # exist here. The .local overlay redirects it to the central LAPI with a
 # key created there via `cscli bouncers add`.
@@ -106,7 +130,7 @@
     owner: root
     group: root
     mode: "0600"
-    content: "{{ {'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains} | to_nice_yaml }}"
+    content: "{{ {'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains, 'iptables_v4_chains': crowdsec_bouncer_v4_chains_present} | to_nice_yaml }}"
   no_log: true
   notify: Restart CrowdSec bouncer
 
@@ -120,7 +144,7 @@
     owner: root
     group: root
     mode: "0755"
-  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  when: "'DOCKER-USER' in crowdsec_bouncer_v4_chains_present"
 
 - name: Order the firewall bouncer after Docker
   ansible.builtin.copy:
@@ -132,7 +156,7 @@
       [Unit]
       After=docker.service
       Wants=docker.service
-  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  when: "'DOCKER-USER' in crowdsec_bouncer_v4_chains_present"
   notify:
     - Reload systemd
     - Restart CrowdSec bouncer

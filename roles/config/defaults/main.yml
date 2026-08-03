@@ -75,17 +75,24 @@ crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
 crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
 
-# Chains the firewall bouncer drops banned traffic in. The upstream default is
-# INPUT alone, which only covers services listening on the host - traffic
-# Docker forwards to a published container port never reaches it.
-#
-# DOCKER-USER is the hook Docker provides for exactly this and is traversed
-# before its own accept rules, so bans apply to containers reached from the
-# internet. Container-to-container traffic crosses that chain too, but only
-# ever with RFC1918 source addresses, which never appear in the ban list, so
-# internal traffic is unaffected in practice.
+# Chains the firewall bouncer drops banned traffic in. Anything listed here is
+# applied to iptables *and* ip6tables, so it must exist in both families.
 crowdsec_bouncer_iptables_chains:
   - INPUT
+
+# IPv4-only chains. The bouncer aborts at startup if a configured chain is
+# missing, and Docker only creates DOCKER-USER in ip6tables when IPv6 is
+# enabled for Docker, so it cannot go in the list above.
+#
+# DOCKER-USER itself is the hook Docker provides for filtering traffic it
+# forwards, traversed before its own accept rules. Without it the upstream
+# default of INPUT alone covers services on the host but not published
+# container ports. Container-to-container traffic crosses the chain too, but
+# only ever with RFC1918 source addresses, which never appear in a ban list.
+#
+# Chains that do not exist on a host are dropped at run time rather than
+# breaking the bouncer.
+crowdsec_bouncer_iptables_v4_chains:
   - DOCKER-USER
 
 # Inventory host running the central LAPI. Required: machine credentials and
