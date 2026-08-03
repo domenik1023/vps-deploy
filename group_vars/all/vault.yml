@@ -12,15 +12,6 @@
 
 vault_admin_password: "REPLACE_WITH_SHA512_HASH"
 
-# CrowdSec central LAPI credentials.
-#
-# Only needed when crowdsec_lapi_host is left empty. Set it to the inventory
-# host running the LAPI and the playbook creates both secrets itself, in which
-# case the two variables below can be deleted.
-#
-# Create on the LAPI server with:
-#   cscli machines add <login> --password '<password>'
-vault_crowdsec_lapi_password: "REPLACE_WITH_LAPI_MACHINE_PASSWORD"
-# Create on the LAPI server with:
-#   cscli bouncers add <host>-firewall-bouncer
-vault_crowdsec_bouncer_api_key: "REPLACE_WITH_BOUNCER_API_KEY"
+# CrowdSec needs nothing here: the agent's machine credentials and its bouncer
+# API key are created on the central LAPI server at deploy time and written
+# straight to the agent. See crowdsec_lapi_host in the role defaults.

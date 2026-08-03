@@ -3,13 +3,8 @@
 # central LAPI server ({{ crowdsec_lapi_url }}) and the firewall bouncer pulls
 # its ban decisions from there, so bans propagate across all machines.
 #
-# Credentials for that LAPI come from one of two modes:
-#   * automatic (crowdsec_lapi_host set): cscli runs on the LAPI server over
-#     delegation and mints them, see crowdsec_credentials.yml
-#   * manual (crowdsec_lapi_host empty): they are read from the vault, having
-#     been created by hand on the LAPI server with
-#       cscli machines add <login> --password '<password>'
-#       cscli bouncers add <host>-firewall-bouncer
+# Credentials for that LAPI are minted on the LAPI server itself, by running
+# cscli there over delegation; see crowdsec_credentials.yml.
 #
 # Uses the official CrowdSec packagecloud repository (distro packages are
 # outdated) with the signed-by keyring pattern, same as the Docker repo.
@@ -65,28 +60,18 @@
   notify: Restart CrowdSec
 
 # --- CREDENTIALS ---
+- name: Require a central LAPI server to provision credentials against
+  ansible.builtin.assert:
+    that:
+      - crowdsec_lapi_host | length > 0
+    fail_msg: >-
+      Set crowdsec_lapi_host to the inventory host running the central CrowdSec
+      LAPI. This agent's machine credentials and bouncer API key are created
+      there automatically.
+
 - name: Provision LAPI credentials on the central LAPI server
   ansible.builtin.include_tasks:
     file: crowdsec_credentials.yml
-  when: crowdsec_lapi_host | length > 0
-
-- name: Fail early when manual LAPI credentials are missing
-  ansible.builtin.assert:
-    that:
-      - crowdsec_lapi_password | length > 0
-      - crowdsec_bouncer_api_key | length > 0
-    fail_msg: >-
-      Set crowdsec_lapi_host to provision CrowdSec credentials automatically, or
-      define vault_crowdsec_lapi_password and vault_crowdsec_bouncer_api_key in
-      group_vars/all/vault.yml after creating them on the LAPI server.
-  when: crowdsec_lapi_host | length == 0
-
-- name: Use the manually provisioned LAPI credentials
-  ansible.builtin.set_fact:
-    crowdsec_lapi_password_resolved: "{{ crowdsec_lapi_password }}"
-    crowdsec_bouncer_api_key_resolved: "{{ crowdsec_bouncer_api_key }}"
-  no_log: true
-  when: crowdsec_lapi_host | length == 0
 
 - name: Point agent at the central LAPI server
   ansible.builtin.copy:
