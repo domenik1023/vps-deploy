@@ -184,6 +184,7 @@ sudo ipset list crowdsec-blacklists | head       # populated?
 | Alerts on the master, but nothing blocked | Bouncer is not pulling; check `cscli metrics` on the master and the bouncer's log in `/var/log/` |
 | Host traffic blocked, container traffic not | `DOCKER-USER` absent on the host, so the role dropped it — the play prints which chains it skipped |
 | Bouncer dead after a reboot | `DOCKER-USER` did not exist yet at start; the role installs an `After=docker.service` drop-in for this |
+| `firewall '${BACKEND}' is not supported` | The base config is upstream's raw template — `mode: ${BACKEND}` is normally substituted per package at build time. The role pins `mode` in the `.local` overlay, so re-running the playbook fixes it. Reproduce with `crowdsec-firewall-bouncer -c /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml -t` |
 | `ExecStartPre` exits 1, `journalctl` shows nothing | A configured chain does not exist. `-t` runs the same init as a real start, so the config test fails too. The bouncer logs to `/var/log/crowdsec-firewall-bouncer.log`, not the journal — look there. Note `iptables_chains` applies to **both** families, so a chain must exist in ip6tables too; use `iptables_v4_chains` for IPv4-only ones like `DOCKER-USER` |
 | Your own proxy gets banned | See *The reverse proxy trap* above |
 

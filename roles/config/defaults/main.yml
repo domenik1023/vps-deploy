@@ -70,6 +70,14 @@ crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-iptables
 # the package name.
 crowdsec_firewall_bouncer_service: crowdsec-firewall-bouncer
 
+# Which backend the bouncer drives. Upstream ships the config as a template
+# with `mode: ${BACKEND}`, substituted per package at build time; a base config
+# that is the raw template instead leaves the placeholder in place and the
+# bouncer refuses to start with "firewall '${BACKEND}' is not supported".
+# Pinning the mode in the .local overlay makes startup independent of whatever
+# the base file happens to contain.
+crowdsec_firewall_bouncer_mode: "{{ 'nftables' if 'nftables' in crowdsec_firewall_bouncer_package else 'iptables' }}"
+
 # Central LAPI server this agent reports to.
 crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
