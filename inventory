@@ -7,5 +7,8 @@
 # The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
 # delegate cscli calls to it. main.yml excludes this group from the play: the
 # role configures agent-only nodes and would disable the LAPI it depends on.
+# It has to be listed even though it is never configured: a delegate_to target
+# missing from the inventory falls back to SSH defaults (port 22, no
+# ansible_user), ignoring whatever this host actually needs.
 [lapi]
 192.168.2.2 ansible_port=22
