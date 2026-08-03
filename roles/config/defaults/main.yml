@@ -30,7 +30,7 @@ crowdsec_collections:
 crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-iptables
 
 # Central LAPI server this agent reports to.
-crowdsec_lapi_url: "https://lapi.example.com:8080"
+crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
 crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
 
@@ -38,10 +38,10 @@ crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
 # the bouncer API key are created there by running cscli over delegation, so
 # no CrowdSec secret is ever stored in the vault. Existing working credentials
 # are reused; they are only rotated when missing, stale or rejected.
-crowdsec_lapi_host: ""
+crowdsec_lapi_host: "192.168.2.2"
 # Set when the LAPI runs in a Docker container on that host: cscli is then
 # invoked inside the container instead of on the host itself.
-crowdsec_lapi_docker_container: ""
+crowdsec_lapi_docker_container: "crowdsec-master-crowdsec-1"
 # How to invoke cscli on the LAPI host. Override directly for setups the two
 # variables above do not cover (podman, docker compose, a wrapper script).
 crowdsec_lapi_cscli: "{{ ['docker', 'exec', crowdsec_lapi_docker_container, 'cscli'] if crowdsec_lapi_docker_container | length > 0 else ['cscli'] }}"
