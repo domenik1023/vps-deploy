@@ -106,11 +106,36 @@
     owner: root
     group: root
     mode: "0600"
-    content: |
-      api_url: {{ crowdsec_lapi_url }}
-      api_key: {{ crowdsec_bouncer_api_key_resolved }}
+    content: "{{ {'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains} | to_nice_yaml }}"
   no_log: true
   notify: Restart CrowdSec bouncer
+
+# DOCKER-USER only exists once dockerd has built its iptables rules. The
+# bouncer's own unit orders itself after crowdsec.service but knows nothing
+# about Docker, so on boot it can lose that race and fail to insert its rules.
+- name: Ensure the firewall bouncer unit drop-in directory exists
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ crowdsec_firewall_bouncer_service }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+
+- name: Order the firewall bouncer after Docker
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ crowdsec_firewall_bouncer_service }}.service.d/10-after-docker.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      After=docker.service
+      Wants=docker.service
+  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  notify:
+    - Reload systemd
+    - Restart CrowdSec bouncer
 
 # --- ACQUISITION ---
 # Minimal Ubuntu images may not ship rsyslog, so /var/log/auth.log can be

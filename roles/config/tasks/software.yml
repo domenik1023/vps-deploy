@@ -26,9 +26,55 @@
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Unattended-Upgrade "1";
       APT::Periodic::AutocleanInterval "7";
+      // Rebooting is handled by the reboot-if-required timer, which can pick a
+      // weekday; unattended-upgrades only understands a time of day.
+      Unattended-Upgrade::Automatic-Reboot "false";
     owner: root
     group: root
     mode: "0644"
+
+# Upgrades that need a reboot leave /run/reboot-required behind. Take it at a
+# fixed weekly window instead of whenever the upgrade happens to land.
+- name: Install the reboot-if-required service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/reboot-if-required.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reboot if a package upgrade requires it
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'if [ -e /run/reboot-required ]; then systemctl reboot; fi'
+  notify: Reload systemd
+
+- name: Install the reboot-if-required timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/reboot-if-required.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Weekly reboot window for pending upgrades
+
+      [Timer]
+      OnCalendar={{ unattended_reboot_oncalendar }}
+      # A missed window waits for the next one rather than rebooting at boot.
+      Persistent=false
+
+      [Install]
+      WantedBy=timers.target
+  notify: Reload systemd
+
+- name: Set the weekly reboot timer state
+  ansible.builtin.systemd_service:
+    name: reboot-if-required.timer
+    enabled: "{{ unattended_reboot_enabled | bool }}"
+    state: "{{ 'started' if unattended_reboot_enabled | bool else 'stopped' }}"
+    daemon_reload: true
 
 # --- NTP ---
 

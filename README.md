@@ -12,7 +12,7 @@ Hardens a fresh Ubuntu VPS with:
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
 - Docker Engine with security daemon config (log rotation, live-restore, no-new-privileges; optional user namespace remap)
 - Chrony NTP for accurate system time
-- Daily unattended security upgrades
+- Daily unattended security upgrades, with a weekly reboot window for updates that need one
 
 ## Project Structure
 
@@ -173,7 +173,9 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `fail2ban_maxretry` | `5` | Failed attempts before ban |
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
-| `docker_data_dir` | `/mnt/docker` | Mount point for Docker volumes |
+| `unattended_reboot_enabled` | `true` | Enable the weekly reboot timer for pending upgrades |
+| `unattended_reboot_oncalendar` | `Sat *-*-* 05:00:00` | systemd `OnCalendar` for the reboot window |
+| `docker_data_dir` | `/mnt/docker` | Directory for persistent volume data (created only; not Docker's data root) |
 | `docker_daemon_options` | log rotation, live-restore, no-new-privileges | Contents of `/etc/docker/daemon.json` |
 | `docker_userns_remap` | `""` (off) | Set to `"default"` for user namespace remapping — see the note below |
 | `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
@@ -182,6 +184,7 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
 | `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
 | `crowdsec_bouncer_name` | `{{ inventory_hostname }}-firewall-bouncer` | Bouncer name on the central LAPI |
+| `crowdsec_bouncer_iptables_chains` | `[INPUT, DOCKER-USER]` | Chains bans are enforced in; `DOCKER-USER` covers published container ports |
 | `crowdsec_lapi_host` | `""` (empty) | **Required.** Inventory host running the LAPI, used to provision credentials |
 | `crowdsec_lapi_docker_container` | `""` (empty) | Container name, when the LAPI runs in Docker on that host |
 | `crowdsec_lapi_cscli` | `["cscli"]` / `docker exec …` | `cscli` invocation prefix on the LAPI host; override for podman, compose, wrappers |
@@ -229,6 +232,7 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
   the old data is still on disk under the other path. Enable it per host with
   `docker_userns_remap: "default"` only where nothing needs the socket.
 - The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing, and skips CrowdSec, which only belongs on internet-facing hosts
+- CrowdSec bans are enforced in `INPUT` **and** `DOCKER-USER`. The bouncer's own default is `INPUT` alone, which misses traffic Docker forwards to published container ports — UFW and Fail2ban have that same blind spot, so on a container host they only protect services listening on the host itself. Container-to-container traffic crosses `DOCKER-USER` too but carries RFC1918 source addresses, which never appear in the ban list. The bouncer unit gets a drop-in ordering it after `docker.service`, since `DOCKER-USER` does not exist until dockerd has built its rules.
 - CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
 - CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
 - `host_key_checking` is disabled in `ansible.cfg` for the initial connection; use `ssh-keyscan` to pre-populate `known_hosts` in production environments
