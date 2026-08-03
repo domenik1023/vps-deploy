@@ -3,9 +3,8 @@
 # central LAPI server ({{ crowdsec_lapi_url }}) and the firewall bouncer pulls
 # its ban decisions from there, so bans propagate across all machines.
 #
-# Prerequisites on the LAPI server (once per host):
-#   cscli machines add <login> --password '<password>'
-#   cscli bouncers add <host>-firewall-bouncer   -> yields the bouncer API key
+# Credentials for that LAPI are minted on the LAPI server itself, by running
+# cscli there over delegation; see crowdsec_credentials.yml.
 #
 # Uses the official CrowdSec packagecloud repository (distro packages are
 # outdated) with the signed-by keyring pattern, same as the Docker repo.
@@ -27,11 +26,22 @@
     mode: "0644"
     force: false
 
+# apt_repository wrote crowdsec.list; deb822_repository writes crowdsec.sources.
+# Both being present would make apt read the repository twice.
+- name: Remove the legacy CrowdSec APT source list
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/crowdsec.list
+    state: absent
+
 - name: Add CrowdSec APT repository
-  ansible.builtin.apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/crowdsec.asc] https://packagecloud.io/crowdsec/crowdsec/ubuntu {{ ansible_distribution_release }} main"
+  ansible.builtin.deb822_repository:
+    name: crowdsec
+    types: [deb]
+    uris: ["https://packagecloud.io/crowdsec/crowdsec/ubuntu"]
+    suites: ["{{ ansible_facts['distribution_release'] }}"]
+    components: [main]
+    signed_by: /etc/apt/keyrings/crowdsec.asc
     state: present
-    filename: crowdsec
 
 - name: Install CrowdSec agent
   ansible.builtin.apt:
@@ -41,7 +51,7 @@
 
 - name: Install CrowdSec firewall bouncer
   ansible.builtin.apt:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_package }}"
     state: present
 
 # --- CENTRAL LAPI WIRING ---
@@ -60,6 +70,20 @@
           enable: false
   notify: Restart CrowdSec
 
+# --- CREDENTIALS ---
+- name: Require a central LAPI server to provision credentials against
+  ansible.builtin.assert:
+    that:
+      - crowdsec_lapi_host | length > 0
+    fail_msg: >-
+      Set crowdsec_lapi_host to the inventory host running the central CrowdSec
+      LAPI. This agent's machine credentials and bouncer API key are created
+      there automatically.
+
+- name: Provision LAPI credentials on the central LAPI server
+  ansible.builtin.include_tasks:
+    file: crowdsec_credentials.yml
+
 - name: Point agent at the central LAPI server
   ansible.builtin.copy:
     dest: /etc/crowdsec/local_api_credentials.yaml
@@ -69,24 +93,49 @@
     content: |
       url: {{ crowdsec_lapi_url }}
       login: {{ crowdsec_lapi_login }}
-      password: {{ crowdsec_lapi_password }}
+      password: {{ crowdsec_lapi_password_resolved }}
   no_log: true
   notify: Restart CrowdSec
 
 # The bouncer package auto-registers against a local LAPI, which doesn't
 # exist here. The .local overlay redirects it to the central LAPI with a
-# key pre-created there via `cscli bouncers add`.
+# key created there via `cscli bouncers add`.
 - name: Point firewall bouncer at the central LAPI server
   ansible.builtin.copy:
     dest: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
     owner: root
     group: root
     mode: "0600"
-    content: |
-      api_url: {{ crowdsec_lapi_url }}
-      api_key: {{ crowdsec_bouncer_api_key }}
+    content: "{{ {'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains} | to_nice_yaml }}"
   no_log: true
   notify: Restart CrowdSec bouncer
+
+# DOCKER-USER only exists once dockerd has built its iptables rules. The
+# bouncer's own unit orders itself after crowdsec.service but knows nothing
+# about Docker, so on boot it can lose that race and fail to insert its rules.
+- name: Ensure the firewall bouncer unit drop-in directory exists
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ crowdsec_firewall_bouncer_service }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+
+- name: Order the firewall bouncer after Docker
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ crowdsec_firewall_bouncer_service }}.service.d/10-after-docker.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      After=docker.service
+      Wants=docker.service
+  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  notify:
+    - Reload systemd
+    - Restart CrowdSec bouncer
 
 # --- ACQUISITION ---
 # Minimal Ubuntu images may not ship rsyslog, so /var/log/auth.log can be
@@ -104,6 +153,20 @@
         - "_SYSTEMD_UNIT=ssh.service"
       labels:
         type: syslog
+  notify: Restart CrowdSec
+
+# Per-host sources - a Caddy container, an nginx log file, another unit.
+# Removing an entry leaves its file behind; delete it on the host by hand.
+- name: Configure extra acquisition sources
+  ansible.builtin.copy:
+    dest: "/etc/crowdsec/acquis.d/{{ item.key }}.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.value | to_nice_yaml }}"
+  loop: "{{ crowdsec_acquisitions | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
   notify: Restart CrowdSec
 
 # --- COLLECTIONS ---
@@ -127,6 +190,6 @@
 
 - name: Ensure CrowdSec firewall bouncer is enabled and running
   ansible.builtin.service:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_service }}"
     enabled: true
     state: started

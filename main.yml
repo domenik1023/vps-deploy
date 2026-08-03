@@ -1,5 +1,7 @@
 - name: Basic VPS Hardening with SSH Key Only and Custom Port
-  hosts: all
+  # The [lapi] group is only there as a delegation target for CrowdSec
+  # credential provisioning; hardening it would disable the central LAPI.
+  hosts: all:!lapi
   become: true
   tasks:
     - name: Include Role

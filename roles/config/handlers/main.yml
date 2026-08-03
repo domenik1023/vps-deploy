@@ -1,3 +1,9 @@
+# Handlers fire in the order they are defined here, not the order they are
+# notified, so the daemon-reload has to come before any service it affects.
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
 - name: Restart Docker
   ansible.builtin.service:
     name: docker
@@ -10,5 +16,5 @@
 
 - name: Restart CrowdSec bouncer
   ansible.builtin.service:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_service }}"
     state: restarted

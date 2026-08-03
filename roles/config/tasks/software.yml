@@ -26,9 +26,55 @@
       APT::Periodic::Update-Package-Lists "1";
       APT::Periodic::Unattended-Upgrade "1";
       APT::Periodic::AutocleanInterval "7";
+      // Rebooting is handled by the reboot-if-required timer, which can pick a
+      // weekday; unattended-upgrades only understands a time of day.
+      Unattended-Upgrade::Automatic-Reboot "false";
     owner: root
     group: root
     mode: "0644"
+
+# Upgrades that need a reboot leave /run/reboot-required behind. Take it at a
+# fixed weekly window instead of whenever the upgrade happens to land.
+- name: Install the reboot-if-required service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/reboot-if-required.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Reboot if a package upgrade requires it
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'if [ -e /run/reboot-required ]; then systemctl reboot; fi'
+  notify: Reload systemd
+
+- name: Install the reboot-if-required timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/reboot-if-required.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Weekly reboot window for pending upgrades
+
+      [Timer]
+      OnCalendar={{ unattended_reboot_oncalendar }}
+      # A missed window waits for the next one rather than rebooting at boot.
+      Persistent=false
+
+      [Install]
+      WantedBy=timers.target
+  notify: Reload systemd
+
+- name: Set the weekly reboot timer state
+  ansible.builtin.systemd_service:
+    name: reboot-if-required.timer
+    enabled: "{{ unattended_reboot_enabled | bool }}"
+    state: "{{ 'started' if unattended_reboot_enabled | bool else 'stopped' }}"
+    daemon_reload: true
 
 # --- NTP ---
 
@@ -72,11 +118,23 @@
     mode: "0644"
     force: false
 
+# apt_repository wrote docker.list; deb822_repository writes docker.sources.
+# Both being present would make apt read the repository twice.
+- name: Remove the legacy Docker APT source list
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/docker.list
+    state: absent
+
 - name: Add Docker APT repository
-  ansible.builtin.apt_repository:
-    repo: "deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: [deb]
+    uris: ["https://download.docker.com/linux/ubuntu"]
+    suites: ["{{ ansible_facts['distribution_release'] }}"]
+    components: [stable]
+    architectures: ["{{ 'amd64' if ansible_facts['architecture'] == 'x86_64' else 'arm64' }}"]
+    signed_by: /etc/apt/keyrings/docker.asc
     state: present
-    filename: docker
 
 - name: Update apt cache
   ansible.builtin.apt:
@@ -94,25 +152,17 @@
 
 # --- DOCKER SECURITY CONFIGURATION ---
 
-# Enables live-restore (containers keep running on daemon restart),
-# enforces log rotation, and enables user namespace remapping for isolation.
+# Enables live-restore (containers keep running on daemon restart), enforces
+# log rotation and blocks privilege escalation inside containers. User
+# namespace remapping is opt-in via docker_userns_remap - see the comment on
+# that variable for why it is not on by default.
 - name: Configure Docker daemon security options
   ansible.builtin.copy:
     dest: /etc/docker/daemon.json
     owner: root
     group: root
     mode: "0644"
-    content: |
-      {
-        "live-restore": true,
-        "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "10m",
-          "max-file": "3"
-        },
-        "userns-remap": "default",
-        "no-new-privileges": true
-      }
+    content: "{{ (docker_daemon_options | combine({'userns-remap': docker_userns_remap}) if docker_userns_remap | length > 0 else docker_daemon_options) | to_nice_json }}\n"
   register: docker_daemon_conf
   notify: Restart Docker
 

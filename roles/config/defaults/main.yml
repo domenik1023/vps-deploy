@@ -15,24 +15,91 @@ fail2ban_maxretry: 5
 fail2ban_findtime: 10m
 fail2ban_bantime: 1h
 
+# --- Unattended upgrades ---
+# Security updates install daily, but anything touching the kernel or libc only
+# takes effect after a reboot. unattended-upgrades can only express a time of
+# day for that reboot, never a weekday, so it is driven by a systemd timer.
+unattended_reboot_enabled: true
+unattended_reboot_oncalendar: "Sat *-*-* 05:00:00"
+
 # --- Docker ---
+# Convention for where persistent volume data is bind-mounted from; the
+# playbook only creates the directory. Docker's own data root is left at
+# /var/lib/docker.
 docker_data_dir: /mnt/docker
 
+# Written to /etc/docker/daemon.json.
+docker_daemon_options:
+  live-restore: true
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: "3"
+  no-new-privileges: true
+
+# User namespace remapping maps container root to an unprivileged host UID,
+# which is good isolation but breaks any container that bind-mounts
+# /var/run/docker.sock - the socket is root:docker, and remapped root is
+# neither. Container managers run that way (Komodo Periphery, Portainer,
+# Watchtower, a Traefik docker provider), so it is off by default.
+#
+# It also moves the data root to /var/lib/docker/<subuid>.<subgid>/, so
+# toggling it hides every container, image and volume created under the other
+# setting. Set to "default" only on hosts that run no such container, and
+# expect to migrate their data.
+docker_userns_remap: ""
+
 # --- CrowdSec ---
+# Installed on internet-facing hosts only; the [local] group is skipped in
+# tasks/main.yml, same as the SSH hardening tasks.
 # Collections to install (parsers + scenarios); crowdsecurity/linux bundles sshd.
+# Overriding this in host_vars replaces the list, so keep crowdsecurity/linux.
 crowdsec_collections:
   - crowdsecurity/linux
+
+# Extra log sources for this host, each written to
+# /etc/crowdsec/acquis.d/<key>.yaml. sshd is always read from journald; a host
+# running web services needs its own entry here, since CrowdSec parses nothing
+# it has not been pointed at. See docs/crowdsec.md for worked examples.
+crowdsec_acquisitions: {}
 # UFW on Ubuntu drives netfilter via iptables-nft, so the iptables bouncer
 # variant is the right fit. Switch to crowdsec-firewall-bouncer-nftables for
 # pure-nftables setups.
-crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-iptables
+crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-iptables
+# Both packages ship the same systemd unit, so the service name does not follow
+# the package name.
+crowdsec_firewall_bouncer_service: crowdsec-firewall-bouncer
 
-# Central LAPI server this agent reports to. Machine credentials and the
-# bouncer API key must be pre-created on that server:
-#   cscli machines add <login> --password '<password>'
-#   cscli bouncers add <name>
-crowdsec_lapi_url: "https://lapi.example.com:8080"
+# Central LAPI server this agent reports to.
+crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
-# Secrets live in group_vars/all/vault.yml (ansible-vault encrypted)
-crowdsec_lapi_password: "{{ vault_crowdsec_lapi_password }}"
-crowdsec_bouncer_api_key: "{{ vault_crowdsec_bouncer_api_key }}"
+crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
+
+# Chains the firewall bouncer drops banned traffic in. The upstream default is
+# INPUT alone, which only covers services listening on the host - traffic
+# Docker forwards to a published container port never reaches it.
+#
+# DOCKER-USER is the hook Docker provides for exactly this and is traversed
+# before its own accept rules, so bans apply to containers reached from the
+# internet. Container-to-container traffic crosses that chain too, but only
+# ever with RFC1918 source addresses, which never appear in the ban list, so
+# internal traffic is unaffected in practice.
+crowdsec_bouncer_iptables_chains:
+  - INPUT
+  - DOCKER-USER
+
+# Inventory host running the central LAPI. Required: machine credentials and
+# the bouncer API key are created there by running cscli over delegation, so
+# no CrowdSec secret is ever stored in the vault. Existing working credentials
+# are reused; they are only rotated when missing, stale or rejected.
+# Inventory name, not an address: delegation resolves it through the inventory
+# so the host's own connection settings in host_vars apply.
+crowdsec_lapi_host: "crowdsec-master"
+# Set when the LAPI runs in a Docker container on that host: cscli is then
+# invoked inside the container instead of on the host itself.
+crowdsec_lapi_docker_container: "crowdsec-master-crowdsec-1"
+# How to invoke cscli on the LAPI host. Override directly for setups the two
+# variables above do not cover (podman, docker compose, a wrapper script).
+crowdsec_lapi_cscli: "{{ ['docker', 'exec', crowdsec_lapi_docker_container, 'cscli'] if crowdsec_lapi_docker_container | length > 0 else ['cscli'] }}"
+# Set to false if the LAPI serves a self-signed certificate.
+crowdsec_lapi_validate_certs: true

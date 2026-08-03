@@ -1,0 +1,5 @@
+# LAN test box. It is in the [local] group, so SSH hardening is skipped to
+# avoid locking yourself out, and CrowdSec is not installed at all - see
+# roles/config/tasks/main.yml.
+ansible_host: 192.168.2.112
+ansible_port: 22

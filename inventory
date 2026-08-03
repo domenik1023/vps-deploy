@@ -1,5 +1,24 @@
+# Hosts are listed by name only; addresses, ports and per-host overrides live
+# in host_vars/<name>.yml.
+#
+# The name is not cosmetic: crowdsec_lapi_login and crowdsec_bouncer_name both
+# derive from inventory_hostname, so it is what this host registers as on the
+# central LAPI. Renaming a host that is already registered leaves an orphaned
+# machine and bouncer behind - clean those up with `cscli machines delete` and
+# `cscli bouncers delete` on the master.
+
 [vps]
-#195.128.100.90 ansible_port=22
-#91.132.146.192 ansible_port=22
+vps-pangolin
+vps-docker
+
 [local]
-192.168.2.112 ansible_port=22
+#testvm
+
+# The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
+# delegate cscli calls to it. main.yml excludes this group from the play: the
+# role configures agent-only nodes and would disable the LAPI it depends on.
+# It has to be listed even though it is never configured: a delegate_to target
+# missing from the inventory falls back to SSH defaults (port 22, no
+# ansible_user), ignoring whatever this host actually needs.
+[lapi]
+crowdsec-master
