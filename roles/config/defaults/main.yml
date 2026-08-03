@@ -11,7 +11,18 @@ ssh_port: 22822
 ssh_old_port: 22
 
 # --- Fail2ban ---
-fail2ban_maxretry: 5
+# Deliberately duller than CrowdSec, which should ban first: its decisions go to
+# the central LAPI and apply across the whole fleet, while a fail2ban ban only
+# covers the host that saw the traffic. crowdsecurity/ssh-bf overflows at 6
+# failures arriving faster than one per 10s, and ssh-slow-bf at 11 faster than
+# one per 60s, so a threshold above both leaves fail2ban as an independent
+# backstop for the case CrowdSec cannot cover for itself - the agent, the LAPI
+# or the bouncer being down.
+#
+# Exact ordering cannot hold at every attack rate: CrowdSec leaks its buckets
+# while fail2ban counts in a fixed window, so the two cross over somewhere in
+# the middle. This is tuned for the common case, a fast brute force.
+fail2ban_maxretry: 15
 fail2ban_findtime: 10m
 fail2ban_bantime: 1h
 

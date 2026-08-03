@@ -129,6 +129,35 @@ crowdsec_acquisitions:
       type: syslog
 ```
 
+## Sharing SSH with fail2ban
+
+Both watch sshd, and they are not independent: whichever bans first drops the
+attacker's packets, so the other never sees enough failures to act. The
+thresholds are set so CrowdSec wins.
+
+| Detector | Fires at |
+|---|---|
+| `crowdsecurity/ssh-bf` | 6 failures faster than one per 10s |
+| `crowdsecurity/ssh-slow-bf` | 11 failures faster than one per 60s |
+| fail2ban (`fail2ban_maxretry`) | 15 failures in `fail2ban_findtime` |
+
+CrowdSec first is what you want: its decision reaches the central LAPI and
+every agent in the fleet, so an IP banned here is blocked everywhere. A
+fail2ban ban stays on the host that saw it.
+
+fail2ban is kept as a backstop rather than removed, because it is the only
+part of this that keeps working when the CrowdSec agent, the LAPI or the
+bouncer is down.
+
+CrowdSec's buckets leak and fail2ban counts in a fixed window, so the ordering
+cannot hold at every possible attack rate — somewhere in the middle they cross
+over. It is tuned for the common case, a fast brute force.
+
+Expect few SSH alerts regardless: sshd is on a non-standard port with port 22
+denied, so scanners rarely reach it at all. Web traffic is unavoidable and will
+always dominate. Check which system acted with `fail2ban-client status sshd`
+against `cscli alerts list --scenario crowdsecurity/ssh-bf` on the master.
+
 ## The reverse proxy trap
 
 If the service sits behind another proxy — Caddy behind Pangolin, anything

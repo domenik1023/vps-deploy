@@ -6,7 +6,7 @@ Hardens a fresh Ubuntu VPS with:
 
 - SSH key-only authentication on a custom port (22822), with port 22 denied after hardening
 - UFW firewall with connection-rate limiting on the SSH port
-- Fail2ban intrusion detection (bans after 5 failed attempts)
+- Fail2ban as a local backstop behind CrowdSec (bans after 15 failed attempts)
 - CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
@@ -176,7 +176,7 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `admin_password` | `{{ vault_admin_password }}` | sha512-crypt hash (from vault) |
 | `ssh_port` | `22822` | Custom SSH port |
 | `ssh_old_port` | `22` | Standard port to deny after hardening |
-| `fail2ban_maxretry` | `5` | Failed attempts before ban |
+| `fail2ban_maxretry` | `15` | Failed attempts before ban — set above CrowdSec's SSH thresholds so it bans first |
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `unattended_reboot_enabled` | `true` | Enable the weekly reboot timer for pending upgrades |
