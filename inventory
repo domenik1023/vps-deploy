@@ -8,4 +8,4 @@
 # delegate cscli calls to it. main.yml excludes this group from the play: the
 # role configures agent-only nodes and would disable the LAPI it depends on.
 [lapi]
-#lapi.example.com ansible_port=22822
+192.168.2.2 ansible_port=22
