@@ -3,3 +3,9 @@
 #91.132.146.192 ansible_port=22
 [local]
 192.168.2.112 ansible_port=22
+
+# The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
+# delegate cscli calls to it. main.yml excludes this group from the play: the
+# role configures agent-only nodes and would disable the LAPI it depends on.
+[lapi]
+#lapi.example.com ansible_port=22822

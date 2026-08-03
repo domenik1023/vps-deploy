@@ -36,7 +36,8 @@ vps-deploy/
             ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
             ├── sysctl.yml            # Kernel parameter hardening
             ├── software.yml          # Docker, NTP, auto-updates
-            └── crowdsec.yml          # CrowdSec agent + firewall bouncer
+            ├── crowdsec.yml          # CrowdSec agent + firewall bouncer
+            └── crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
 ```
 
 ## Prerequisites
@@ -70,6 +71,75 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
    ansible-vault encrypt group_vars/all/vault.yml
    ```
 
+## CrowdSec Credentials
+
+Each agent needs two secrets from the central LAPI server: a machine
+login/password and a firewall bouncer API key. There are two ways to get them.
+
+### Automatic (recommended)
+
+Point `crowdsec_lapi_host` at the inventory host running the LAPI and the
+playbook creates both secrets itself, by running `cscli` on that host over
+Ansible delegation:
+
+```yaml
+# group_vars/all/main.yml, or per-host in the inventory
+crowdsec_lapi_url: "https://lapi.internal:8080"
+crowdsec_lapi_host: "lapi.internal"     # must be reachable in the inventory
+```
+
+If the LAPI runs in a Docker container, name it and `cscli` is invoked inside
+the container instead of on the host:
+
+```yaml
+crowdsec_lapi_docker_container: "crowdsec"
+```
+
+For anything else (podman, `docker compose exec`, a wrapper script) override the
+invocation prefix directly — it is a plain argument list:
+
+```yaml
+crowdsec_lapi_cscli: ["docker", "compose", "-f", "/srv/crowdsec/compose.yml", "exec", "-T", "crowdsec", "cscli"]
+```
+
+Requirements: the LAPI host is in the inventory, reachable over SSH, and the
+connecting user can `become` root there (enough to run `docker exec` in the
+container case). Put it in the inventory's `[lapi]` group — `main.yml` runs
+against `all:!lapi`, so the master is used purely as a delegation target and is
+not reconfigured as an agent, which would disable the very LAPI the fleet
+depends on.
+
+Nothing goes into the vault — the generated secrets live only in
+`/etc/crowdsec/local_api_credentials.yaml` and
+`/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local` on the agent, and
+hashed in the LAPI database.
+
+Re-runs are idempotent. Before touching anything the playbook verifies what the
+agent already has — `cscli lapi status` for the machine credentials, an
+authenticated `GET /v1/decisions` for the bouncer key — and reuses working
+secrets verbatim. A secret is only rotated when it is missing, points at a
+different LAPI, or is rejected. Re-registering an agent whose credentials were
+lost works too: the machine is re-added with `--force` and a stale bouncer of
+the same name is deleted first.
+
+Provisioning goes through `cscli` rather than HTTP because the LAPI's REST API
+cannot do the job: it can register a machine (`POST /v1/watchers`) only when
+auto-registration is enabled on the server, and it has no endpoint at all for
+creating a bouncer — bouncer keys exist only in the LAPI database.
+
+### Manual
+
+Leave `crowdsec_lapi_host` empty and provision the secrets by hand on the LAPI
+server, then store them in the vault:
+
+```bash
+cscli machines add <inventory_hostname> --password '<password>'   # -> vault_crowdsec_lapi_password
+cscli bouncers add <host>-firewall-bouncer                        # -> vault_crowdsec_bouncer_api_key
+```
+
+The playbook asserts both are set before configuring the agent, so a missing
+value fails the run with a clear message instead of writing a broken config.
+
 ## Configuration
 
 All tunable values live in `roles/config/defaults/main.yml`:
@@ -88,8 +158,13 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `crowdsec_firewall_bouncer` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
 | `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
-| `crowdsec_lapi_password` | `{{ vault_crowdsec_lapi_password }}` | Machine password (from vault) |
-| `crowdsec_bouncer_api_key` | `{{ vault_crowdsec_bouncer_api_key }}` | Bouncer API key (from vault) |
+| `crowdsec_bouncer_name` | `{{ inventory_hostname }}-firewall-bouncer` | Bouncer name on the central LAPI |
+| `crowdsec_lapi_host` | `""` (empty) | Inventory host running the LAPI. Set it to provision credentials automatically; empty means manual/vault mode |
+| `crowdsec_lapi_docker_container` | `""` (empty) | Container name, when the LAPI runs in Docker on that host |
+| `crowdsec_lapi_cscli` | `["cscli"]` / `docker exec …` | `cscli` invocation prefix on the LAPI host; override for podman, compose, wrappers |
+| `crowdsec_lapi_validate_certs` | `true` | Set to `false` if the LAPI serves a self-signed certificate |
+| `crowdsec_lapi_password` | `{{ vault_crowdsec_lapi_password }}` | Machine password (manual mode only, from vault) |
+| `crowdsec_bouncer_api_key` | `{{ vault_crowdsec_bouncer_api_key }}` | Bouncer API key (manual mode only, from vault) |
 
 ## Usage
 
@@ -125,10 +200,5 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
 
 - The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing
 - CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
-- CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. Before the first run, provision credentials **on the LAPI server**:
-  ```bash
-  cscli machines add <inventory_hostname> --password '<password>'   # -> vault_crowdsec_lapi_password
-  cscli bouncers add <host>-firewall-bouncer                        # -> vault_crowdsec_bouncer_api_key
-  ```
-  CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
+- CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
 - `host_key_checking` is disabled in `ansible.cfg` for the initial connection; use `ssh-keyscan` to pre-populate `known_hosts` in production environments

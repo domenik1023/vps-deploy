@@ -13,6 +13,11 @@
 vault_admin_password: "REPLACE_WITH_SHA512_HASH"
 
 # CrowdSec central LAPI credentials.
+#
+# Only needed when crowdsec_lapi_host is left empty. Set it to the inventory
+# host running the LAPI and the playbook creates both secrets itself, in which
+# case the two variables below can be deleted.
+#
 # Create on the LAPI server with:
 #   cscli machines add <login> --password '<password>'
 vault_crowdsec_lapi_password: "REPLACE_WITH_LAPI_MACHINE_PASSWORD"

@@ -27,12 +27,29 @@ crowdsec_collections:
 # pure-nftables setups.
 crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-iptables
 
-# Central LAPI server this agent reports to. Machine credentials and the
-# bouncer API key must be pre-created on that server:
-#   cscli machines add <login> --password '<password>'
-#   cscli bouncers add <name>
+# Central LAPI server this agent reports to.
 crowdsec_lapi_url: "https://lapi.example.com:8080"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
-# Secrets live in group_vars/all/vault.yml (ansible-vault encrypted)
-crowdsec_lapi_password: "{{ vault_crowdsec_lapi_password }}"
-crowdsec_bouncer_api_key: "{{ vault_crowdsec_bouncer_api_key }}"
+crowdsec_bouncer_name: "{{ inventory_hostname }}-firewall-bouncer"
+
+# Inventory host running the central LAPI. When set, machine credentials and
+# the bouncer API key are created automatically by running cscli there (over
+# delegation) and are never stored in the vault. Existing working credentials
+# are reused; they are only rotated when missing, stale or rejected.
+# Leave empty to keep provisioning them by hand:
+#   cscli machines add <login> --password '<password>'
+#   cscli bouncers add <name>
+crowdsec_lapi_host: ""
+# Set when the LAPI runs in a Docker container on that host: cscli is then
+# invoked inside the container instead of on the host itself.
+crowdsec_lapi_docker_container: ""
+# How to invoke cscli on the LAPI host. Override directly for setups the two
+# variables above do not cover (podman, docker compose, a wrapper script).
+crowdsec_lapi_cscli: "{{ ['docker', 'exec', crowdsec_lapi_docker_container, 'cscli'] if crowdsec_lapi_docker_container | length > 0 else ['cscli'] }}"
+# Set to false if the LAPI serves a self-signed certificate.
+crowdsec_lapi_validate_certs: true
+
+# Manual mode only: secrets live in group_vars/all/vault.yml (ansible-vault
+# encrypted). Unused when crowdsec_lapi_host is set.
+crowdsec_lapi_password: "{{ vault_crowdsec_lapi_password | default('') }}"
+crowdsec_bouncer_api_key: "{{ vault_crowdsec_bouncer_api_key | default('') }}"

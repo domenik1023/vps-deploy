@@ -3,9 +3,13 @@
 # central LAPI server ({{ crowdsec_lapi_url }}) and the firewall bouncer pulls
 # its ban decisions from there, so bans propagate across all machines.
 #
-# Prerequisites on the LAPI server (once per host):
-#   cscli machines add <login> --password '<password>'
-#   cscli bouncers add <host>-firewall-bouncer   -> yields the bouncer API key
+# Credentials for that LAPI come from one of two modes:
+#   * automatic (crowdsec_lapi_host set): cscli runs on the LAPI server over
+#     delegation and mints them, see crowdsec_credentials.yml
+#   * manual (crowdsec_lapi_host empty): they are read from the vault, having
+#     been created by hand on the LAPI server with
+#       cscli machines add <login> --password '<password>'
+#       cscli bouncers add <host>-firewall-bouncer
 #
 # Uses the official CrowdSec packagecloud repository (distro packages are
 # outdated) with the signed-by keyring pattern, same as the Docker repo.
@@ -60,6 +64,30 @@
           enable: false
   notify: Restart CrowdSec
 
+# --- CREDENTIALS ---
+- name: Provision LAPI credentials on the central LAPI server
+  ansible.builtin.include_tasks:
+    file: crowdsec_credentials.yml
+  when: crowdsec_lapi_host | length > 0
+
+- name: Fail early when manual LAPI credentials are missing
+  ansible.builtin.assert:
+    that:
+      - crowdsec_lapi_password | length > 0
+      - crowdsec_bouncer_api_key | length > 0
+    fail_msg: >-
+      Set crowdsec_lapi_host to provision CrowdSec credentials automatically, or
+      define vault_crowdsec_lapi_password and vault_crowdsec_bouncer_api_key in
+      group_vars/all/vault.yml after creating them on the LAPI server.
+  when: crowdsec_lapi_host | length == 0
+
+- name: Use the manually provisioned LAPI credentials
+  ansible.builtin.set_fact:
+    crowdsec_lapi_password_resolved: "{{ crowdsec_lapi_password }}"
+    crowdsec_bouncer_api_key_resolved: "{{ crowdsec_bouncer_api_key }}"
+  no_log: true
+  when: crowdsec_lapi_host | length == 0
+
 - name: Point agent at the central LAPI server
   ansible.builtin.copy:
     dest: /etc/crowdsec/local_api_credentials.yaml
@@ -69,13 +97,13 @@
     content: |
       url: {{ crowdsec_lapi_url }}
       login: {{ crowdsec_lapi_login }}
-      password: {{ crowdsec_lapi_password }}
+      password: {{ crowdsec_lapi_password_resolved }}
   no_log: true
   notify: Restart CrowdSec
 
 # The bouncer package auto-registers against a local LAPI, which doesn't
 # exist here. The .local overlay redirects it to the central LAPI with a
-# key pre-created there via `cscli bouncers add`.
+# key created there via `cscli bouncers add`.
 - name: Point firewall bouncer at the central LAPI server
   ansible.builtin.copy:
     dest: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local
@@ -84,7 +112,7 @@
     mode: "0600"
     content: |
       api_url: {{ crowdsec_lapi_url }}
-      api_key: {{ crowdsec_bouncer_api_key }}
+      api_key: {{ crowdsec_bouncer_api_key_resolved }}
   no_log: true
   notify: Restart CrowdSec bouncer
 
