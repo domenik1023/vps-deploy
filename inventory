@@ -8,11 +8,11 @@
 # `cscli bouncers delete` on the master.
 
 [vps]
-#vps1
-#vps2
+vps-pangolin
+vps-docker
 
 [local]
-testvm
+#testvm
 
 # The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
 # delegate cscli calls to it. main.yml excludes this group from the play: the
