@@ -10,7 +10,7 @@
 # Generate a new sha512-crypt password hash with:
 #   python3 -c "from passlib.hash import sha512_crypt; print(sha512_crypt.hash('yourpassword'))"
 
-vault_admin_password: "REPLACE_WITH_SHA512_HASH"
+vault_admin_password: "$6$rounds=656000$zXpOl1BwFDT2nX5B$op1n.adEgcW8gGIGCr8Sc/mWEZMG8qTYy4T2Wm3KoLYzG0Dhz7.5frgM3yVm49A9N/3MZJfQVee8G8HyGzE6y/"
 
 # CrowdSec needs nothing here: the agent's machine credentials and its bouncer
 # API key are created on the central LAPI server at deploy time and written
