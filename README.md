@@ -24,10 +24,8 @@ vps-deploy/
 ├── group_vars/
 │   └── all/
 │       └── vault.yml                 # Encrypted secrets (ansible-vault)
-├── host_vars/
-│   ├── vps1.yml                      # Address, SSH port, per-host overrides
-│   ├── vps2.yml
-│   ├── testvm.yml
+├── host_vars/                        # Optional per-host settings, by name
+│   ├── testvm.yml                    # Address, SSH port, per-host overrides
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
     └── config/
@@ -138,18 +136,20 @@ creating a bouncer — bouncer keys exist only in the LAPI database.
 
 ## Inventory and Host Variables
 
-`inventory` lists host *names* and their groups; everything host-specific —
-address, SSH port, per-host overrides — lives in `host_vars/<name>.yml`:
+`inventory` lists host *names* and their groups. A name that resolves — via
+DNS, `/etc/hosts` or an SSH config alias — needs nothing further. Anything
+host-specific otherwise (address, SSH port, per-host overrides) goes in
+`host_vars/<name>.yml`:
 
 ```ini
 [vps]
-vps1
-vps2
+vps-pangolin
+vps-docker
 ```
 
 ```yaml
-# host_vars/vps1.yml
-ansible_host: 195.128.100.90
+# host_vars/vps-pangolin.yml — only if the name does not resolve on its own
+ansible_host: 203.0.113.10
 ansible_port: 22          # 22822 once hardening has run
 ```
 
