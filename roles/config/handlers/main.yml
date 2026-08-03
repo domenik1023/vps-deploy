@@ -10,5 +10,5 @@
 
 - name: Restart CrowdSec bouncer
   ansible.builtin.service:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_service }}"
     state: restarted

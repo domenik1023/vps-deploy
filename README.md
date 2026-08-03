@@ -175,7 +175,8 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `docker_data_dir` | `/mnt/docker` | Mount point for Docker volumes |
 | `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
-| `crowdsec_firewall_bouncer` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
+| `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
+| `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
 | `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
 | `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
 | `crowdsec_bouncer_name` | `{{ inventory_hostname }}-firewall-bouncer` | Bouncer name on the central LAPI |

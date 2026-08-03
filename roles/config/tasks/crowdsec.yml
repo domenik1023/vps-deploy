@@ -40,7 +40,7 @@
 
 - name: Install CrowdSec firewall bouncer
   ansible.builtin.apt:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_package }}"
     state: present
 
 # --- CENTRAL LAPI WIRING ---
@@ -140,6 +140,6 @@
 
 - name: Ensure CrowdSec firewall bouncer is enabled and running
   ansible.builtin.service:
-    name: "{{ crowdsec_firewall_bouncer }}"
+    name: "{{ crowdsec_firewall_bouncer_service }}"
     enabled: true
     state: started

@@ -27,7 +27,10 @@ crowdsec_collections:
 # UFW on Ubuntu drives netfilter via iptables-nft, so the iptables bouncer
 # variant is the right fit. Switch to crowdsec-firewall-bouncer-nftables for
 # pure-nftables setups.
-crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-iptables
+crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-iptables
+# Both packages ship the same systemd unit, so the service name does not follow
+# the package name.
+crowdsec_firewall_bouncer_service: crowdsec-firewall-bouncer
 
 # Central LAPI server this agent reports to.
 crowdsec_lapi_url: "https://crowdsec.d1023.de"
