@@ -26,11 +26,22 @@
     mode: "0644"
     force: false
 
+# apt_repository wrote crowdsec.list; deb822_repository writes crowdsec.sources.
+# Both being present would make apt read the repository twice.
+- name: Remove the legacy CrowdSec APT source list
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/crowdsec.list
+    state: absent
+
 - name: Add CrowdSec APT repository
-  ansible.builtin.apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/crowdsec.asc] https://packagecloud.io/crowdsec/crowdsec/ubuntu {{ ansible_distribution_release }} main"
+  ansible.builtin.deb822_repository:
+    name: crowdsec
+    types: [deb]
+    uris: ["https://packagecloud.io/crowdsec/crowdsec/ubuntu"]
+    suites: ["{{ ansible_facts['distribution_release'] }}"]
+    components: [main]
+    signed_by: /etc/apt/keyrings/crowdsec.asc
     state: present
-    filename: crowdsec
 
 - name: Install CrowdSec agent
   ansible.builtin.apt:

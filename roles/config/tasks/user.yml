@@ -12,6 +12,20 @@
     mode: "0440"
     validate: "visudo -cf %s"
 
+# The user module writes `password` into /etc/shadow verbatim. A plaintext
+# value lands there as an unparseable hash, so the account silently ends up
+# with no working password at all - the module only warns about it.
+- name: Verify the admin password is a crypt hash
+  ansible.builtin.assert:
+    that:
+      - admin_password.startswith('$')
+    fail_msg: >-
+      admin_password must be a crypt hash, not plaintext. Generate one with
+      `python3 -c "from passlib.hash import sha512_crypt;
+      print(sha512_crypt.hash('yourpassword'))"` and store it as
+      vault_admin_password in group_vars/all/vault.yml.
+  no_log: true
+
 - name: Ensure admin user exists
   ansible.builtin.user:
     name: "{{ admin_user }}"

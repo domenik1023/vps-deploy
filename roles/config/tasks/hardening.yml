@@ -10,6 +10,10 @@
       - openssh-server
       - ufw
       - fail2ban
+      # deb822_repository parses and writes .sources files through python-debian;
+      # it is not part of a stock Ubuntu image, and the Docker and CrowdSec
+      # repository tasks later in the play both need it.
+      - python3-debian
     state: present
 
 # --- UFW ---
