@@ -1,1 +1,11 @@
-inventory
+# Lock/cache directory Ansible creates in the working directory at run time.
+.ansible/
+
+# Collections when installed into the repo via `ansible-galaxy ... -p ./collections`.
+collections/
+
+*.retry
+
+# Note: `inventory` used to be listed here, but it has always been tracked -
+# gitignore has no effect on a file already in the index, so the entry only
+# looked like it did something. It and host_vars/ are committed deliberately.
