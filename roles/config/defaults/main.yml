@@ -53,8 +53,15 @@ docker_userns_remap: ""
 # Installed on internet-facing hosts only; the [local] group is skipped in
 # tasks/main.yml, same as the SSH hardening tasks.
 # Collections to install (parsers + scenarios); crowdsecurity/linux bundles sshd.
+# Overriding this in host_vars replaces the list, so keep crowdsecurity/linux.
 crowdsec_collections:
   - crowdsecurity/linux
+
+# Extra log sources for this host, each written to
+# /etc/crowdsec/acquis.d/<key>.yaml. sshd is always read from journald; a host
+# running web services needs its own entry here, since CrowdSec parses nothing
+# it has not been pointed at. See docs/crowdsec.md for worked examples.
+crowdsec_acquisitions: {}
 # UFW on Ubuntu drives netfilter via iptables-nft, so the iptables bouncer
 # variant is the right fit. Switch to crowdsec-firewall-bouncer-nftables for
 # pure-nftables setups.

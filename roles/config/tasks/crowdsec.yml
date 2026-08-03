@@ -155,6 +155,20 @@
         type: syslog
   notify: Restart CrowdSec
 
+# Per-host sources - a Caddy container, an nginx log file, another unit.
+# Removing an entry leaves its file behind; delete it on the host by hand.
+- name: Configure extra acquisition sources
+  ansible.builtin.copy:
+    dest: "/etc/crowdsec/acquis.d/{{ item.key }}.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.value | to_nice_yaml }}"
+  loop: "{{ crowdsec_acquisitions | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  notify: Restart CrowdSec
+
 # --- COLLECTIONS ---
 # Parsers/scenarios run on the agent, so collections are installed locally
 # even in central-LAPI mode. crowdsecurity/linux bundles sshd + syslog.

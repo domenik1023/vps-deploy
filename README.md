@@ -24,6 +24,8 @@ vps-deploy/
 ├── group_vars/
 │   └── all/
 │       └── vault.yml                 # Encrypted secrets (ansible-vault)
+├── docs/
+│   └── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── testvm.yml                    # Address, SSH port, per-host overrides
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
@@ -75,6 +77,10 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
    ```
 
 ## CrowdSec Credentials
+
+> Adding a log source (a Caddy container, an nginx file), verifying parsing and
+> troubleshooting bans are covered in **[docs/crowdsec.md](docs/crowdsec.md)**.
+> Out of the box CrowdSec watches sshd and nothing else.
 
 CrowdSec is installed on internet-facing hosts only: the `[local]` group is
 skipped, the same way SSH hardening skips it. Local hosts sit behind NAT and
@@ -179,6 +185,7 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `docker_daemon_options` | log rotation, live-restore, no-new-privileges | Contents of `/etc/docker/daemon.json` |
 | `docker_userns_remap` | `""` (off) | Set to `"default"` for user namespace remapping — see the note below |
 | `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
+| `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
 | `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
