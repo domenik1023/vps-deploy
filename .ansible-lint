@@ -1,0 +1,20 @@
+---
+profile: basic
+
+exclude_paths:
+  - .ansible/
+  - collections/
+
+skip_list:
+  # Wants every variable in the role prefixed `config_`. That convention earns
+  # its keep when roles are shared and their variables can collide; here there
+  # is one role, the names are already domain-prefixed (crowdsec_*, docker_*,
+  # fail2ban_*), and renaming ~50 variables would only add noise. ansible_port
+  # is flagged by the same rule and cannot be renamed at all - it is Ansible's.
+  - var-naming[no-role-prefix]
+
+  # "Tasks that run when changed should likely be handlers." Not here: the four
+  # matches are the mid-play SSH port switch and the sysctl apply, which must
+  # run inline. Handlers fire at the end of the play, by which point sshd has
+  # already moved and the connection would be dead.
+  - no-handler

@@ -4,16 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An Ansible playbook that hardens Ubuntu VPS hosts. There is no build, no test
-suite and no linter configured — the feedback loop is `--syntax-check`, then
-`--check`, then a real run against one host.
+An Ansible playbook that hardens Ubuntu VPS hosts. There is no build and no
+unit test suite — the feedback loop is the three checks below, then `--check`,
+then a real run against one host.
 
 ## Commands
 
 ```bash
 ansible-galaxy collection install -r requirements.yml   # community.general, ansible.posix
 
-ansible-playbook main.yml -i inventory --syntax-check   # fastest check; run after every edit
+# The three checks CI runs; run them locally after every edit.
+ansible-playbook main.yml -i inventory --syntax-check
+ansible-lint
+ansible-playbook tests/render-check.yml   # variable shapes + design invariants
+
 ansible-playbook main.yml -i inventory --list-hosts      # confirm targeting after inventory/group changes
 ansible-inventory -i inventory --host <name>             # resolved vars for one host
 
@@ -27,10 +31,15 @@ ansible-playbook main.yml -i inventory --ask-vault-pass --limit <host> # one hos
 ansible-vault edit group_vars/all/vault.yml
 ```
 
-Verifying template/filter logic without a target host is worth doing — most
-bugs here are Jinja, not Ansible. Write a throwaway play that loads
-`roles/config/defaults/main.yml` via `vars_files`, renders the expression to a
-file, and parse it back with Python to confirm the shape.
+Most bugs here are Jinja, not Ansible, and neither `--syntax-check` nor
+`ansible-lint` catches an expression that parses but evaluates to the wrong
+type. `tests/render-check.yml` covers the derived variables; when adding a
+tricky expression, add an assertion there — and confirm it fails when the
+regression is present (`-e var=badvalue`), or it is not testing anything.
+
+For task-level templates the render check cannot reach, write a throwaway play
+that loads `roles/config/defaults/main.yml` via `vars_files`, renders the
+expression to a file, and parse it back with Python to confirm the shape.
 
 ## Architecture
 

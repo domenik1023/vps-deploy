@@ -130,7 +130,14 @@
     owner: root
     group: root
     mode: "0600"
-    content: "{{ {'mode': crowdsec_firewall_bouncer_mode, 'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains, 'iptables_v4_chains': crowdsec_bouncer_v4_chains_present} | to_nice_yaml }}"
+    content: "{{ crowdsec_bouncer_overlay | to_nice_yaml }}"
+  vars:
+    crowdsec_bouncer_overlay:
+      mode: "{{ crowdsec_firewall_bouncer_mode }}"
+      api_url: "{{ crowdsec_lapi_url }}"
+      api_key: "{{ crowdsec_bouncer_api_key_resolved }}"
+      iptables_chains: "{{ crowdsec_bouncer_iptables_chains }}"
+      iptables_v4_chains: "{{ crowdsec_bouncer_v4_chains_present }}"
   no_log: true
   notify: Restart CrowdSec bouncer
 

@@ -162,7 +162,11 @@
     owner: root
     group: root
     mode: "0644"
-    content: "{{ (docker_daemon_options | combine({'userns-remap': docker_userns_remap}) if docker_userns_remap | length > 0 else docker_daemon_options) | to_nice_json }}\n"
+    content: "{{ docker_daemon_config | to_nice_json }}\n"
+  vars:
+    docker_daemon_config: >-
+      {{ docker_daemon_options | combine({'userns-remap': docker_userns_remap})
+         if docker_userns_remap | length > 0 else docker_daemon_options }}
   register: docker_daemon_conf
   notify: Restart Docker
 
