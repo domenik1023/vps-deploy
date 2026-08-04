@@ -17,6 +17,15 @@ crowdsec_acquisitions:
     labels:
       type: caddy
 
-crowdsec_collections:
-  - crowdsecurity/linux   # keep - overriding replaces the whole list
+# Added to the base list in the role defaults, not replacing it.
+crowdsec_collections_extra:
+  # Parser for Caddy's JSON logs, and the generic HTTP scenarios it pulls in
+  # via crowdsecurity/base-http-scenarios: scanning, probing, brute force.
   - crowdsecurity/caddy
+  # Exploitation attempts against known CVEs. A different signal from the
+  # generic scenarios above, on the same log source.
+  - crowdsecurity/http-cve
+  # Whitelists legitimate crawlers at the postoverflow stage. Without it an
+  # aggressive Googlebot crawl can look like scanning, and the resulting ban
+  # would propagate from the central LAPI to every host in the fleet.
+  - crowdsecurity/whitelist-good-actors

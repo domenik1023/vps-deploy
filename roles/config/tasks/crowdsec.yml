@@ -186,6 +186,27 @@
         type: syslog
   notify: Restart CrowdSec
 
+# UFW logs dropped packets through the kernel ring buffer, so port scans are
+# visible without rsyslog. crowdsecurity/iptables-logs keys on
+# `program == 'kernel'`, which the syslog parser extracts, hence type: syslog.
+#
+# The filter is per-field, so it cannot narrow to firewall lines alone: other
+# kernel messages are read and left unparsed. That is expected, and shows up as
+# a gap between lines_read and lines_parsed in `cscli metrics`.
+- name: Configure journald acquisition for firewall drop logs
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/acquis.d/ufw-journald.yaml
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      source: journalctl
+      journalctl_filter:
+        - "_TRANSPORT=kernel"
+      labels:
+        type: syslog
+  notify: Restart CrowdSec
+
 # Per-host sources - a Caddy container, an nginx log file, another unit.
 # Removing an entry leaves its file behind; delete it on the host by hand.
 - name: Configure extra acquisition sources
@@ -209,7 +230,7 @@
   ansible.builtin.command: "cscli collections install {{ item }}"
   args:
     creates: "/etc/crowdsec/collections/{{ item | basename }}.yaml"
-  loop: "{{ crowdsec_collections }}"
+  loop: "{{ crowdsec_collections + crowdsec_collections_extra }}"
   notify: Restart CrowdSec
 
 # --- SERVICES ---

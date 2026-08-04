@@ -184,7 +184,9 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `docker_data_dir` | `/mnt/docker` | Directory for persistent volume data (created only; not Docker's data root) |
 | `docker_daemon_options` | log rotation, live-restore, no-new-privileges | Contents of `/etc/docker/daemon.json` |
 | `docker_userns_remap` | `""` (off) | Set to `"default"` for user namespace remapping — see the note below |
-| `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
+| `crowdsec_collections` | `[crowdsecurity/linux, crowdsecurity/iptables]` | Base collections every agent gets |
+| `crowdsec_collections_extra` | `[]` | Per-host additions — add here rather than replacing the base list |
+| `ufw_logging` | `low` | UFW log level; the port-scan scenario reads these drop lines |
 | `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |

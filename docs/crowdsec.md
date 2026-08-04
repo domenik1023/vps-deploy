@@ -31,19 +31,47 @@ collections are installed on each agent even in this mode.
 
 ## What is watched out of the box
 
-Only **sshd**, read straight from the journal:
+Two sources, on every agent:
+
+- **sshd**, read from the journal (`_SYSTEMD_UNIT=ssh.service`)
+- **firewall drops**, read from the kernel log (`_TRANSPORT=kernel`), which is
+  where UFW records blocked packets
+
+Between them that covers authentication against sshd and connection attempts to
+every other port — including ones nothing listens on, which is the only signal
+here that is not tied to a specific service. `crowdsecurity/iptables-scan-multi_ports`
+needs **16 distinct destination ports** from one IP inside roughly a minute, so
+routine single-port probing is ignored and only real sweeps register.
+
+The kernel filter matches by journal field, not content, so unrelated kernel
+messages are read and left unparsed. Expect a gap between `lines_read` and
+`lines_parsed` for that source in `cscli metrics`; it is not a fault.
+
+Application traffic is **not** covered by either. CrowdSec parses only what it
+is pointed at, so a host serving HTTP needs its own source — see below.
+
+## Collections
+
+`crowdsec_collections` in the role defaults is the floor every agent gets.
+Per-host additions go in `crowdsec_collections_extra`:
 
 ```yaml
-# /etc/crowdsec/acquis.d/sshd-journald.yaml
-source: journalctl
-journalctl_filter:
-  - "_SYSTEMD_UNIT=ssh.service"
-labels:
-  type: syslog
+# host_vars/vps-docker.yml
+crowdsec_collections_extra:
+  - crowdsecurity/caddy                  # parser + generic HTTP scenarios
+  - crowdsecurity/http-cve               # known-CVE exploitation attempts
+  - crowdsecurity/whitelist-good-actors  # keeps real crawlers out of the ban list
 ```
 
-Nothing else. CrowdSec parses only what it is pointed at, so a host serving
-HTTP is not protected against HTTP attacks until you add a source for it.
+They are two variables because a `host_vars` override replaces a list outright.
+Setting `crowdsec_collections` on a host would drop `crowdsecurity/linux` and
+disable sshd detection with nothing to indicate it. `tests/render-check.yml`
+asserts the base list still holds.
+
+`crowdsecurity/whitelist-good-actors` is worth calling out: it whitelists
+legitimate crawlers at the postoverflow stage. Without it, an aggressive
+Googlebot crawl can resemble scanning, and because decisions go to the central
+LAPI, that ban would apply on every host in the fleet.
 
 ## Adding a log source
 

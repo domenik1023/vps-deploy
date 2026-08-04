@@ -10,6 +10,11 @@ ssh_port: 22822
 # It is explicitly denied by hardening tasks once the custom port is confirmed.
 ssh_old_port: 22
 
+# --- UFW ---
+# `low` logs blocked packets, which is what CrowdSec's port-scan scenario
+# consumes. Higher levels also log accepted traffic and will flood the journal.
+ufw_logging: low
+
 # --- Fail2ban ---
 # Deliberately duller than CrowdSec, which should ban first: its decisions go to
 # the central LAPI and apply across the whole fleet, while a fail2ban ban only
@@ -63,10 +68,22 @@ docker_userns_remap: ""
 # --- CrowdSec ---
 # Installed on internet-facing hosts only; the [local] group is skipped in
 # tasks/main.yml, same as the SSH hardening tasks.
-# Collections to install (parsers + scenarios); crowdsecurity/linux bundles sshd.
-# Overriding this in host_vars replaces the list, so keep crowdsecurity/linux.
+# Collections every agent gets (parsers + scenarios).
+#   linux    - sshd and syslog
+#   iptables - port-scan detection from the firewall's own drop logs, which is
+#              the only source here that covers ports nothing listens on.
+#              Its scenario needs 16 *distinct* destination ports from one IP
+#              in about a minute, so ordinary single-port probing is ignored.
+# Add host-specific ones to crowdsec_collections_extra rather than editing this
+# list, which is why they are two variables: a host_vars override replaces a
+# list outright, and silently dropping crowdsecurity/linux disables sshd
+# detection with nothing to show for it.
 crowdsec_collections:
   - crowdsecurity/linux
+  - crowdsecurity/iptables
+
+# Per-host additions, e.g. crowdsecurity/caddy on a host serving HTTP.
+crowdsec_collections_extra: []
 
 # Extra log sources for this host, each written to
 # /etc/crowdsec/acquis.d/<key>.yaml. sshd is always read from journald; a host

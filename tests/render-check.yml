@@ -80,6 +80,19 @@
           crowdsecurity/ssh-slow-bf's threshold of 11, so fail2ban will ban
           first and CrowdSec's SSH scenarios will rarely fire.
 
+    - name: The base collection list must survive host overrides
+      # crowdsec_collections is the floor every agent gets; hosts add to
+      # crowdsec_collections_extra. If a host_vars file ever sets the base list
+      # directly it replaces it wholesale, which silently drops sshd detection.
+      ansible.builtin.assert:
+        that:
+          - "'crowdsecurity/linux' in crowdsec_collections"
+          - "'crowdsecurity/iptables' in crowdsec_collections"
+          - crowdsec_collections_extra is iterable
+        fail_msg: >-
+          Host-specific collections belong in crowdsec_collections_extra;
+          crowdsec_collections is the base every agent needs.
+
     - name: The reboot window must be a valid systemd calendar expression
       ansible.builtin.assert:
         that:

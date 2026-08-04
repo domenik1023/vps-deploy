@@ -38,9 +38,13 @@
     port: "{{ ssh_port }}"
     proto: tcp
 
+# Logging is set explicitly rather than left to UFW's default: CrowdSec's
+# port-scan detection reads these kernel drop lines, and silently losing them
+# would leave the scenario installed but permanently starved.
 - name: Enable UFW
   community.general.ufw:
     state: enabled
+    logging: "{{ ufw_logging }}"
 
 # --- Fail2ban jail for sshd on custom port ---
 - name: Configure fail2ban jail for sshd
