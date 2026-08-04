@@ -1,0 +1,40 @@
+---
+# Runs on GitHub Actions (free tier covers private repos) and, unchanged, on a
+# self-hosted Forgejo instance - Forgejo Actions reads the same syntax. To move
+# it, copy this file to .forgejo/workflows/ci.yml; nothing else needs editing.
+name: CI
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pinned so a new ansible-lint release cannot turn an unrelated pull
+      # request red. Bump deliberately.
+      - name: Install tooling
+        run: pip install "ansible-core~=2.19.0" "ansible-lint~=26.6.0"
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Syntax check
+        run: ansible-playbook main.yml -i inventory --syntax-check
+
+      - name: Lint
+        run: ansible-lint
+
+      # Catches what the two steps above cannot: a Jinja expression that parses
+      # but evaluates to the wrong type, and the design invariants that are
+      # easy to reverse by accident. See tests/render-check.yml.
+      - name: Render check
+        run: ansible-playbook tests/render-check.yml

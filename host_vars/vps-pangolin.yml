@@ -7,4 +7,4 @@ ansible_port: 22822
 
 # Per-host overrides go here, for example:
 # ssh_port: 22822
-# crowdsec_firewall_bouncer: crowdsec-firewall-bouncer-nftables
+# crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-nftables

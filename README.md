@@ -6,7 +6,7 @@ Hardens a fresh Ubuntu VPS with:
 
 - SSH key-only authentication on a custom port (22822), with port 22 denied after hardening
 - UFW firewall with connection-rate limiting on the SSH port
-- Fail2ban intrusion detection (bans after 5 failed attempts)
+- Fail2ban as a local backstop behind CrowdSec (bans after 15 failed attempts)
 - CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
@@ -21,13 +21,21 @@ vps-deploy/
 ├── main.yml                          # Entry point
 ├── inventory                         # Host names, grouped (vps / local / lapi)
 ├── ansible.cfg                       # Ansible settings
+├── requirements.yml                  # Galaxy collections
+├── CLAUDE.md                         # Orientation for Claude Code
+├── .ansible-lint                     # Lint profile and the two skipped rules
+├── .github/workflows/ci.yml          # syntax check, lint, render check
+├── tests/
+│   └── render-check.yml              # Variable shapes and design invariants
 ├── group_vars/
 │   └── all/
 │       └── vault.yml                 # Encrypted secrets (ansible-vault)
 ├── docs/
 │   └── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 ├── host_vars/                        # Optional per-host settings, by name
-│   ├── testvm.yml                    # Address, SSH port, per-host overrides
+│   ├── vps-docker.yml                # Address, SSH port, per-host overrides
+│   ├── vps-pangolin.yml
+│   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
     └── config/
@@ -80,7 +88,8 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
 
 > Adding a log source (a Caddy container, an nginx file), verifying parsing and
 > troubleshooting bans are covered in **[docs/crowdsec.md](docs/crowdsec.md)**.
-> Out of the box CrowdSec watches sshd and nothing else.
+> Out of the box CrowdSec watches sshd and the firewall's own drop logs;
+> application traffic needs a source adding.
 
 CrowdSec is installed on internet-facing hosts only: the `[local]` group is
 skipped, the same way SSH hardening skips it. Local hosts sit behind NAT and
@@ -161,7 +170,8 @@ ansible_port: 22          # 22822 once hardening has run
 
 Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
 derive from `inventory_hostname`, so the name is what the host registers as on
-the central LAPI — `vps1` and `vps1-firewall-bouncer` rather than a bare IP.
+the central LAPI — `vps-docker` and `vps-docker-firewall-bouncer` rather than
+a bare IP.
 Renaming a host that is already registered makes it register again under the
 new name; delete the leftovers on the master with `cscli machines delete` and
 `cscli bouncers delete`.
@@ -176,7 +186,7 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `admin_password` | `{{ vault_admin_password }}` | sha512-crypt hash (from vault) |
 | `ssh_port` | `22822` | Custom SSH port |
 | `ssh_old_port` | `22` | Standard port to deny after hardening |
-| `fail2ban_maxretry` | `5` | Failed attempts before ban |
+| `fail2ban_maxretry` | `15` | Failed attempts before ban — set above CrowdSec's SSH thresholds so it bans first |
 | `fail2ban_findtime` | `10m` | Time window for failed attempts |
 | `fail2ban_bantime` | `1h` | How long IPs stay banned |
 | `unattended_reboot_enabled` | `true` | Enable the weekly reboot timer for pending upgrades |
@@ -184,16 +194,20 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `docker_data_dir` | `/mnt/docker` | Directory for persistent volume data (created only; not Docker's data root) |
 | `docker_daemon_options` | log rotation, live-restore, no-new-privileges | Contents of `/etc/docker/daemon.json` |
 | `docker_userns_remap` | `""` (off) | Set to `"default"` for user namespace remapping — see the note below |
-| `crowdsec_collections` | `[crowdsecurity/linux]` | CrowdSec collections (parsers + scenarios) to install |
+| `crowdsec_collections` | `[crowdsecurity/linux, crowdsecurity/iptables]` | Base collections every agent gets |
+| `crowdsec_collections_extra` | `[]` | Per-host additions — add here rather than replacing the base list |
+| `ufw_logging` | `low` | UFW log level; the port-scan scenario reads these drop lines |
 | `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
-| `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
+| `crowdsec_firewall_bouncer_mode` | derived from the package | Backend pinned in the `.local` overlay, so a base config still holding `${BACKEND}` cannot stop the bouncer |
+| `crowdsec_lapi_url` | `https://crowdsec.d1023.de` | Central LAPI server URL (override per environment) |
 | `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
 | `crowdsec_bouncer_name` | `{{ inventory_hostname }}-firewall-bouncer` | Bouncer name on the central LAPI |
-| `crowdsec_bouncer_iptables_chains` | `[INPUT, DOCKER-USER]` | Chains bans are enforced in; `DOCKER-USER` covers published container ports |
-| `crowdsec_lapi_host` | `""` (empty) | **Required.** Inventory host running the LAPI, used to provision credentials |
-| `crowdsec_lapi_docker_container` | `""` (empty) | Container name, when the LAPI runs in Docker on that host |
+| `crowdsec_bouncer_iptables_chains` | `[INPUT]` | Chains bans are enforced in, for IPv4 **and** IPv6 — must exist in both |
+| `crowdsec_bouncer_iptables_v4_chains` | `[DOCKER-USER]` | IPv4-only chains; absent ones are dropped at run time |
+| `crowdsec_lapi_host` | `crowdsec-master` | **Required.** Inventory host running the LAPI, used to provision credentials |
+| `crowdsec_lapi_docker_container` | `crowdsec-master-crowdsec-1` | Container name, when the LAPI runs in Docker on that host |
 | `crowdsec_lapi_cscli` | `["cscli"]` / `docker exec …` | `cscli` invocation prefix on the LAPI host; override for podman, compose, wrappers |
 | `crowdsec_lapi_validate_certs` | `true` | Set to `false` if the LAPI serves a self-signed certificate |
 
@@ -221,6 +235,23 @@ ansible-playbook main.yml -i inventory \
 
 Update `ansible_port` to `22822` in `host_vars/<name>.yml` for each VPS after its first run.
 
+### Checks
+
+The three commands CI runs, which need no target host:
+
+```bash
+ansible-playbook main.yml -i inventory --syntax-check
+ansible-lint
+ansible-playbook tests/render-check.yml
+```
+
+The render check exists because the other two happily accept a Jinja expression
+that parses but evaluates to the wrong type — a list that becomes a string, a
+dict that stops being valid JSON. It also pins the design decisions that are
+easy to reverse by accident: fail2ban staying duller than CrowdSec, user
+namespace remapping staying off, and only both-family chains in
+`crowdsec_bouncer_iptables_chains`.
+
 ### Dry run (check mode)
 
 ```bash
@@ -239,7 +270,7 @@ ansible-playbook main.yml -i inventory --private-key=~/.ssh/domenik1023 --ask-va
   the old data is still on disk under the other path. Enable it per host with
   `docker_userns_remap: "default"` only where nothing needs the socket.
 - The `[local]` inventory group skips SSH hardening to prevent self-lockout during testing, and skips CrowdSec, which only belongs on internet-facing hosts
-- CrowdSec bans are enforced in `INPUT` **and** `DOCKER-USER`. The bouncer's own default is `INPUT` alone, which misses traffic Docker forwards to published container ports — UFW and Fail2ban have that same blind spot, so on a container host they only protect services listening on the host itself. Container-to-container traffic crosses `DOCKER-USER` too but carries RFC1918 source addresses, which never appear in the ban list. The bouncer unit gets a drop-in ordering it after `docker.service`, since `DOCKER-USER` does not exist until dockerd has built its rules.
+- CrowdSec bans are enforced in `INPUT` **and** `DOCKER-USER`. The bouncer's own default is `INPUT` alone, which misses traffic Docker forwards to published container ports — UFW and Fail2ban have that same blind spot, so on a container host they only protect services listening on the host itself. Container-to-container traffic crosses `DOCKER-USER` too but carries RFC1918 source addresses, which never appear in the ban list. `DOCKER-USER` is configured as an IPv4-only chain: `iptables_chains` applies to both families, and Docker creates that chain in ip6tables only when IPv6 is enabled for Docker — a chain the bouncer cannot find aborts its startup. Chains missing on a host are dropped at run time, and the unit gets a drop-in ordering it after `docker.service`.
 - CrowdSec is installed from the official packagecloud repository and runs alongside Fail2ban; both can ban independently. CrowdSec reads sshd events directly from journald, so it works on minimal images without rsyslog.
 - CrowdSec runs in **agent-only mode**: the local API server is disabled and the agent pushes alerts to the central LAPI server (`crowdsec_lapi_url`). The firewall bouncer pulls decisions from the same central LAPI, so bans made anywhere in the fleet apply on this host too. CAPI enrollment/console registration happens on the central LAPI server, not on the agents.
 - `host_key_checking` is disabled in `ansible.cfg` for the initial connection; use `ssh-keyscan` to pre-populate `known_hosts` in production environments

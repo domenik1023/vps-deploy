@@ -97,6 +97,30 @@
   no_log: true
   notify: Restart CrowdSec
 
+# A chain the bouncer cannot find aborts its startup, and `-t` runs the same
+# initialisation, so the config test fails too and systemd never starts the
+# unit. Probe first and configure only what is actually there.
+- name: Check which IPv4-only bouncer chains exist on this host
+  ansible.builtin.command:
+    argv: [iptables, --numeric, --list, "{{ item }}"]
+  loop: "{{ crowdsec_bouncer_iptables_v4_chains }}"
+  register: crowdsec_v4_chain_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Keep only the IPv4 chains that exist
+  ansible.builtin.set_fact:
+    crowdsec_bouncer_v4_chains_present: "{{ crowdsec_v4_chain_probe.results | selectattr('rc', 'eq', 0) | map(attribute='item') | list }}"
+
+- name: Report IPv4 chains skipped because this host does not have them
+  ansible.builtin.debug:
+    msg: >-
+      Not enforcing CrowdSec bans in
+      {{ crowdsec_bouncer_iptables_v4_chains | difference(crowdsec_bouncer_v4_chains_present) | join(', ') }}
+      - absent on this host. Traffic through those chains stays unfiltered.
+  when: crowdsec_bouncer_v4_chains_present | length < crowdsec_bouncer_iptables_v4_chains | length
+
 # The bouncer package auto-registers against a local LAPI, which doesn't
 # exist here. The .local overlay redirects it to the central LAPI with a
 # key created there via `cscli bouncers add`.
@@ -106,7 +130,14 @@
     owner: root
     group: root
     mode: "0600"
-    content: "{{ {'api_url': crowdsec_lapi_url, 'api_key': crowdsec_bouncer_api_key_resolved, 'iptables_chains': crowdsec_bouncer_iptables_chains} | to_nice_yaml }}"
+    content: "{{ crowdsec_bouncer_overlay | to_nice_yaml }}"
+  vars:
+    crowdsec_bouncer_overlay:
+      mode: "{{ crowdsec_firewall_bouncer_mode }}"
+      api_url: "{{ crowdsec_lapi_url }}"
+      api_key: "{{ crowdsec_bouncer_api_key_resolved }}"
+      iptables_chains: "{{ crowdsec_bouncer_iptables_chains }}"
+      iptables_v4_chains: "{{ crowdsec_bouncer_v4_chains_present }}"
   no_log: true
   notify: Restart CrowdSec bouncer
 
@@ -120,7 +151,7 @@
     owner: root
     group: root
     mode: "0755"
-  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  when: "'DOCKER-USER' in crowdsec_bouncer_v4_chains_present"
 
 - name: Order the firewall bouncer after Docker
   ansible.builtin.copy:
@@ -132,7 +163,7 @@
       [Unit]
       After=docker.service
       Wants=docker.service
-  when: "'DOCKER-USER' in crowdsec_bouncer_iptables_chains"
+  when: "'DOCKER-USER' in crowdsec_bouncer_v4_chains_present"
   notify:
     - Reload systemd
     - Restart CrowdSec bouncer
@@ -151,6 +182,27 @@
       source: journalctl
       journalctl_filter:
         - "_SYSTEMD_UNIT=ssh.service"
+      labels:
+        type: syslog
+  notify: Restart CrowdSec
+
+# UFW logs dropped packets through the kernel ring buffer, so port scans are
+# visible without rsyslog. crowdsecurity/iptables-logs keys on
+# `program == 'kernel'`, which the syslog parser extracts, hence type: syslog.
+#
+# The filter is per-field, so it cannot narrow to firewall lines alone: other
+# kernel messages are read and left unparsed. That is expected, and shows up as
+# a gap between lines_read and lines_parsed in `cscli metrics`.
+- name: Configure journald acquisition for firewall drop logs
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/acquis.d/ufw-journald.yaml
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      source: journalctl
+      journalctl_filter:
+        - "_TRANSPORT=kernel"
       labels:
         type: syslog
   notify: Restart CrowdSec
@@ -178,7 +230,7 @@
   ansible.builtin.command: "cscli collections install {{ item }}"
   args:
     creates: "/etc/crowdsec/collections/{{ item | basename }}.yaml"
-  loop: "{{ crowdsec_collections }}"
+  loop: "{{ crowdsec_collections + crowdsec_collections_extra }}"
   notify: Restart CrowdSec
 
 # --- SERVICES ---

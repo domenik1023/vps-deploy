@@ -31,19 +31,47 @@ collections are installed on each agent even in this mode.
 
 ## What is watched out of the box
 
-Only **sshd**, read straight from the journal:
+Two sources, on every agent:
+
+- **sshd**, read from the journal (`_SYSTEMD_UNIT=ssh.service`)
+- **firewall drops**, read from the kernel log (`_TRANSPORT=kernel`), which is
+  where UFW records blocked packets
+
+Between them that covers authentication against sshd and connection attempts to
+every other port — including ones nothing listens on, which is the only signal
+here that is not tied to a specific service. `crowdsecurity/iptables-scan-multi_ports`
+needs **16 distinct destination ports** from one IP inside roughly a minute, so
+routine single-port probing is ignored and only real sweeps register.
+
+The kernel filter matches by journal field, not content, so unrelated kernel
+messages are read and left unparsed. Expect a gap between `lines_read` and
+`lines_parsed` for that source in `cscli metrics`; it is not a fault.
+
+Application traffic is **not** covered by either. CrowdSec parses only what it
+is pointed at, so a host serving HTTP needs its own source — see below.
+
+## Collections
+
+`crowdsec_collections` in the role defaults is the floor every agent gets.
+Per-host additions go in `crowdsec_collections_extra`:
 
 ```yaml
-# /etc/crowdsec/acquis.d/sshd-journald.yaml
-source: journalctl
-journalctl_filter:
-  - "_SYSTEMD_UNIT=ssh.service"
-labels:
-  type: syslog
+# host_vars/vps-docker.yml
+crowdsec_collections_extra:
+  - crowdsecurity/caddy                  # parser + generic HTTP scenarios
+  - crowdsecurity/http-cve               # known-CVE exploitation attempts
+  - crowdsecurity/whitelist-good-actors  # keeps real crawlers out of the ban list
 ```
 
-Nothing else. CrowdSec parses only what it is pointed at, so a host serving
-HTTP is not protected against HTTP attacks until you add a source for it.
+They are two variables because a `host_vars` override replaces a list outright.
+Setting `crowdsec_collections` on a host would drop `crowdsecurity/linux` and
+disable sshd detection with nothing to indicate it. `tests/render-check.yml`
+asserts the base list still holds.
+
+`crowdsecurity/whitelist-good-actors` is worth calling out: it whitelists
+legitimate crawlers at the postoverflow stage. Without it, an aggressive
+Googlebot crawl can resemble scanning, and because decisions go to the central
+LAPI, that ban would apply on every host in the fleet.
 
 ## Adding a log source
 
@@ -82,8 +110,7 @@ crowdsec_acquisitions:
     labels:
       type: caddy
 
-crowdsec_collections:
-  - crowdsecurity/linux   # keep - overriding replaces the whole list
+crowdsec_collections_extra:
   - crowdsecurity/caddy
 ```
 
@@ -128,6 +155,35 @@ crowdsec_acquisitions:
     labels:
       type: syslog
 ```
+
+## Sharing SSH with fail2ban
+
+Both watch sshd, and they are not independent: whichever bans first drops the
+attacker's packets, so the other never sees enough failures to act. The
+thresholds are set so CrowdSec wins.
+
+| Detector | Fires at |
+|---|---|
+| `crowdsecurity/ssh-bf` | 6 failures faster than one per 10s |
+| `crowdsecurity/ssh-slow-bf` | 11 failures faster than one per 60s |
+| fail2ban (`fail2ban_maxretry`) | 15 failures in `fail2ban_findtime` |
+
+CrowdSec first is what you want: its decision reaches the central LAPI and
+every agent in the fleet, so an IP banned here is blocked everywhere. A
+fail2ban ban stays on the host that saw it.
+
+fail2ban is kept as a backstop rather than removed, because it is the only
+part of this that keeps working when the CrowdSec agent, the LAPI or the
+bouncer is down.
+
+CrowdSec's buckets leak and fail2ban counts in a fixed window, so the ordering
+cannot hold at every possible attack rate — somewhere in the middle they cross
+over. It is tuned for the common case, a fast brute force.
+
+Expect few SSH alerts regardless: sshd is on a non-standard port with port 22
+denied, so scanners rarely reach it at all. Web traffic is unavoidable and will
+always dominate. Check which system acted with `fail2ban-client status sshd`
+against `cscli alerts list --scenario crowdsecurity/ssh-bf` on the master.
 
 ## The reverse proxy trap
 
@@ -179,11 +235,13 @@ sudo ipset list crowdsec-blacklists | head       # populated?
 
 | Symptom | Where to look |
 |---|---|
-| `lines_read` rising, `lines_parsed` zero | `labels.type` does not match an installed parser; check `cscli parsers list` |
+| `lines_read` rising, `lines_parsed` zero | `labels.type` does not match an installed parser; check `cscli parsers list`. A *partial* gap on the kernel source is normal — see *What is watched out of the box* |
 | Parsed, but no alerts | Scenario not installed (`cscli scenarios list`), or the threshold genuinely is not met |
 | Alerts on the master, but nothing blocked | Bouncer is not pulling; check `cscli metrics` on the master and the bouncer's log in `/var/log/` |
-| Host traffic blocked, container traffic not | `DOCKER-USER` missing from `crowdsec_bouncer_iptables_chains` |
+| Host traffic blocked, container traffic not | `DOCKER-USER` absent on the host, so the role dropped it — the play prints which chains it skipped |
 | Bouncer dead after a reboot | `DOCKER-USER` did not exist yet at start; the role installs an `After=docker.service` drop-in for this |
+| `firewall '${BACKEND}' is not supported` | The base config is upstream's raw template — `mode: ${BACKEND}` is normally substituted per package at build time. The role pins `mode` in the `.local` overlay, so re-running the playbook fixes it. Reproduce with `crowdsec-firewall-bouncer -c /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml -t` |
+| `ExecStartPre` exits 1, `journalctl` shows nothing | A configured chain does not exist. `-t` runs the same init as a real start, so the config test fails too. The bouncer logs to `/var/log/crowdsec-firewall-bouncer.log`, not the journal — look there. Note `iptables_chains` applies to **both** families, so a chain must exist in ip6tables too; use `iptables_v4_chains` for IPv4-only ones like `DOCKER-USER` |
 | Your own proxy gets banned | See *The reverse proxy trap* above |
 
 ## Operations on the master

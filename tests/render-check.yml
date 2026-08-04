@@ -1,0 +1,101 @@
+---
+# Renders the role's derived variables and asserts their shape.
+#
+# --syntax-check and ansible-lint both parse this repo happily while a Jinja
+# expression still evaluates to the wrong *type* - a list that silently becomes
+# a string, a dict that stops being valid JSON. Those only surface on a real
+# host, usually as a service that will not start. This play catches them on a
+# laptop, with no target and no side effects.
+#
+#   ansible-playbook tests/render-check.yml
+#
+# It deliberately reads roles/config/defaults/main.yml rather than restating the
+# expressions, so it tests the real definitions.
+- name: Check that the role's derived variables render to the right shapes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../roles/config/defaults/main.yml
+  vars:
+    # Only present so defaults referencing it can be loaded; never used.
+    vault_admin_password: "$6$placeholder"
+
+  tasks:
+    - name: The cscli prefix must stay a list
+      # If Ansible ever stops preserving the native type here, this becomes the
+      # string "['docker', 'exec', ...]" and every delegated command breaks with
+      # a confusing "No such file or directory".
+      ansible.builtin.assert:
+        that:
+          - crowdsec_lapi_cscli is sequence
+          - crowdsec_lapi_cscli is not string
+          - crowdsec_lapi_cscli[-1] == 'cscli'
+        success_msg: "crowdsec_lapi_cscli renders as {{ crowdsec_lapi_cscli }}"
+
+    - name: The bouncer mode must follow the package variant
+      # Package name, service name and backend mode are three different strings.
+      ansible.builtin.assert:
+        that:
+          - crowdsec_firewall_bouncer_mode in ['iptables', 'nftables']
+          - crowdsec_firewall_bouncer_mode in crowdsec_firewall_bouncer_package
+        success_msg: "{{ crowdsec_firewall_bouncer_package }} -> mode={{ crowdsec_firewall_bouncer_mode }}"
+
+    - name: The Docker daemon config must be a mapping that survives a JSON round trip
+      ansible.builtin.assert:
+        that:
+          - docker_daemon_options is mapping
+          - (docker_daemon_options | to_nice_json | from_json) == docker_daemon_options
+          - docker_daemon_options['live-restore'] is boolean
+          - docker_daemon_options['log-opts']['max-file'] is string
+
+    - name: User namespace remapping must stay opt-in
+      # Turning it on relocates Docker's data root and breaks every container
+      # that bind-mounts the socket, so it should never become a default again.
+      ansible.builtin.assert:
+        that:
+          - docker_userns_remap | length == 0
+
+    - name: Chains applied to both address families must exist in both
+      # iptables_chains is appended to the v4 *and* v6 lists by the bouncer, and
+      # a chain it cannot find aborts startup. Docker-specific chains belong in
+      # the v4-only list, which is probed before use.
+      ansible.builtin.assert:
+        that:
+          - crowdsec_bouncer_iptables_chains | difference(['INPUT', 'OUTPUT', 'FORWARD']) | length == 0
+        fail_msg: >-
+          crowdsec_bouncer_iptables_chains may only hold chains that exist in
+          iptables and ip6tables alike. Put anything Docker creates in
+          crowdsec_bouncer_iptables_v4_chains instead.
+
+    - name: Fail2ban must stay duller than CrowdSec's SSH scenarios
+      # crowdsecurity/ssh-bf overflows at 6 failures and ssh-slow-bf at 11. A
+      # lower fail2ban threshold bans first and starves CrowdSec of the events
+      # it needs, which costs the fleet-wide decision.
+      ansible.builtin.assert:
+        that:
+          - fail2ban_maxretry | int > 11
+        fail_msg: >-
+          fail2ban_maxretry ({{ fail2ban_maxretry }}) is at or below
+          crowdsecurity/ssh-slow-bf's threshold of 11, so fail2ban will ban
+          first and CrowdSec's SSH scenarios will rarely fire.
+
+    - name: The base collection list must survive host overrides
+      # crowdsec_collections is the floor every agent gets; hosts add to
+      # crowdsec_collections_extra. If a host_vars file ever sets the base list
+      # directly it replaces it wholesale, which silently drops sshd detection.
+      ansible.builtin.assert:
+        that:
+          - "'crowdsecurity/linux' in crowdsec_collections"
+          - "'crowdsecurity/iptables' in crowdsec_collections"
+          - crowdsec_collections_extra is iterable
+        fail_msg: >-
+          Host-specific collections belong in crowdsec_collections_extra;
+          crowdsec_collections is the base every agent needs.
+
+    - name: The reboot window must be a valid systemd calendar expression
+      ansible.builtin.assert:
+        that:
+          - unattended_reboot_oncalendar is search('^[A-Za-z]{3} \\*-\\*-\\* [0-9]{2}:[0-9]{2}:[0-9]{2}$')
+        fail_msg: >-
+          Verify with `systemd-analyze calendar "{{ unattended_reboot_oncalendar }}"`.
