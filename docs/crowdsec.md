@@ -110,8 +110,7 @@ crowdsec_acquisitions:
     labels:
       type: caddy
 
-crowdsec_collections:
-  - crowdsecurity/linux   # keep - overriding replaces the whole list
+crowdsec_collections_extra:
   - crowdsecurity/caddy
 ```
 
@@ -236,7 +235,7 @@ sudo ipset list crowdsec-blacklists | head       # populated?
 
 | Symptom | Where to look |
 |---|---|
-| `lines_read` rising, `lines_parsed` zero | `labels.type` does not match an installed parser; check `cscli parsers list` |
+| `lines_read` rising, `lines_parsed` zero | `labels.type` does not match an installed parser; check `cscli parsers list`. A *partial* gap on the kernel source is normal — see *What is watched out of the box* |
 | Parsed, but no alerts | Scenario not installed (`cscli scenarios list`), or the threshold genuinely is not met |
 | Alerts on the master, but nothing blocked | Bouncer is not pulling; check `cscli metrics` on the master and the bouncer's log in `/var/log/` |
 | Host traffic blocked, container traffic not | `DOCKER-USER` absent on the host, so the role dropped it — the play prints which chains it skipped |

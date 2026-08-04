@@ -21,13 +21,21 @@ vps-deploy/
 ├── main.yml                          # Entry point
 ├── inventory                         # Host names, grouped (vps / local / lapi)
 ├── ansible.cfg                       # Ansible settings
+├── requirements.yml                  # Galaxy collections
+├── CLAUDE.md                         # Orientation for Claude Code
+├── .ansible-lint                     # Lint profile and the two skipped rules
+├── .github/workflows/ci.yml          # syntax check, lint, render check
+├── tests/
+│   └── render-check.yml              # Variable shapes and design invariants
 ├── group_vars/
 │   └── all/
 │       └── vault.yml                 # Encrypted secrets (ansible-vault)
 ├── docs/
 │   └── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 ├── host_vars/                        # Optional per-host settings, by name
-│   ├── testvm.yml                    # Address, SSH port, per-host overrides
+│   ├── vps-docker.yml                # Address, SSH port, per-host overrides
+│   ├── vps-pangolin.yml
+│   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
     └── config/
@@ -80,7 +88,8 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
 
 > Adding a log source (a Caddy container, an nginx file), verifying parsing and
 > troubleshooting bans are covered in **[docs/crowdsec.md](docs/crowdsec.md)**.
-> Out of the box CrowdSec watches sshd and nothing else.
+> Out of the box CrowdSec watches sshd and the firewall's own drop logs;
+> application traffic needs a source adding.
 
 CrowdSec is installed on internet-facing hosts only: the `[local]` group is
 skipped, the same way SSH hardening skips it. Local hosts sit behind NAT and
@@ -161,7 +170,8 @@ ansible_port: 22          # 22822 once hardening has run
 
 Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
 derive from `inventory_hostname`, so the name is what the host registers as on
-the central LAPI — `vps1` and `vps1-firewall-bouncer` rather than a bare IP.
+the central LAPI — `vps-docker` and `vps-docker-firewall-bouncer` rather than
+a bare IP.
 Renaming a host that is already registered makes it register again under the
 new name; delete the leftovers on the master with `cscli machines delete` and
 `cscli bouncers delete`.
@@ -191,13 +201,13 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
 | `crowdsec_firewall_bouncer_mode` | derived from the package | Backend pinned in the `.local` overlay, so a base config still holding `${BACKEND}` cannot stop the bouncer |
-| `crowdsec_lapi_url` | `https://lapi.example.com:8080` | Central LAPI server URL (override per environment) |
+| `crowdsec_lapi_url` | `https://crowdsec.d1023.de` | Central LAPI server URL (override per environment) |
 | `crowdsec_lapi_login` | `{{ inventory_hostname }}` | Machine login on the central LAPI |
 | `crowdsec_bouncer_name` | `{{ inventory_hostname }}-firewall-bouncer` | Bouncer name on the central LAPI |
 | `crowdsec_bouncer_iptables_chains` | `[INPUT]` | Chains bans are enforced in, for IPv4 **and** IPv6 — must exist in both |
 | `crowdsec_bouncer_iptables_v4_chains` | `[DOCKER-USER]` | IPv4-only chains; absent ones are dropped at run time |
-| `crowdsec_lapi_host` | `""` (empty) | **Required.** Inventory host running the LAPI, used to provision credentials |
-| `crowdsec_lapi_docker_container` | `""` (empty) | Container name, when the LAPI runs in Docker on that host |
+| `crowdsec_lapi_host` | `crowdsec-master` | **Required.** Inventory host running the LAPI, used to provision credentials |
+| `crowdsec_lapi_docker_container` | `crowdsec-master-crowdsec-1` | Container name, when the LAPI runs in Docker on that host |
 | `crowdsec_lapi_cscli` | `["cscli"]` / `docker exec …` | `cscli` invocation prefix on the LAPI host; override for podman, compose, wrappers |
 | `crowdsec_lapi_validate_certs` | `true` | Set to `false` if the LAPI serves a self-signed certificate |
 
@@ -224,6 +234,23 @@ ansible-playbook main.yml -i inventory \
 ```
 
 Update `ansible_port` to `22822` in `host_vars/<name>.yml` for each VPS after its first run.
+
+### Checks
+
+The three commands CI runs, which need no target host:
+
+```bash
+ansible-playbook main.yml -i inventory --syntax-check
+ansible-lint
+ansible-playbook tests/render-check.yml
+```
+
+The render check exists because the other two happily accept a Jinja expression
+that parses but evaluates to the wrong type — a list that becomes a string, a
+dict that stops being valid JSON. It also pins the design decisions that are
+easy to reverse by accident: fail2ban staying duller than CrowdSec, user
+namespace remapping staying off, and only both-family chains in
+`crowdsec_bouncer_iptables_chains`.
 
 ### Dry run (check mode)
 
