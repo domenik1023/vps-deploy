@@ -38,9 +38,10 @@
     port: "{{ ssh_port }}"
     proto: tcp
 
-# Logging is set explicitly rather than left to UFW's default: CrowdSec's
-# port-scan detection reads these kernel drop lines, and silently losing them
-# would leave the scenario installed but permanently starved.
+# Logging is set explicitly rather than left to UFW's default, but it is there
+# to be read by hand - CrowdSec does not consume it. ufw rate-limits its own LOG
+# rules below loglevel `high`, so crowdsec.yml installs a separate unthrottled
+# rule for the port-scan scenario. See ufw_logging in the role defaults.
 - name: Enable UFW
   community.general.ufw:
     state: enabled

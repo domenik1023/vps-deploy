@@ -34,18 +34,63 @@ collections are installed on each agent even in this mode.
 Two sources, on every agent:
 
 - **sshd**, read from the journal (`_SYSTEMD_UNIT=ssh.service`)
-- **firewall drops**, read from the kernel log (`_TRANSPORT=kernel`), which is
-  where UFW records blocked packets
+- **new inbound connections**, read from the kernel log (`_TRANSPORT=kernel`)
 
 Between them that covers authentication against sshd and connection attempts to
 every other port — including ones nothing listens on, which is the only signal
-here that is not tied to a specific service. `crowdsecurity/iptables-scan-multi_ports`
-needs **16 distinct destination ports** from one IP inside roughly a minute, so
-routine single-port probing is ignored and only real sweeps register.
+here that is not tied to a specific service.
 
 The kernel filter matches by journal field, not content, so unrelated kernel
 messages are read and left unparsed. Expect a gap between `lines_read` and
 `lines_parsed` for that source in `cscli metrics`; it is not a fault.
+
+### Why the firewall source is not UFW's own logging
+
+`crowdsecurity/iptables-logs` documents what it needs: an
+`iptables -A INPUT -m state --state NEW -j LOG` rule or similar, logging *all*
+new connections, successful or not, unthrottled. UFW's `[UFW BLOCK]` lines
+cannot serve that purpose, for two independent reasons:
+
+- Below loglevel `high`, UFW attaches `-m limit --limit 3/min --limit-burst 10`
+  to its LOG rules. `crowdsecurity/iptables-scan-multi_ports` is a leaky bucket
+  of capacity 15 draining one entry every **5s** — it needs 16 distinct ports
+  arriving faster than 12/min. Fed at 3/min it drains faster than it fills and
+  can never overflow, at any burst size.
+- An explicit `ufw deny` rule — port 22 here — renders as a bare `-j DROP` and
+  terminates in `ufw-user-input` without logging at all. Adding `log` to the
+  rule gets you a log line on a different path, with its own 3/min limit
+  hardcoded in UFW's source and unaffected by loglevel.
+
+So `crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
+both `/etc/ufw/before.rules` and `/etc/ufw/before6.rules`:
+
+```
+-A ufw-before-input -m conntrack --ctstate NEW -j LOG --log-prefix "[CS NEW] "
+```
+
+That chain runs ahead of every user rule, so a packet is logged before anything
+can drop it silently, and loopback plus `ESTABLISHED,RELATED` traffic has
+already been accepted further up and never reaches it.
+
+`ufw_logging` is now for reading by hand only. Nothing in CrowdSec depends on
+it, and raising it does not substitute for the rule above.
+
+Two consequences worth knowing:
+
+- **Accepted traffic is logged too**, and the parser counts every parsed TCP/UDP
+  packet as a drop. That is upstream's design — the scenario tolerates it
+  because a legitimate client touches one or two ports, never sixteen. It does
+  mean one kernel log line per inbound connection, which on a busy web host is
+  real journal volume.
+- **A false positive is expensive.** Decisions go to the central LAPI and apply
+  fleet-wide, so anything that legitimately fans out across many ports should go
+  in `crowdsec_whitelist_ips` / `crowdsec_whitelist_cidrs`. RFC1918 is already
+  covered by `crowdsecurity/whitelists`; public addresses are not.
+
+Because `ufw reload` is a stop/start that flushes the built-in chains, it takes
+the firewall bouncer's rules with it. The `Reload UFW` handler notifies
+`Restart CrowdSec bouncer` for exactly that reason — do not reorder them in
+`handlers/main.yml`.
 
 Application traffic is **not** covered by either. CrowdSec parses only what it
 is pointed at, so a host serving HTTP needs its own source — see below.
@@ -236,6 +281,10 @@ sudo ipset list crowdsec-blacklists | head       # populated?
 | Symptom | Where to look |
 |---|---|
 | `lines_read` rising, `lines_parsed` zero | `labels.type` does not match an installed parser; check `cscli parsers list`. A *partial* gap on the kernel source is normal — see *What is watched out of the box* |
+| No firewall lines at all, only `[UFW BLOCK]` at ~3/min | The role's LOG rule is missing. `grep -A2 'crowdsec firewall logging' /etc/ufw/before.rules`, then confirm it is live with `iptables -S ufw-before-input \| grep LOG`. Re-running the playbook reinstalls it |
+| Firewall lines arrive, `iptables-scan-multi_ports` never overflows | Check the prefix is not being filtered out — it must not contain `ACCEPT` or `UFW AUDIT`. Then `cscli metrics show scenarios` for pours vs overflows; 16 distinct ports faster than 12/min is a genuinely high bar |
+| `ufw reload` fails after an edit to `before.rules` | UFW is left **stopped with a default-ACCEPT policy** — the host is unfiltered. Fix the file and `ufw enable` immediately. `tests/render-check.yml` guards the templated log prefix against the usual cause |
+| A ban you did not expect, on every host at once | The firewall rule logs accepted connections too and the parser counts them as drops. Add the source to `crowdsec_whitelist_ips` / `crowdsec_whitelist_cidrs` |
 | Parsed, but no alerts | Scenario not installed (`cscli scenarios list`), or the threshold genuinely is not met |
 | Alerts on the master, but nothing blocked | Bouncer is not pulling; check `cscli metrics` on the master and the bouncer's log in `/var/log/` |
 | Host traffic blocked, container traffic not | `DOCKER-USER` absent on the host, so the role dropped it — the play prints which chains it skipped |
