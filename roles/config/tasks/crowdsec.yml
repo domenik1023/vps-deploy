@@ -168,6 +168,41 @@
     - Reload systemd
     - Restart CrowdSec bouncer
 
+# --- FIREWALL LOGGING ---
+# The LOG rule crowdsecurity/iptables-logs is documented to require: every new
+# connection, successful or not, with no rate limit. ufw's own logging cannot
+# stand in for it - see crowdsec_firewall_log_prefix in the role defaults for
+# why raising ufw_logging does not fix it either.
+#
+# ufw-before-input is the chain to use. It runs ahead of every user rule, so a
+# packet is logged before an explicit `deny` can drop it silently, and
+# before.rules has already accepted loopback and ESTABLISHED/RELATED traffic
+# above, so only genuinely new inbound connections reach here.
+#
+# insertafter matches the *last* `-A ufw-before-input` line, which puts the rule
+# at the end of that chain's rules and leaves the rest of the file - including
+# anything ucf restored on an ufw upgrade - untouched.
+- name: Log new connections for CrowdSec (IPv4)
+  ansible.builtin.blockinfile:
+    path: /etc/ufw/before.rules
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - crowdsec firewall logging"
+    insertafter: '^-A ufw-before-input '
+    block: |
+      -A ufw-before-input -m conntrack --ctstate NEW -j LOG --log-prefix "{{ crowdsec_firewall_log_prefix }}"
+  notify: Reload UFW
+
+# Same rule for IPv6. Without it an IPv6 sweep is invisible: the parser reads
+# whatever SRC the kernel logged and the LAPI stores v6 decisions happily, but
+# nothing would ever log the packets.
+- name: Log new connections for CrowdSec (IPv6)
+  ansible.builtin.blockinfile:
+    path: /etc/ufw/before6.rules
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - crowdsec firewall logging"
+    insertafter: '^-A ufw6-before-input '
+    block: |
+      -A ufw6-before-input -m conntrack --ctstate NEW -j LOG --log-prefix "{{ crowdsec_firewall_log_prefix }}"
+  notify: Reload UFW
+
 # --- ACQUISITION ---
 # Minimal Ubuntu images may not ship rsyslog, so /var/log/auth.log can be
 # missing. Read sshd authentication events straight from the journal to be
@@ -186,13 +221,19 @@
         type: syslog
   notify: Restart CrowdSec
 
-# UFW logs dropped packets through the kernel ring buffer, so port scans are
-# visible without rsyslog. crowdsecurity/iptables-logs keys on
+# Reads the LOG rule installed above, which lands in the kernel ring buffer.
+# `_TRANSPORT=kernel` is the journal-field spelling of journalctl's `-k`, which
+# is what the crowdsecurity/iptables collection's own acquisition template uses
+# on distributions without rsyslog. crowdsecurity/iptables-logs keys on
 # `program == 'kernel'`, which the syslog parser extracts, hence type: syslog.
 #
 # The filter is per-field, so it cannot narrow to firewall lines alone: other
 # kernel messages are read and left unparsed. That is expected, and shows up as
 # a gap between lines_read and lines_parsed in `cscli metrics`.
+#
+# The filename says ufw for historical reasons and is kept that way on purpose:
+# renaming it would leave the old file behind on every host already running it,
+# and the same journal would then be acquired twice.
 - name: Configure journald acquisition for firewall drop logs
   ansible.builtin.copy:
     dest: /etc/crowdsec/acquis.d/ufw-journald.yaml
@@ -231,6 +272,50 @@
   args:
     creates: "/etc/crowdsec/collections/{{ item | basename }}.yaml"
   loop: "{{ crowdsec_collections + crowdsec_collections_extra }}"
+  notify: Restart CrowdSec
+
+# --- WHITELIST ---
+# The firewall rule above logs accepted connections as well as dropped ones and
+# the parser counts them all as drops, so a host that legitimately fans out
+# across many ports can overflow the scan scenario. Decisions go to the central
+# LAPI and are enforced fleet-wide, which makes that false positive expensive.
+#
+# s02-enrich is the same stage crowdsecurity/whitelists uses for RFC1918, so
+# whitelisted events are dropped before they ever reach a bucket.
+- name: Ensure the CrowdSec enrichment parser directory exists
+  ansible.builtin.file:
+    path: /etc/crowdsec/parsers/s02-enrich
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Whitelist administrative source addresses
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/parsers/s02-enrich/admin-whitelist.yaml
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ crowdsec_admin_whitelist | to_nice_yaml }}"
+  vars:
+    crowdsec_admin_whitelist:
+      name: local/admin-whitelist
+      description: "Administrative source addresses, never to be banned"
+      whitelist:
+        reason: "administrative source address"
+        ip: "{{ crowdsec_whitelist_ips }}"
+        cidr: "{{ crowdsec_whitelist_cidrs }}"
+  when: (crowdsec_whitelist_ips | length + crowdsec_whitelist_cidrs | length) > 0
+  notify: Restart CrowdSec
+
+# Unlike the acquisition files, this one is removed when it empties out. A
+# stale acquisition just reads a log nobody cares about; a stale whitelist goes
+# on exempting an address that was deliberately taken off the list.
+- name: Remove the admin whitelist when no addresses are set
+  ansible.builtin.file:
+    path: /etc/crowdsec/parsers/s02-enrich/admin-whitelist.yaml
+    state: absent
+  when: (crowdsec_whitelist_ips | length + crowdsec_whitelist_cidrs | length) == 0
   notify: Restart CrowdSec
 
 # --- SERVICES ---

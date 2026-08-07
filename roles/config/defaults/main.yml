@@ -11,8 +11,13 @@ ssh_port: 22822
 ssh_old_port: 22
 
 # --- UFW ---
-# `low` logs blocked packets, which is what CrowdSec's port-scan scenario
-# consumes. Higher levels also log accepted traffic and will flood the journal.
+# For reading by hand only. CrowdSec does not consume these lines and must not
+# be made to depend on them: at every level below `high`, ufw attaches
+# `-m limit --limit 3/min --limit-burst 10` to its own LOG rules, which starves
+# the port-scan scenario outright (see crowdsec_firewall_log_prefix below).
+# Raising this does not fix that either - explicit `deny` rules log on a
+# separate path with a limit hardcoded in ufw's source. The rule CrowdSec
+# actually reads is installed by crowdsec.yml and carries no limit.
 ufw_logging: low
 
 # --- Fail2ban ---
@@ -70,10 +75,12 @@ docker_userns_remap: ""
 # tasks/main.yml, same as the SSH hardening tasks.
 # Collections every agent gets (parsers + scenarios).
 #   linux    - sshd and syslog
-#   iptables - port-scan detection from the firewall's own drop logs, which is
-#              the only source here that covers ports nothing listens on.
-#              Its scenario needs 16 *distinct* destination ports from one IP
-#              in about a minute, so ordinary single-port probing is ignored.
+#   iptables - port-scan detection, the only source here that covers ports
+#              nothing listens on. crowdsecurity/iptables-scan-multi_ports is a
+#              leaky bucket of capacity 15 that drains one entry every 5s, so it
+#              overflows only when 16 *distinct* destination ports from one IP
+#              arrive faster than 12/min. Single-port probing is ignored, and so
+#              is any slow sweep - it takes a burst.
 # Add host-specific ones to crowdsec_collections_extra rather than editing this
 # list, which is why they are two variables: a host_vars override replaces a
 # list outright, and silently dropping crowdsecurity/linux disables sshd
@@ -90,6 +97,40 @@ crowdsec_collections_extra: []
 # running web services needs its own entry here, since CrowdSec parses nothing
 # it has not been pointed at. See docs/crowdsec.md for worked examples.
 crowdsec_acquisitions: {}
+
+# Prefix on the LOG rule that feeds crowdsecurity/iptables-logs.
+#
+# CrowdSec does not read ufw's `[UFW BLOCK]` lines, for two independent
+# reasons: ufw rate-limits its own LOG rules to 3/min below loglevel `high`,
+# and an explicit `deny` rule - port 22 here - terminates in ufw-user-input
+# without logging at all unless it was added with `log`, which then carries its
+# own hardcoded 3/min limit. Upstream states the requirement plainly in
+# crowdsecurity/iptables-logs' documentation:
+#
+#   "you should have a `iptables -A INPUT -m state --state NEW -j LOG` or
+#    similar into your configuration. This one will log all new connections,
+#    successful or not."
+#
+# crowdsec.yml installs exactly that in ufw's before.rules, ahead of every user
+# rule, so nothing is throttled and nothing is dropped before it is seen.
+#
+# The prefix only has to clear the parser's two exclusions - it must not
+# contain "ACCEPT" and must not be "[UFW AUDIT]". Do not reuse "[UFW BLOCK]":
+# these are all new connections, accepted ones included, and the parser counts
+# every parsed TCP/UDP packet as a drop regardless of what the prefix claims.
+# tests/render-check.yml asserts the shape; iptables caps prefixes at 29 chars.
+crowdsec_firewall_log_prefix: "[CS NEW] "
+
+# Public source addresses that must never earn a decision. Worth setting: the
+# rule above logs accepted connections too and the parser treats them as drops,
+# while any decision this agent raises is stored on the central LAPI and
+# enforced on every host in the fleet - so a single false positive locks you out
+# everywhere at once. crowdsecurity/whitelists, which crowdsecurity/linux pulls
+# in, already covers RFC1918; these are for public addresses such as your admin
+# IP or an external monitoring probe. No file is written while both are empty.
+crowdsec_whitelist_ips: []
+crowdsec_whitelist_cidrs: []
+
 # UFW on Ubuntu drives netfilter via iptables-nft, so the iptables bouncer
 # variant is the right fit. Switch to crowdsec-firewall-bouncer-nftables for
 # pure-nftables setups.

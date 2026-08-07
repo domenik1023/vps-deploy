@@ -93,6 +93,39 @@
           Host-specific collections belong in crowdsec_collections_extra;
           crowdsec_collections is the base every agent needs.
 
+    - name: The firewall log prefix must be safe to embed in before.rules
+      # This string is written verbatim into a double-quoted --log-prefix
+      # argument in ufw's before.rules, which iptables-restore parses. A stray
+      # quote or newline there does not fail the play - it fails `ufw reload`,
+      # and a failed reload leaves the firewall stopped with a default-ACCEPT
+      # policy. The ACCEPT and "UFW AUDIT" checks are the two exclusions in
+      # crowdsecurity/iptables-logs' filter: a prefix matching either makes the
+      # parser silently discard every line it is meant to read.
+      ansible.builtin.assert:
+        that:
+          - crowdsec_firewall_log_prefix | length > 0
+          - crowdsec_firewall_log_prefix | length <= 29
+          - crowdsec_firewall_log_prefix | regex_findall('["\n]') | length == 0
+          - crowdsec_firewall_log_prefix is not search('ACCEPT')
+          - crowdsec_firewall_log_prefix is not search('UFW AUDIT')
+        fail_msg: >-
+          crowdsec_firewall_log_prefix ({{ crowdsec_firewall_log_prefix }}) must
+          be 1-29 characters, free of quotes and newlines, and must not contain
+          "ACCEPT" or "UFW AUDIT" - crowdsecurity/iptables-logs filters both out.
+        success_msg: "iptables LOG prefix renders as {{ crowdsec_firewall_log_prefix }}"
+
+    - name: The CrowdSec whitelists must stay lists
+      # Both are interpolated straight into the ip: and cidr: keys of a parser
+      # whitelist. A bare string there yields a YAML scalar where CrowdSec
+      # expects a sequence, and the whitelist is ignored - which only shows up
+      # as a fleet-wide ban on an address that was supposed to be exempt.
+      ansible.builtin.assert:
+        that:
+          - crowdsec_whitelist_ips is sequence
+          - crowdsec_whitelist_ips is not string
+          - crowdsec_whitelist_cidrs is sequence
+          - crowdsec_whitelist_cidrs is not string
+
     - name: The reboot window must be a valid systemd calendar expression
       ansible.builtin.assert:
         that:

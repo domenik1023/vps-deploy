@@ -9,6 +9,16 @@
     name: docker
     state: restarted
 
+# `ufw reload` is a stop/start: it flushes the built-in chains and deletes every
+# non-builtin one, which takes the CrowdSec bouncer's rules with it. So it has
+# to be defined ahead of the bouncer handler that puts them back, and it has to
+# notify that handler itself - a run that only touches before.rules would
+# otherwise leave the host unprotected until the next bouncer restart.
+- name: Reload UFW
+  community.general.ufw:
+    state: reloaded
+  notify: Restart CrowdSec bouncer
+
 - name: Restart CrowdSec
   ansible.builtin.service:
     name: crowdsec
