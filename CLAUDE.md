@@ -132,22 +132,35 @@ upstream's `"latest"` — which queries the GitHub API every run and can upgrade
 host unasked. Include parameters outrank every default while still leaving
 host_vars free to override. Do not "simplify" this back into matching names.
 
-**Log sources are shipped raw except Traefik's access log.**
+**Log sources are shipped raw except proxy access logs.**
 `alloy_extra_log_paths` tails files and forwards them unparsed, on the Loki
-principle that parsing belongs at query time. `alloy_traefik_access_log` is the
-one exception, with a `loki.process` pipeline behind it, because three things
+principle that parsing belongs at query time. `alloy_access_logs` is the
+exception, with a `loki.process` pipeline per entry, because three things
 cannot be recovered at query time: a real timestamp (otherwise a replayed
 backlog invents a traffic spike), `trace_id` as structured metadata (which is
 what makes a line clickable through to Tempo), and dropping lines before they
-count against Loki's ingestion limits. Only `entrypoint` becomes a real label —
-anything with unbounded values would create a Loki stream per value.
+count against Loki's ingestion limits.
+
+Each entry names a `format`, which indexes `alloy_access_log_formats` — the
+field maps for `traefik` and `caddy`, kept as data so adding a proxy is one
+entry there and no template change. `job` defaults to the format name and is
+interpolated into the component names, so two access logs on one host need
+distinct jobs. Only fields bounded to a handful of values become real Loki
+labels (`entrypoint` on Traefik, nothing on Caddy); everything else is
+structured metadata, because each distinct value of a real label is another
+Loki stream. `tests/render-check.yml` caps the label list to keep that from
+being undone by accident. Note Caddy emits no trace IDs in access log lines,
+unlike Traefik — the timestamps and dropping are the reason to parse its logs.
 
 **Regexes interpolated into the Alloy config must go through `to_json`.** Alloy
 string literals take Go's escape sequences, so an everyday
-`^/favicon\.ico$` in `alloy_traefik_drop_paths` is an "unknown escape sequence"
+`^/favicon\.ico$` in an entry's `drop_paths` is an "unknown escape sequence"
 that fails the entire config file — not just its stage — and the agent stops on
 its next restart. `alloy validate` from the pinned release catches it;
-`tests/render-check.yml` asserts the escaping so CI catches it first.
+`tests/render-check.yml` asserts the escaping so CI catches it first. Note that
+single-quoted YAML passes backslashes through untouched while a Jinja string
+literal unescapes them — writing the test fixture the wrong way makes that
+assertion pass whether the template escapes or not.
 
 `alloy_config` is rendered with `set_fact` rather than inline in the
 `include_role` vars, and that is also not stylistic: variables are templated

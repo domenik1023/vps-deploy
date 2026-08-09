@@ -94,7 +94,7 @@ head -3 /etc/alloy/config.alloy
 | systemd journal | `loki.source.journal`, relabelled to `unit` / `level` / `boot_id` | `alloy_enable_journal` |
 | Container stdout | `loki.source.docker`, labelled with the compose project and service | `alloy_enable_docker` |
 | Log files | `loki.source.file`, shipped raw | `alloy_extra_log_paths` |
-| Traefik access log | `loki.source.file` into `loki.process`, parsed as JSON | `alloy_traefik_access_log` |
+| Proxy access logs | `loki.source.file` into `loki.process`, parsed as JSON | `alloy_access_logs` |
 | Endpoints already on the host | `prometheus.scrape` (Traefik, an app's `/metrics`) | `alloy_extra_scrape_targets` |
 | Traces | `otelcol.receiver.otlp` on `127.0.0.1:4317` and `:4318` | `alloy_enable_otlp` |
 | Profiles (SDK) | `pyroscope.receive_http` on `127.0.0.1:4041` | `alloy_enable_profiles` |
@@ -184,8 +184,47 @@ cannot, which in practice is three things:
 - **Dropping.** Lines dropped at the agent never count against Loki's
   ingestion rate limits. Query-time filtering happens after you have paid.
 
-The Traefik access log is the one source here that gets that treatment, because
-it is the one with trace IDs in it. Everything else stays raw.
+Reverse-proxy access logs are the sources that get that treatment, because they
+are where all three apply at once. Everything else stays raw.
+
+### Access logs
+
+One entry per log file, in `host_vars/<name>.yml`:
+
+```yaml
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
+    drop_paths:                    # optional, regex against the request path
+      - "^/health$"
+  - path: /mnt/docker/caddy/logs/access.log
+    format: caddy
+```
+
+`format` picks the field map out of `alloy_access_log_formats` in the role
+defaults — `traefik` or `caddy` today, and adding a third proxy is a new entry
+there and nothing else. `job` defaults to the format name and becomes both the
+Loki `job` label and part of the component names, so it has to be a valid Alloy
+identifier. Two logs on one host therefore need distinct `job` values.
+
+> **Both parsers are JSON parsers.** A proxy left on its default plain-text
+> access log errors on every line, which surfaces as an error counter on the
+> component rather than as anything the play notices. The per-proxy setup is
+> below.
+
+Only bounded fields become real Loki labels — `entrypoint` for Traefik, nothing
+for Caddy. Everything else (`status`, `method`, `path`, `host`, `client`,
+`duration`, and `trace_id`/`span_id` where the proxy emits them) becomes
+structured metadata, which is queryable and indexed without creating a stream
+per distinct value. Do not promote `path`, `client` or `router` to
+`stage.labels`: each distinct value there is a new stream, and
+`tests/render-check.yml` caps the label list to stop it happening by accident.
+
+`drop_paths` entries are ordinary regexes — `"^/favicon\\.ico$"` in YAML, which
+is one backslash once YAML is done with it. The template runs each through
+`to_json` on the way into the config, because Alloy's string literals take Go's
+escape sequences and a bare `\.` is an "unknown escape sequence" that fails the
+*whole* config file, not just that stage.
 
 ## Scraping something that already exposes metrics
 
@@ -233,12 +272,13 @@ accessLog:
   format: json
 ```
 
-then name that file in `host_vars/<name>.yml`:
+then name that file in `host_vars/<name>.yml`, as
+[Access logs](#access-logs) describes:
 
 ```yaml
-alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
-alloy_traefik_drop_paths:        # optional, regex against RequestPath
-  - "^/health$"
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
 ```
 
 > **`format: json` is not optional.** The pipeline parses these lines, and the
@@ -246,28 +286,9 @@ alloy_traefik_drop_paths:        # optional, regex against RequestPath
 > on every line — which surfaces as an error counter on the component in the UI,
 > not as anything the play notices.
 
-This is deliberately *not* an `alloy_extra_log_paths` entry. That list ships
-lines raw, which is the right default for everything else — see
-[Raw or parsed](#raw-or-parsed). The access log is the exception because it
-carries trace IDs, and a trace ID only becomes a clickable "View trace" button
-if it is attached as structured metadata at ingest.
-
-Only `entrypoint` is promoted to a real Loki label; `status`, `method`, `path`,
-`router`, `service`, `client`, `duration`, `retries`, `trace_id` and `span_id`
-become structured metadata, which is queryable and indexed without creating a
-stream per distinct value. Do not move `path`, `client` or `router` up to
-`stage.labels` — each distinct value there is a new stream, which is the
-quickest way to make Loki miserable.
-
-`alloy_traefik_drop_paths` entries are regexes matched against `RequestPath`,
-dropped at the agent so they never count against Loki's ingestion rate limits.
-An edge proxy is the most likely thing in the estate to reach
-`per_stream_rate_limit`, and health checks are usually the bulk of it. Write
-them as ordinary regexes — `"^/favicon\\.ico$"` in YAML, one backslash after
-YAML is done with it. The template runs each through `to_json` on the way into
-the config, because Alloy's string literals take Go's escape sequences and a
-bare `\.` is an "unknown escape sequence" that fails the *whole* config file,
-not just that stage.
+Traefik is the proxy where this pays off most, because it is the one that puts
+trace IDs in its access log lines — and a trace ID only becomes a clickable
+"View trace" button if it is attached as structured metadata at ingest.
 
 **Tracing, if you want requests followable end to end.** Point Traefik at the
 local agent's OTLP receiver:
@@ -326,6 +347,86 @@ it on deliberately.
 
 Verify from Grafana: `up{job="integrations/traefik", instance="vps-pangolin"}`
 should be `1`, and `traefik_service_requests_total` should have series.
+
+### Caddy
+
+`vps-docker` runs Caddy in Docker. Same two signals, both needing a change on
+the Caddy side first.
+
+**Caddy's own runtime log needs nothing** — it goes to stdout and arrives
+through `loki.source.docker` already.
+
+**The access log needs writing to a file.** Caddy logs to stdout by default, and
+those lines do reach Loki through the Docker pipeline, but raw — no real
+timestamps, no dropping. Point it at a file the host can see:
+
+```caddyfile
+# Caddyfile — inside the site block, or as a global `log` for all sites
+log {
+    output file /var/log/caddy/access.log
+    format json {
+        time_format rfc3339_nano
+    }
+}
+```
+
+```yaml
+# compose: the path above has to be a bind mount the host can read
+volumes:
+  - /mnt/docker/caddy/logs:/var/log/caddy
+```
+
+```yaml
+# host_vars/vps-docker.yml — the host-side path, not the container-side one
+alloy_access_logs:
+  - path: /mnt/docker/caddy/logs/access.log
+    format: caddy
+```
+
+> **`time_format rfc3339_nano` matters.** Caddy's default `ts` is a float epoch,
+> which `stage.timestamp` reads far less predictably than RFC3339Nano. The stage
+> is set to `fudge` rather than `skip` on failure, so getting this wrong costs
+> you accurate timestamps rather than the logs themselves — which makes it the
+> kind of thing that goes unnoticed.
+
+Note that Caddy, unlike Traefik, does **not** put trace identifiers into access
+log lines just because tracing is enabled, so these lines get no "View trace"
+button. The timestamps and the drop handling are the reason to parse them.
+
+**Metrics need enabling and then scraping**, and the obvious route is the wrong
+one. Caddy serves `/metrics` on its **admin endpoint** (`:2019`), but that
+endpoint is unauthenticated and can rewrite Caddy's running configuration —
+publishing it to the host, even on loopback, hands config-change ability to
+anything on the box. Use a dedicated `metrics` route instead:
+
+```caddyfile
+# global options
+{
+    metrics
+}
+
+# a site block of its own, on its own port
+:2020 {
+    metrics /metrics
+}
+```
+
+```yaml
+# compose: loopback only, per the Docker/UFW trap above
+ports:
+  - "127.0.0.1:2020:2020"
+```
+
+```yaml
+# host_vars/vps-docker.yml
+alloy_extra_scrape_targets:
+  - { name: "caddy", address: "127.0.0.1:2020" }
+```
+
+Verify from Grafana: `up{job="integrations/caddy", instance="vps-docker"}` should
+be `1`, and `caddy_http_requests_total` should have series. Until Caddy actually
+serves that port the target reports `up == 0` rather than nothing at all, so do
+the Caddy side and the playbook run close together.
 
 ## Firewall
 
@@ -477,9 +578,9 @@ every 30 seconds, so it needs no restart.
 | eBPF profiles missing, other profiles fine | `pyroscope.ebpf` is in an error state. Needs root, `/sys/kernel/tracing` and a writable `/tmp/symb-cache`; check the component graph in the UI. |
 | An extra scrape target never comes up | `address` is a bare `host:port` — a URL there scrapes a host that does not exist. If the endpoint is a Docker-published port, check it is published (`docker port <container>`) and that the bind is `127.0.0.1`, which Alloy on the host can still reach. |
 | `alloy` will not start after adding a drop path | An "unknown escape sequence" in the rendered config. Alloy's strings take Go's escapes, so a regex backslash must be doubled — the template's `to_json` does that, and `tests/render-check.yml` asserts it. A drop path that reached the file unescaped fails the whole config, not just its stage. |
-| Traefik access log lines missing, or the component erroring | The pipeline parses JSON and Traefik is not writing it. Set `accessLog.format: json`; the default common-log format errors on every line. Check `alloy_traefik_access_log` points at the file Traefik's `filePath` names, and that the path is visible from the host rather than only inside the container. |
-| Traefik access log arrives, but all at the same timestamp | `stage.timestamp` could not read `StartUTC` and fell back. It is set to `fudge` rather than `skip` so lines still arrive; check the field is present and RFC3339Nano. |
-| No "View trace" button on a Traefik log line | No trace ID in the line. Traefik only adds them once `tracing` is configured — see [Traefik](#traefik). The pipeline reads the snake_case `trace_id`/`span_id` pair, which is what the Loki datasource's derived field matches on. |
+| Access log lines missing, or the component erroring | The pipeline parses JSON and the proxy is not writing it. Traefik needs `accessLog.format: json`, Caddy needs `format json`; a plain-text access log errors on every line. Check the `alloy_access_logs` path is the one the host sees, not the container-side path. |
+| Access log arrives, but all at the same timestamp | `stage.timestamp` could not read the time field and fell back. It is `fudge` rather than `skip`, so lines still arrive. Traefik: check `StartUTC` is present. Caddy: this is the default float `ts` — set `time_format rfc3339_nano`. |
+| No "View trace" button on a Traefik log line | No trace ID in the line. Traefik only adds them once `tracing` is configured — see [Traefik](#traefik). The pipeline reads the snake_case `trace_id`/`span_id` pair, which is what the Loki datasource's derived field matches on. Caddy never emits them, so its lines have no button by design. |
 | Traefik metrics missing, Traefik logs present | Metrics are off in Traefik itself until `metrics.prometheus` is set; the container logging to stdout is independent of it. Per-router series additionally need `addRoutersLabels: true`. |
 | A host stopped reporting and nothing alerted | It was never added to `server/prometheus/targets/blackbox-icmp.yml`. Agents push, so silence is indistinguishable from a healthy idle host without the ICMP probe. |
 | Playbook fails on `ansible.utils.ipaddr` | `alloy_ui_bind` was widened, which makes the upstream role's preflight validate the listen address. Add `ansible.utils` to `requirements.yml`, or put the UI back on loopback. |

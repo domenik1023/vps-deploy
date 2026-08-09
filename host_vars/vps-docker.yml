@@ -9,6 +9,31 @@ ansible_port: 22822
 # ssh_port: 22822
 # crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-nftables
 
+# Caddy's access log, parsed rather than shipped raw - see docs/alloy.md for
+# the Caddy side, which has to be done first: `log { output file ... }` with
+# `format json { time_format rfc3339_nano }`, writing somewhere the host can
+# see. Until that file exists local.file_match simply matches nothing, so
+# landing this ahead of the Caddy change is harmless.
+#
+# Confirm the path against the bind mount in the Caddy compose file before the
+# first run; it follows the same /mnt/docker/<stack>/logs convention as
+# vps-pangolin.
+alloy_access_logs:
+  - path: /mnt/docker/caddy/logs/access.log
+    format: caddy
+    drop_paths:
+      - "^/favicon\\.ico$"
+
+# Caddy's Prometheus endpoint. Deliberately NOT the admin endpoint on :2019:
+# that one is unauthenticated and can rewrite Caddy's running config, so it
+# stays inside the container. This is a dedicated `metrics` route instead, and
+# it has to be published to loopback - see docs/alloy.md.
+#
+# Until Caddy actually serves it, this target reports up == 0 rather than
+# nothing at all, so do the Caddy side promptly or comment this back out.
+alloy_extra_scrape_targets:
+  - { name: "caddy", address: "127.0.0.1:2020" }
+
 crowdsec_acquisitions:
   caddy-docker:
     source: docker

@@ -252,95 +252,82 @@ loki.source.file "extra" {
   tail_from_end = true
 }
 {% endif %}
-{% if alloy_traefik_access_log | length > 0 %}
+{% if alloy_access_logs | length > 0 %}
 
 // =============================================================================
-// Logs - Traefik access log
+// Logs - reverse-proxy access logs, parsed
 // =============================================================================
-// Separate from the generic file tailing above because these lines are parsed
-// rather than shipped raw, and the parser is a JSON one: pointed at Traefik's
-// default common-log format it errors on every line. Traefik needs
-// accessLog.format set to json - see docs/alloy.md.
+// Separate from the raw file tailing above because these lines are parsed at
+// ingest, which buys three things LogQL at query time cannot: real timestamps,
+// trace_id as structured metadata, and dropping noise before it counts against
+// Loki's rate limits. Both parsers are JSON ones - a proxy writing plain text
+// errors on every line. See docs/alloy.md and alloy_access_log_formats.
+{% for entry in alloy_access_logs %}
+{% set job = entry.job | default(entry.format) %}
+{% set fmt = alloy_access_log_formats[entry.format] %}
+{% set width = (fmt.fields | map(attribute='name') | map('length') | list + [2]) | max %}
 
-local.file_match "traefik" {
+local.file_match "access_{{ job }}" {
   path_targets = [
-    { __path__ = "{{ alloy_traefik_access_log }}", job = "{{ alloy_traefik_job }}", instance = constants.hostname },
+    { __path__ = {{ entry.path | to_json }}, job = "{{ job }}", instance = constants.hostname },
   ]
   sync_period = "5s"
 }
 
-loki.source.file "traefik" {
-  targets       = local.file_match.traefik.targets
-  forward_to    = [loki.process.traefik.receiver]
+loki.source.file "access_{{ job }}" {
+  targets       = local.file_match.access_{{ job }}.targets
+  forward_to    = [loki.process.access_{{ job }}.receiver]
   tail_from_end = true
 }
 
-loki.process "traefik" {
+loki.process "access_{{ job }}" {
   forward_to = [loki.write.default.receiver]
 
-  // Field names are Traefik's own, from pkg/middlewares/accesslog/logdata.go.
-  // It emits the trace identifiers twice - TraceId/SpanId and
-  // trace_id/span_id - and the snake_case pair is the one taken, because that
-  // is what the Loki datasource's derived field matches on.
   stage.json {
     expressions = {
-      ts         = "StartUTC",
-      status     = "DownstreamStatus",
-      method     = "RequestMethod",
-      host       = "RequestHost",
-      path       = "RequestPath",
-      duration   = "Duration",
-      router     = "RouterName",
-      service    = "ServiceName",
-      entrypoint = "entryPointName",
-      client     = "ClientHost",
-      retries    = "RetryAttempts",
-      trace_id   = "trace_id",
-      span_id    = "span_id",
+      {{ "ts".ljust(width) }} = "{{ fmt.timestamp_field }}",
+{% for f in fmt.fields %}
+      {{ f.name.ljust(width) }} = "{{ f.json }}",
+{% endfor %}
     }
   }
 
   // Without this Loki stamps each line with its ingest time, which is fine
   // until the agent replays a backlog after a restart or a log rotation: a
   // burst of old lines all land at "now" and invent a traffic spike that never
-  // happened.
+  // happened. Fudged rather than skipped on failure, so a proxy whose time
+  // format drifts degrades instead of dropping its logs entirely.
   stage.timestamp {
     source            = "ts"
-    format            = "RFC3339Nano"
+    format            = "{{ fmt.timestamp_format }}"
     action_on_failure = "fudge"
   }
 
   // Structured metadata, deliberately not labels: queryable and indexed
-  // without creating a Loki stream per distinct value. trace_id here is what
-  // puts the "View trace" button on a log line and jumps into Tempo.
+  // without creating a Loki stream per distinct value.
   stage.structured_metadata {
     values = {
-      trace_id = "",
-      span_id  = "",
-      status   = "",
-      method   = "",
-      host     = "",
-      path     = "",
-      duration = "",
-      router   = "",
-      service  = "",
-      client   = "",
-      retries  = "",
+{% for f in fmt.fields if f.name not in fmt.labels %}
+      {{ f.name.ljust(width) }} = "",
+{% endfor %}
     }
   }
+{% if fmt.labels | length > 0 %}
 
-  // The only field promoted to a real label, and only because it is bounded to
-  // a handful of values (web, websecure, ...). Do not add path, client or
-  // router: every distinct value becomes its own stream, which is the quickest
-  // way to make Loki miserable.
+  // Promoted to real labels, which is only safe because these are bounded to a
+  // handful of values. Do not add path, client or router: every distinct value
+  // becomes its own stream, which is the quickest way to make Loki miserable.
   stage.labels {
-    values = { entrypoint = "" }
+    values = {
+{% for label in fmt.labels %}
+      {{ label.ljust(width) }} = "",
+{% endfor %}
+    }
   }
-{% if alloy_traefik_drop_paths | length > 0 %}
+{% endif %}
+{% if entry.drop_paths | default([]) | length > 0 %}
 
-  // Dropped before the lines count against Loki's ingestion rate limits. An
-  // edge proxy is the most likely thing in the estate to reach
-  // per_stream_rate_limit.
+  // Dropped before the lines count against Loki's ingestion rate limits.
   //
   // The expression goes through to_json rather than being wrapped in quotes
   // here, and that is load-bearing: Alloy's string literals take Go's escape
@@ -348,15 +335,16 @@ loki.process "traefik" {
   // ^/favicon\.ico$ is an "unknown escape sequence" that fails the whole file
   // and stops the agent on its next restart. to_json emits the quotes and
   // doubles the backslash, which Alloy then reads back as one.
-{% for expr in alloy_traefik_drop_paths %}
+{% for expr in entry.drop_paths %}
   stage.drop {
     source              = "path"
     expression          = {{ expr | to_json }}
-    drop_counter_reason = "traefik_noise"
+    drop_counter_reason = "{{ job }}_noise"
   }
 {% endfor %}
 {% endif %}
 }
+{% endfor %}
 {% endif %}
 {% if alloy_enable_otlp %}
 

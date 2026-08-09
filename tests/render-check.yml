@@ -232,24 +232,56 @@
           glob and a `job`, e.g.
           [{ path: "/tmp/logs/*.log", job: "python" }].
 
-    - name: The Traefik access log must be an absolute path and its drops regexes
-      # The path is interpolated into local.file_match's __path__, where a
-      # relative path resolves against Alloy's working directory rather than
-      # failing, so the pipeline sits there matching nothing. Empty is the
-      # normal case - the whole block is omitted for a host without Traefik.
-      # The drop expressions are strings, not a mapping, for the same
-      # byte-stability reason as the log paths; the template escapes them, so
-      # backslashes and quotes in a regex are safe here.
+    - name: Every access log must name a known format and an absolute path
+      # `format` selects the field map, and an unknown one is an undefined-key
+      # error at render time rather than anything subtle. `path` is
+      # interpolated into local.file_match's __path__, where a relative path
+      # resolves against Alloy's working directory instead of failing, so the
+      # pipeline sits there matching nothing. `job` is interpolated into the
+      # component names, where anything but an Alloy identifier is a parse
+      # error that stops the agent on its next restart.
       ansible.builtin.assert:
         that:
-          - alloy_traefik_access_log | length == 0 or alloy_traefik_access_log is match('^/')
-          - alloy_traefik_job | length > 0
-          - alloy_traefik_drop_paths is sequence
-          - alloy_traefik_drop_paths is not string
-          - alloy_traefik_drop_paths | select('string') | list | length == alloy_traefik_drop_paths | length
+          - alloy_access_logs is sequence
+          - alloy_access_logs is not string
+          - alloy_access_logs is not mapping
+          - alloy_access_logs | rejectattr('path', 'defined') | list | length == 0
+          - alloy_access_logs | map(attribute='path') | reject('match', '^/') | list | length == 0
+          - alloy_access_logs | map(attribute='format', default='') | reject('in', alloy_access_log_formats) | list | length == 0
+          - alloy_access_logs | map(attribute='job', default='x') | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
         fail_msg: >-
-          alloy_traefik_access_log must be empty or an absolute path, and
-          alloy_traefik_drop_paths a list of regex strings, e.g. ["^/health$"].
+          alloy_access_logs must be a list of mappings, each with an absolute
+          `path` and a `format` from
+          {{ alloy_access_log_formats.keys() | list | join(', ') }}, e.g.
+          [{ path: /mnt/docker/pangolin/logs/access.log, format: traefik }].
+
+    - name: Each access log format must map fields and keep its labels bounded
+      # `labels` become real Loki labels, and every distinct value of one is a
+      # new stream. Promoting an unbounded field - a path, a client IP - is the
+      # quickest way to make Loki miserable, and it is the kind of edit that
+      # looks harmless in review. The names are also interpolated into Alloy
+      # identifiers, and every label has to be a field that was extracted.
+      ansible.builtin.assert:
+        that:
+          - alloy_access_log_formats is mapping
+          - fmt.timestamp_field | length > 0
+          - fmt.timestamp_format | length > 0
+          - fmt.fields is sequence
+          - fmt.fields is not mapping
+          - fmt.fields | rejectattr('name', 'defined') | list | length == 0
+          - fmt.fields | rejectattr('json', 'defined') | list | length == 0
+          - fmt.fields | map(attribute='name') | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+          - fmt.fields | map(attribute='name') | unique | list | length == fmt.fields | length
+          - fmt.labels | length <= 2
+          - fmt.labels | difference(fmt.fields | map(attribute='name') | list) | length == 0
+        fail_msg: >-
+          alloy_access_log_formats.{{ item }} must map every field it names and
+          promote at most two bounded ones to labels. Everything else belongs
+          in structured metadata, which is queryable without creating a Loki
+          stream per distinct value.
+      loop: "{{ alloy_access_log_formats.keys() | list }}"
+      vars:
+        fmt: "{{ alloy_access_log_formats[item] }}"
 
     - name: Extra scrape targets must name a valid component and a bare host port
       # `name` is interpolated straight into the block name, where anything but
@@ -302,8 +334,9 @@
         alloy_rendered: "{{ lookup('ansible.builtin.template', alloy_template) }}"
         alloy_everything_vars:
           alloy_enable_ebpf: true
-          alloy_traefik_access_log: /mnt/docker/pangolin/logs/access.log
-          alloy_traefik_drop_paths: ["^/health$"]
+          alloy_access_logs:
+            - { path: /mnt/docker/pangolin/logs/access.log, format: traefik, drop_paths: ["^/health$"] }
+            - { path: /mnt/docker/caddy/logs/access.log, format: caddy }
           alloy_extra_log_paths:
             - { path: "/tmp/logs/*.log", job: "python" }
           alloy_extra_scrape_targets:
@@ -332,14 +365,19 @@
           # docs/alloy.md filters on, and renaming it silently orphans them
           # all - the metrics keep arriving under a name nothing looks for.
           - alloy_default is search('job_name        = "integrations/node_exporter"')
-          # The Traefik pipeline is off unless a host names its access log, and
+          # An access log pipeline appears only when a host names one, and
           # naming one has to bring the parser with it: the file tailed without
           # loki.process ships JSON blobs Loki cannot break into fields.
-          - alloy_default is not search('loki.process "traefik"')
-          - alloy_traefik is search('loki.process "traefik"')
+          - alloy_default is not search('loki.process')
+          - alloy_traefik is search('loki.process "access_traefik"')
           - alloy_traefik is search('stage.structured_metadata')
           - alloy_traefik is search('trace_id')
           - alloy_traefik is not search('stage.drop')
+          # Each format renders its own pipeline, and two on one host must not
+          # collide - the component names are what keep them apart.
+          - alloy_both is search('loki.process "access_traefik"')
+          - alloy_both is search('loki.process "access_caddy"')
+          - alloy_both is search('request.uri')
           - alloy_traefik_dropping is search('stage.drop')
           - alloy_traefik_dropping is search('expression          = "\^/health\$"')
           # Alloy's strings take Go's escape sequences, so the backslash in an
@@ -360,21 +398,25 @@
           - name: traefik
             address: 127.0.0.1:8082
         alloy_scrape: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_extra_scrape_targets': alloy_probe_targets}) }}"
-        alloy_probe_access_log: /mnt/docker/pangolin/logs/access.log
-        alloy_traefik: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_traefik_access_log': alloy_probe_access_log}) }}"
+        alloy_probe_traefik:
+          - { path: /mnt/docker/pangolin/logs/access.log, format: traefik }
+        alloy_traefik: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_traefik}) }}"
+        alloy_probe_both:
+          - { path: /mnt/docker/pangolin/logs/access.log, format: traefik }
+          - { path: /mnt/docker/caddy/logs/access.log, format: caddy }
+        alloy_both: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_both}) }}"
         # Single-quoted YAML, which passes backslashes through untouched - so
         # this is one backslash, exactly what a host_vars entry produces. Do
         # not write it as a Jinja string literal inside the lookup below: that
         # unescapes the pair and feeds the template a value already doubled,
         # which makes this test pass whether the template escapes or not.
-        alloy_probe_drop_paths:
-          - '^/health$'
-          - '^/favicon\.ico$'
+        alloy_probe_dropping:
+          - path: /mnt/docker/pangolin/logs/access.log
+            format: traefik
+            drop_paths:
+              - '^/health$'
+              - '^/favicon\.ico$'
         # The expected output, likewise single-quoted: two backslashes, which
         # is what Alloy reads back as the one the regex needs.
         alloy_escaped_drop: 'expression          = "^/favicon\\.ico$"'
-        alloy_traefik_dropping: >-
-          {{ lookup('ansible.builtin.template', alloy_template, template_vars={
-               'alloy_traefik_access_log': alloy_probe_access_log,
-               'alloy_traefik_drop_paths': alloy_probe_drop_paths,
-             }) }}
+        alloy_traefik_dropping: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_dropping}) }}"

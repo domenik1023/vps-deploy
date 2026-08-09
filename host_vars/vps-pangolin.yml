@@ -13,7 +13,9 @@ ansible_port: 22822
 # raw, and this one is parsed, which is what gives the lines their real
 # timestamps and the trace_id that makes them clickable through to Tempo.
 # Requires `accessLog.format: json` in Traefik - see docs/alloy.md.
-alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
 
 alloy_extra_scrape_targets:
   - { name: "traefik", address: "127.0.0.1:8082" }

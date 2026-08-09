@@ -196,10 +196,12 @@ alloy_enable_profiles: false
 alloy_extra_log_paths:
   - { path: "/tmp/pangolin/*.log", job: "pangolin" }
 
-# Traefik's access log, which is the exception: parsed at ingest, so its
-# timestamps are real and its trace IDs click through to Tempo. Needs
-# `accessLog.format: json` in Traefik.
-alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
+# A reverse proxy's access log, which is the exception: parsed at ingest, so
+# its timestamps are real and (on Traefik) its trace IDs click through to
+# Tempo. Needs the proxy configured to write JSON.
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
 
 # The one host where whole-host eBPF profiling is wanted
 alloy_enable_ebpf: true
@@ -307,9 +309,8 @@ each pipeline actually collects.
 | `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
 | `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
 | `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable. Lines are shipped raw and parsed at query time with LogQL |
-| `alloy_traefik_access_log` | `""` | Traefik's access log, given its own parsing pipeline rather than an entry above; requires `accessLog.format: json` — see [docs/alloy.md](docs/alloy.md#traefik) |
-| `alloy_traefik_job` | `traefik` | The Loki `job` label for those lines |
-| `alloy_traefik_drop_paths` | `[]` | Regexes matched against `RequestPath`, dropped at the agent before they count against Loki's rate limits |
+| `alloy_access_logs` | `[]` | Reverse-proxy access logs, as `{ path, format }` mappings with optional `job` and `drop_paths`. Parsed at ingest rather than shipped raw; the proxy must be writing JSON — see [docs/alloy.md](docs/alloy.md#access-logs) |
+| `alloy_access_log_formats` | `traefik`, `caddy` | How to read each proxy's JSON: time field, field map, and which fields are bounded enough to be real labels. Adding a proxy is an entry here |
 | `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |
 | `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
