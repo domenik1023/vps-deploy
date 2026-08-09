@@ -12,6 +12,7 @@ vps-pangolin
 vps-docker
 
 [local]
+komodo
 #testvm
 
 # The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
