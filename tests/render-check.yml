@@ -137,6 +137,24 @@
         fail_msg: >-
           Verify with `systemd-analyze calendar "{{ unattended_reboot_oncalendar }}"`.
 
+    - name: The hostname pattern must accept inventory names and reject invalid ones
+      # system_hostname is written to /etc/hostname and handed to hostnamectl,
+      # which rejects an invalid name outright - and the task that would catch
+      # it runs first in the play, so a bad pattern fails the run before the
+      # admin user exists. Underscores are the case that matters: legal in an
+      # inventory name, illegal in a hostname.
+      ansible.builtin.assert:
+        that:
+          - valid_hostnames | reject('match', system_hostname_pattern) | list | length == 0
+          - invalid_hostnames | select('match', system_hostname_pattern) | list | length == 0
+        fail_msg: >-
+          system_hostname_pattern no longer separates valid DNS names from
+          invalid ones. It must accept {{ valid_hostnames | join(', ') }} and
+          reject {{ invalid_hostnames | join(', ') }}.
+      vars:
+        valid_hostnames: [vps-pangolin, vps-docker, testvm, a, vps.example.com]
+        invalid_hostnames: ["crowdsec_master", "-leading", "trailing-", "has space", "", "double..dot"]
+
     - name: Every Alloy signal endpoint must derive from the one ingest hostname
       # The whole point of alloy_ingest_base is that switching a group between
       # the LAN and public names is one line in group_vars/vps.yml. An endpoint

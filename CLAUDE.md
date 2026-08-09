@@ -59,10 +59,13 @@ Two roles and two plays in `main.yml`, in this order: `config` (hardening) then
 itself; `hardening.yml` records the switched SSH port with `set_fact`, and host
 facts persist across plays within a run, so the second play still connects.
 
-`config/tasks/main.yml` includes five files **and the order is load-bearing**:
+`config/tasks/main.yml` includes six files **and the order is load-bearing**:
 
-`user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` → `crowdsec.yml`
+`hostname.yml` → `user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` →
+`crowdsec.yml`
 
+- `hostname.yml` is first because the host's own name is what everything after
+  it records itself as, and the Alloy play labels all its telemetry with it.
 - `hardening.yml` installs `python3-debian`, which `deb822_repository` in
   `software.yml` and `crowdsec.yml` needs and a stock Ubuntu image lacks.
 - `software.yml` starts Docker before `crowdsec.yml` probes for `DOCKER-USER`.
@@ -174,6 +177,17 @@ checking it against the `ssh-bf` / `ssh-slow-bf` thresholds inverts that.
 **`docker_userns_remap` is off deliberately.** It breaks any container that
 bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
+
+**Alloy's `instance` label comes from the system hostname, not the inventory.**
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
+across the config — so a host whose local name differs from its inventory name
+ships telemetry no dashboard filtering on the inventory name will match.
+`hostname.yml` closes that by setting the system hostname to
+`inventory_hostname`, which is why it fixes all six at once and no relabelling
+is needed. Alloy reads the hostname once at startup and its config carries no
+literal copy, so a rename does not change the config and upstream's handler
+never fires — `roles/alloy` restarts it explicitly on the fact `hostname.yml`
+sets. Facts persist across plays, which is what makes that work.
 
 **The Alloy config is templated twice.** `grafana.grafana.alloy` writes
 `alloy_config` with `ansible.builtin.template`, so whatever `config.alloy.j2`

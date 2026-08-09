@@ -48,6 +48,7 @@ vps-deploy/
     │   │   └── main.yml              # Service restart handlers
     │   └── tasks/
     │       ├── main.yml              # Task orchestration
+    │       ├── hostname.yml          # System hostname = inventory name
     │       ├── user.yml              # Admin user + sudo setup
     │       ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
     │       ├── sysctl.yml            # Kernel parameter hardening
@@ -232,7 +233,12 @@ ansible_port: 22          # 22822 once hardening has run
 Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
 derive from `inventory_hostname`, so the name is what the host registers as on
 the central LAPI — `vps-docker` and `vps-docker-firewall-bouncer` rather than
-a bare IP.
+a bare IP. The playbook also sets the **system hostname** to the inventory name,
+because Alloy labels every metric, log line and profile with `instance` taken
+from the host's own name — a box called `pangolin` locally but `vps-pangolin`
+here ships telemetry that no query filtering on the inventory name will find.
+Renaming a host that is already reporting splits its history: old series and log
+streams stay under the previous label.
 Renaming a host that is already registered makes it register again under the
 new name; delete the leftovers on the master with `cscli machines delete` and
 `cscli bouncers delete`.
@@ -245,6 +251,9 @@ Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 
 | Variable | Default | Description |
 |---|---|---|
+| `system_hostname` | `{{ inventory_hostname }}` | System hostname to set. Alloy's `instance` label comes from it, so a mismatch with the inventory name hides that host's telemetry |
+| `system_hostname_manage` | `true` | Set `false` to leave the host's own name alone |
+| `system_hostname_pattern` | RFC 1123 regex | Validates the name before it is written; underscores are legal in an inventory name but not in a hostname |
 | `admin_user` | `domenik1023` | Admin username to create |
 | `admin_password` | `{{ vault_admin_password }}` | sha512-crypt hash (from vault) |
 | `ssh_port` | `22822` | Custom SSH port |

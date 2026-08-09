@@ -52,3 +52,17 @@
     alloy_env_file_vars:
       CUSTOM_ARGS: "{{ alloy_custom_args }}"
     alloy_user_groups: "{{ alloy_service_extra_groups }}"
+
+# Alloy reads constants.hostname once, at startup, and every `instance` label it
+# produces comes from there. A host renamed by hostname.yml earlier in this run
+# therefore keeps labelling itself with the old name - and the rendered config
+# carries no literal hostname, so it does not change, so upstream's own
+# `restart alloy` handler never fires. The fact is set in the hardening play;
+# host facts persist across plays within a run.
+- name: Restart Alloy after a hostname change
+  ansible.builtin.service:
+    name: alloy
+    state: restarted
+  when:
+    - system_hostname_changed | default(false) | bool
+    - not ansible_check_mode

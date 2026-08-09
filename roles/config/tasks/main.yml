@@ -1,3 +1,9 @@
+# First: the host's own name is what everything after it records itself as, and
+# the Alloy play in main.yml labels all of its telemetry with it.
+- name: Include hostname tasks
+  ansible.builtin.include_tasks:
+    file: hostname.yml
+
 - name: Include user tasks
   ansible.builtin.include_tasks:
     file: user.yml
