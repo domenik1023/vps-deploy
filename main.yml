@@ -7,3 +7,21 @@
     - name: Include Role
       ansible.builtin.include_role:
         name: config
+
+# A second play rather than another include in the one above, so the hardening
+# role's load-bearing task order stays a statement about itself.
+#
+# Two things make the split safe. hardening.yml moves sshd mid-play and records
+# the new port with set_fact; host facts persist across plays within a run, so
+# this play connects on the right port even on a bootstrap run. And it has to
+# come after software.yml, because cAdvisor and the Docker log discovery both
+# expect the Docker socket to already be there.
+- name: Deploy the Grafana Alloy telemetry agent
+  # Same targeting as above, for the same reason: the LAPI host is a delegation
+  # target, not a machine this playbook configures.
+  hosts: all:!lapi
+  become: true
+  tasks:
+    - name: Include Alloy role
+      ansible.builtin.include_role:
+        name: alloy

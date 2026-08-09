@@ -1,0 +1,168 @@
+# --- Grafana Alloy ---
+# One agent per host, collecting four signals and pushing them to the central
+# observability stack: metrics (node exporter and cAdvisor, both built in),
+# logs (journald, Docker stdout, arbitrary files), traces (OTLP received on
+# loopback and forwarded) and profiles (SDK pushes, optionally whole-host eBPF).
+#
+# Installation is native - a deb and a systemd unit - not a container. Alloy
+# needs /proc, /sys, the journal, the Docker socket, /dev/kmsg and, for eBPF,
+# the host PID namespace and kernel tracing. A container gets all of that only
+# by being given host networking, host PID, root and eight capabilities, at
+# which point it isolates nothing and only adds mount juggling.
+#
+# tasks/main.yml renders templates/config.alloy.j2 from the variables below and
+# hands it to grafana.grafana.alloy, which does the install. See docs/alloy.md.
+
+# --- What to collect ---
+# Container metrics (cAdvisor) and container log discovery. Both talk to the
+# Docker socket, so set this false on a host without Docker: the components
+# stay permanently unhealthy and Alloy logs socket errors continuously rather
+# than failing loudly once. Every host this playbook manages gets Docker from
+# roles/config/tasks/software.yml, so true is right by default here.
+alloy_enable_docker: true
+
+# systemd journal. False on non-systemd hosts (Alpine, most NAS firmware).
+alloy_enable_journal: true
+
+# OTLP receiver, so applications on this host can send traces to loopback.
+alloy_enable_otlp: true
+
+# The Pyroscope SDK receiver on :4041, plus the pyroscope.write output it
+# forwards to. Turning this off also removes the write block, so it must be on
+# for eBPF profiling to have anywhere to send.
+alloy_enable_profiles: true
+
+# Whole-host eBPF profiling. Off by default - it is the only pipeline with real
+# prerequisites, and a kernel that cannot load the program fails the component
+# at startup rather than degrading. Requires alloy_service_user to be root (a
+# prerequisite tasks/main.yml asserts), /sys/kernel/tracing readable, a
+# writable /tmp/symb-cache and ideally kernel 5.9+. Turn it on for one host and
+# look at the flame graphs before rolling it out.
+#
+# pyroscope.ebpf is generally available from Alloy 1.18, so no
+# --stability.level flag is needed. Advice to the contrary predates the
+# promotion out of public preview.
+alloy_enable_ebpf: false
+
+# Log files to tail, for applications that write to disk instead of stdout.
+# A list of mappings, each with a `path` glob and a `job`, which becomes the
+# Loki job label. It is a list and not a dict so the rendered config keeps a
+# stable order - an unordered mapping here would make the config file change on
+# every run and the deploy report `changed` forever.
+#
+#   alloy_extra_log_paths:
+#     - { path: "/tmp/logs/*.log", job: "python" }
+#     - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+alloy_extra_log_paths: []
+
+# --- Tuning ---
+alloy_log_level: info
+alloy_scrape_interval: "15s"
+# Becomes an external label on every metric, log line and profile, so the
+# stack can tell fleets apart. Not per host - inventory_hostname already
+# provides that.
+alloy_cluster: homelab
+alloy_ebpf_interval: "15s"
+alloy_docker_host: "unix:///var/run/docker.sock"
+
+# --- Bind addresses ---
+# All three listeners are unauthenticated, and there is no option that changes
+# that - Alloy has no credential checking to enable. Loopback is therefore the
+# only correct default on an internet-facing host. A host that needs to send
+# telemetry should run its own agent rather than reach across to this one.
+#
+# tests/render-check.yml asserts all three stay on loopback, so widening one is
+# a deliberate edit in two places rather than a slip in one.
+alloy_otlp_bind: "127.0.0.1"
+alloy_profiles_bind: "127.0.0.1"
+
+# The Alloy UI and its own /metrics endpoint, on port 12345. Worth reaching -
+# the UI shows the live component graph and is how you diagnose a pipeline that
+# quietly stopped collecting - but it exposes the config structure, so it stays
+# on loopback and is reached over an SSH tunnel:
+#
+#   ssh -L 12345:localhost:12345 <host>
+#
+# Nothing scrapes it remotely: Alloy scrapes itself via prometheus.exporter.self
+# and pushes the result, so there is no pull path to keep open. No UFW rule is
+# added for it either, deliberately - see docs/alloy.md.
+alloy_ui_bind: "127.0.0.1"
+
+# Flags appended to the packaged unit's ExecStart, via the CUSTOM_ARGS
+# environment variable that grafana.grafana.alloy writes to Alloy's env file.
+#
+# --server.http.listen-addr is emitted only when the bind address differs from
+# Alloy's own default of 127.0.0.1:12345, which is also what the upstream role
+# assumes for its post-install readiness check. That is not just tidiness: the
+# upstream preflight parses this flag and runs the captured address through
+# ansible.utils.ipaddr, and ansible.utils is neither in requirements.yml nor a
+# dependency of grafana.grafana - so emitting the flag fails the play with a
+# missing-filter error. Widening alloy_ui_bind therefore means adding
+# ansible.utils (and netaddr) to requirements.yml as well.
+alloy_custom_args: >-
+  {{ ('--server.http.listen-addr=' ~ alloy_ui_bind ~ ':12345 ') if alloy_ui_bind != '127.0.0.1' else '' }}--disable-reporting
+
+# --- Endpoints ---
+# Two ingest hostnames reach the same reverse proxy and the same backends; only
+# the network path differs:
+#
+#   https://ingest.net.d1023.de   LAN and tunnel only - the default, for hosts
+#                                 on 192.168.2.x
+#   https://ingest.d1023.de       internet-facing - for off-site hosts
+#
+# Each signal has a distinct write path, so one hostname routes all four with
+# no prefix rewriting. Switching a whole group is one line; group_vars/vps.yml
+# already does it for every off-site host.
+#
+# Both endpoints are unauthenticated by design - an agent cannot do interactive
+# OIDC. Do not add credentials here expecting the server to check them; nothing
+# does. If that changes it will change on ingest.d1023.de first, since that is
+# the one exposed to the internet.
+alloy_ingest_base: "https://ingest.net.d1023.de"
+
+# Per-signal endpoints, derived so that setting alloy_ingest_base is enough.
+# Override one only to split a single signal off somewhere else, such as a
+# staging Tempo. tests/render-check.yml asserts each still derives from the
+# base, which is what makes the one-line group override trustworthy.
+alloy_loki_endpoint: "{{ alloy_ingest_base }}/loki/api/v1/push"
+alloy_prom_endpoint: "{{ alloy_ingest_base }}/api/v1/write"
+# Base URLs, not full paths: otelcol.exporter.otlphttp appends /v1/traces
+# itself, and pyroscope.write appends /push.v1.PusherService/Push. Appending
+# them here gives a doubled path and a 404 the agent reports only as a failed
+# export.
+alloy_tempo_endpoint: "{{ alloy_ingest_base }}"
+alloy_pyroscope_endpoint: "{{ alloy_ingest_base }}"
+
+# --- The upstream role ---
+# These three shadow variables that grafana.grafana.alloy defines itself, so
+# they deliberately do not reuse its names. Role defaults from both roles sit
+# at the same precedence and the role loaded second wins - an `alloy_version`
+# here would be silently replaced by upstream's "latest". tasks/main.yml maps
+# each onto the upstream name as an include parameter, which outranks every
+# default while still leaving host_vars and group_vars free to override these.
+
+# Pin it. Upstream defaults to "latest", which queries the GitHub API on every
+# run and can upgrade a host without anyone asking for it. Bumping this
+# variable and re-running is the upgrade path; there is no apt route, because
+# the role installs the release asset directly.
+alloy_agent_version: "1.18.1"
+
+# The packaged unit runs as the unprivileged `alloy` user, which cannot read
+# the cgroup hierarchy cAdvisor needs, cannot read /dev/kmsg for container OOM
+# detection, and cannot load eBPF programs. Running as root is therefore the
+# default rather than an optimisation.
+#
+# Everything except eBPF works unprivileged. For a host where that matters:
+#
+#   alloy_service_user: alloy
+#   alloy_service_extra_groups: [systemd-journal, docker]
+#
+# and add AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYSLOG to the override.
+# Test it on one host first - cAdvisor's cgroup access is the part most likely
+# to break, and it breaks by reporting no container metrics rather than by
+# failing the run.
+alloy_service_user: root
+
+# Supplementary groups for the `alloy` system user. Only meaningful on the
+# unprivileged path above; root is already in every group that matters.
+alloy_service_extra_groups: []

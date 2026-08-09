@@ -17,9 +17,13 @@
   gather_facts: false
   vars_files:
     - ../roles/config/defaults/main.yml
+    - ../roles/alloy/defaults/main.yml
   vars:
     # Only present so defaults referencing it can be loaded; never used.
     vault_admin_password: "$6$placeholder"
+    # Relative to this playbook. The Alloy config is a template rather than a
+    # variable, so its assertions render it here instead of reading a value.
+    alloy_template: ../roles/alloy/templates/config.alloy.j2
 
   tasks:
     - name: The cscli prefix must stay a list
@@ -132,3 +136,127 @@
           - unattended_reboot_oncalendar is search('^[A-Za-z]{3} \\*-\\*-\\* [0-9]{2}:[0-9]{2}:[0-9]{2}$')
         fail_msg: >-
           Verify with `systemd-analyze calendar "{{ unattended_reboot_oncalendar }}"`.
+
+    - name: Every Alloy signal endpoint must derive from the one ingest hostname
+      # The whole point of alloy_ingest_base is that switching a group between
+      # the LAN and public names is one line in group_vars/vps.yml. An endpoint
+      # that stops deriving from it keeps pointing at the old hostname, and an
+      # off-site host cannot even resolve ingest.net.d1023.de - the agent then
+      # retries forever and the only symptom is telemetry that never arrives.
+      ansible.builtin.assert:
+        that:
+          - alloy_ingest_base is search('^https://')
+          - alloy_loki_endpoint == alloy_ingest_base ~ '/loki/api/v1/push'
+          - alloy_prom_endpoint == alloy_ingest_base ~ '/api/v1/write'
+          # Base URLs, not paths: otelcol.exporter.otlphttp appends /v1/traces
+          # and pyroscope.write appends /push.v1.PusherService/Push themselves.
+          - alloy_tempo_endpoint == alloy_ingest_base
+          - alloy_pyroscope_endpoint == alloy_ingest_base
+        fail_msg: >-
+          The four alloy_*_endpoint values must derive from alloy_ingest_base
+          ({{ alloy_ingest_base }}), which must be an https:// URL. Override one
+          individually only to send a single signal somewhere else.
+        success_msg: "Alloy endpoints derive from {{ alloy_ingest_base }}"
+
+    - name: Alloy's listeners must stay on loopback
+      # All three are unauthenticated and Alloy has no credential checking to
+      # turn on, so binding any of them wider publishes a trace sink, a profile
+      # sink and a UI exposing the config structure. UFW's default-deny is the
+      # only thing between them and the internet on these hosts, and Docker
+      # publishing a port is enough to bypass that.
+      ansible.builtin.assert:
+        that:
+          - alloy_otlp_bind == '127.0.0.1'
+          - alloy_profiles_bind == '127.0.0.1'
+          - alloy_ui_bind == '127.0.0.1'
+          # Alloy already defaults to 127.0.0.1:12345, so the flag is omitted
+          # while the bind address matches. Emitting it takes the upstream
+          # role's preflight down a path that needs ansible.utils.ipaddr, which
+          # is not in requirements.yml.
+          - "'--disable-reporting' in alloy_custom_args"
+          - alloy_custom_args is not search('listen-addr')
+        fail_msg: >-
+          alloy_otlp_bind, alloy_profiles_bind and alloy_ui_bind must stay on
+          127.0.0.1. Reach the UI over an SSH tunnel instead
+          (ssh -L 12345:localhost:12345 <host>); widening alloy_ui_bind also
+          means adding ansible.utils to requirements.yml.
+
+    - name: Whole-host eBPF profiling must have the privileges and the output it needs
+      # pyroscope.ebpf is documented as root-only, and it forwards to the
+      # pyroscope.write block that alloy_enable_profiles controls. Get either
+      # wrong and one component sits in an error state while the rest of the
+      # agent carries on, so nothing looks broken and no profiles arrive.
+      ansible.builtin.assert:
+        that:
+          - not alloy_enable_ebpf | bool or alloy_service_user == 'root'
+          - not alloy_enable_ebpf | bool or alloy_enable_profiles | bool
+        fail_msg: >-
+          alloy_enable_ebpf needs alloy_service_user=root and
+          alloy_enable_profiles=true. The host also needs /sys/kernel/tracing
+          readable and a writable /tmp/symb-cache - see docs/alloy.md.
+
+    - name: Extra log paths must stay a list of path/job mappings
+      # Interpolated one per line into local.file_match's path_targets. A bare
+      # string, or an entry missing `job`, renders a block that either fails
+      # Alloy's parser at startup or ships the lines under an empty job label,
+      # where nothing in Grafana is looking for them. A list and not a dict so
+      # the rendered file keeps a stable order: unordered output makes the
+      # config task report `changed` on every run and restart Alloy with it.
+      ansible.builtin.assert:
+        that:
+          - alloy_extra_log_paths is sequence
+          - alloy_extra_log_paths is not string
+          - alloy_extra_log_paths is not mapping
+          - alloy_extra_log_paths | rejectattr('path', 'defined') | list | length == 0
+          - alloy_extra_log_paths | rejectattr('job', 'defined') | list | length == 0
+        fail_msg: >-
+          alloy_extra_log_paths must be a list of mappings, each with a `path`
+          glob and a `job`, e.g.
+          [{ path: "/tmp/logs/*.log", job: "python" }].
+
+    - name: The rendered Alloy config must survive being templated a second time
+      # grafana.grafana.alloy writes alloy_config with ansible.builtin.template,
+      # so whatever this repo renders passes through Jinja again on the way to
+      # /etc/alloy/config.alloy. Anything that reaches that second pass holding
+      # an opening Jinja delimiter is evaluated and discarded silently - the
+      # file lands short of a pipeline and Alloy starts perfectly happily
+      # without it.
+      #
+      # The delimiters are concatenated a character at a time on purpose: a
+      # literal opening delimiter written out in this file is read by the very
+      # lexer being tested, and the task fails to parse instead of running.
+      ansible.builtin.assert:
+        that:
+          - alloy_rendered.count('{' ~ '{') == 0
+          - alloy_rendered.count('{' ~ '%') == 0
+          - alloy_rendered.count('{' ~ '#') == 0
+        fail_msg: >-
+          The rendered Alloy config still contains a Jinja opening delimiter,
+          which grafana.grafana.alloy's own templating will consume. Escaping
+          it for this pass is not enough; it has to survive both.
+      vars:
+        alloy_rendered: "{{ lookup('ansible.builtin.template', alloy_template) }}"
+
+    - name: The pipeline toggles must actually add and remove pipelines
+      # Each toggle exists for a failure it prevents, and a broken conditional
+      # fails quietly in the direction that matters: a host without Docker
+      # keeps the container blocks and logs socket errors continuously, and a
+      # host that never asked for eBPF loads a kernel program.
+      ansible.builtin.assert:
+        that:
+          - alloy_default is search('prometheus.exporter.cadvisor')
+          - alloy_default is search('loki.source.journal')
+          - alloy_default is search('otelcol.receiver.otlp')
+          - alloy_default is search('pyroscope.receive_http')
+          - alloy_default is not search('pyroscope.ebpf')
+          - alloy_no_docker is not search('cadvisor')
+          - alloy_no_docker is not search('discovery.docker')
+          - alloy_ebpf is search('pyroscope.ebpf')
+        fail_msg: >-
+          A pipeline toggle in config.alloy.j2 no longer adds or removes the
+          block it names. Render it by hand to compare:
+          ansible-playbook tests/render-check.yml -vvv
+      vars:
+        alloy_default: "{{ lookup('ansible.builtin.template', alloy_template) }}"
+        alloy_no_docker: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_enable_docker': false}) }}"
+        alloy_ebpf: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_enable_ebpf': true}) }}"

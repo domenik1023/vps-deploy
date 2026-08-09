@@ -1,0 +1,12 @@
+# Settings shared by every off-site host.
+#
+# The two ingest hostnames reach the same reverse proxy and the same backends;
+# only the network path differs. ingest.net.d1023.de is LAN and tunnel only, so
+# hosts outside 192.168.2.x cannot resolve or route to it and every push would
+# fail. All four signal endpoints derive from this one value, which is why
+# switching a whole group is one line - see roles/alloy/defaults/main.yml.
+#
+# It is unauthenticated, like its LAN counterpart: agents cannot do interactive
+# OIDC, and nothing on the server checks credentials. If that ever changes it
+# changes here first, since this is the internet-facing name.
+alloy_ingest_base: "https://ingest.d1023.de"

@@ -8,6 +8,7 @@ Hardens a fresh Ubuntu VPS with:
 - UFW firewall with connection-rate limiting on the SSH port
 - Fail2ban as a local backstop behind CrowdSec (bans after 15 failed attempts)
 - CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
+- Grafana Alloy telemetry agent pushing metrics, logs, traces and profiles to the central observability stack
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
 - Docker Engine with security daemon config (log rotation, live-restore, no-new-privileges; optional user namespace remap)
@@ -28,29 +29,38 @@ vps-deploy/
 ├── tests/
 │   └── render-check.yml              # Variable shapes and design invariants
 ├── group_vars/
-│   └── all/
-│       └── vault.yml                 # Encrypted secrets (ansible-vault)
+│   ├── all/
+│   │   └── vault.yml                 # Encrypted secrets (ansible-vault)
+│   └── vps.yml                       # Off-site hosts: the public ingest hostname
 ├── docs/
-│   └── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
+│   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
+│   └── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
 │   ├── vps-pangolin.yml
 │   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
-    └── config/
+    ├── config/
+    │   ├── defaults/
+    │   │   └── main.yml              # All configurable variables
+    │   ├── handlers/
+    │   │   └── main.yml              # Service restart handlers
+    │   └── tasks/
+    │       ├── main.yml              # Task orchestration
+    │       ├── user.yml              # Admin user + sudo setup
+    │       ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
+    │       ├── sysctl.yml            # Kernel parameter hardening
+    │       ├── software.yml          # Docker, NTP, auto-updates
+    │       ├── crowdsec.yml          # CrowdSec agent + firewall bouncer
+    │       └── crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
+    └── alloy/
         ├── defaults/
-        │   └── main.yml              # All configurable variables
-        ├── handlers/
-        │   └── main.yml              # Service restart handlers
+        │   └── main.yml              # Pipelines, endpoints, bind addresses, version pin
+        ├── templates/
+        │   └── config.alloy.j2       # Rendered to /etc/alloy/config.alloy
         └── tasks/
-            ├── main.yml              # Task orchestration
-            ├── user.yml              # Admin user + sudo setup
-            ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
-            ├── sysctl.yml            # Kernel parameter hardening
-            ├── software.yml          # Docker, NTP, auto-updates
-            ├── crowdsec.yml          # CrowdSec agent + firewall bouncer
-            └── crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
+            └── main.yml              # Prerequisite asserts + grafana.grafana.alloy
 ```
 
 ## Prerequisites
@@ -149,6 +159,57 @@ cannot do the job: it can register a machine (`POST /v1/watchers`) only when
 auto-registration is enabled on the server, and it has no endpoint at all for
 creating a bouncer — bouncer keys exist only in the LAPI database.
 
+## Grafana Alloy
+
+> The pipelines, the two ingest hostnames, adding a log source, eBPF
+> prerequisites and troubleshooting are covered in
+> **[docs/alloy.md](docs/alloy.md)**.
+
+Every host gets one Alloy agent, installed natively from the upstream release
+(deb + systemd) by `grafana.grafana.alloy`, and configured from
+`roles/alloy/templates/config.alloy.j2`. It collects host and container metrics,
+the journal, container stdout, OTLP traces and Pyroscope profiles, and **pushes**
+them all to one ingest hostname.
+
+Two hostnames reach the same reverse proxy and the same backends; only the
+network path differs. `https://ingest.net.d1023.de` is LAN-routed and is the
+default, so a host on 192.168.2.x needs no configuration. Off-site hosts are
+switched a whole group at a time — `group_vars/vps.yml` is the entire override:
+
+```yaml
+alloy_ingest_base: "https://ingest.d1023.de"
+```
+
+All four signal endpoints derive from that value. `head -3
+/etc/alloy/config.alloy` on a host says which one it actually got.
+
+Per-host settings go in `host_vars/<name>.yml`:
+
+```yaml
+# A host with no Docker and nothing worth profiling
+alloy_enable_docker: false
+alloy_enable_profiles: false
+
+# An application writing logs to disk rather than stdout
+alloy_extra_log_paths:
+  - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+
+# The one host where whole-host eBPF profiling is wanted
+alloy_enable_ebpf: true
+```
+
+Two things are deliberate and easy to undo by accident. The OTLP receiver, the
+profile receiver and the Alloy UI are all **unauthenticated** and all stay on
+loopback — reach the UI with `ssh -L 12345:localhost:12345 <host>` rather than
+opening the port, and note that no UFW rule is added for any of them, because
+`ufw reload` flushes the CrowdSec bouncer's chains. And `alloy_agent_version` is
+**pinned**: upstream's default of `latest` queries the GitHub API on every run
+and can upgrade a host unasked. Both are asserted in `tests/render-check.yml`.
+
+The ingest endpoints are unauthenticated by design — agents cannot do
+interactive OIDC. Do not add credentials to the agent config expecting the
+server to check them.
+
 ## Inventory and Host Variables
 
 `inventory` lists host *names* and their groups. A name that resolves — via
@@ -178,7 +239,9 @@ new name; delete the leftovers on the master with `cscli machines delete` and
 
 ## Configuration
 
-All tunable values live in `roles/config/defaults/main.yml`:
+Hardening, Docker and CrowdSec values live in `roles/config/defaults/main.yml`;
+Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
+[below](#grafana-alloy-1).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -210,6 +273,37 @@ All tunable values live in `roles/config/defaults/main.yml`:
 | `crowdsec_lapi_docker_container` | `crowdsec-master-crowdsec-1` | Container name, when the LAPI runs in Docker on that host |
 | `crowdsec_lapi_cscli` | `["cscli"]` / `docker exec …` | `cscli` invocation prefix on the LAPI host; override for podman, compose, wrappers |
 | `crowdsec_lapi_validate_certs` | `true` | Set to `false` if the LAPI serves a self-signed certificate |
+
+### Grafana Alloy
+
+From `roles/alloy/defaults/main.yml`. See [docs/alloy.md](docs/alloy.md) for what
+each pipeline actually collects.
+
+| Variable | Default | Description |
+|---|---|---|
+| `alloy_ingest_base` | `https://ingest.net.d1023.de` | LAN ingest hostname; `group_vars/vps.yml` switches off-site hosts to the public one. All four signal endpoints derive from it |
+| `alloy_loki_endpoint` | derived + `/loki/api/v1/push` | Override only to send logs somewhere else |
+| `alloy_prom_endpoint` | derived + `/api/v1/write` | Override only to send metrics somewhere else |
+| `alloy_tempo_endpoint` | derived (base URL) | Base URL — the OTLP exporter appends `/v1/traces` itself |
+| `alloy_pyroscope_endpoint` | derived (base URL) | Base URL — `pyroscope.write` appends `/push.v1.PusherService/Push` itself |
+| `alloy_enable_docker` | `true` | cAdvisor metrics and container log discovery; **false on a host without Docker**, or the components log socket errors continuously |
+| `alloy_enable_journal` | `true` | systemd journal; false on non-systemd hosts |
+| `alloy_enable_otlp` | `true` | OTLP trace receiver on loopback |
+| `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
+| `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
+| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable |
+| `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
+| `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
+| `alloy_ui_bind` | `127.0.0.1` | Alloy UI and `/metrics`; reach it over an SSH tunnel |
+| `alloy_custom_args` | `--disable-reporting` | Extra `ExecStart` flags; adds `--server.http.listen-addr` only when the UI bind differs from Alloy's own default |
+| `alloy_log_level` | `info` | Alloy's own log level |
+| `alloy_scrape_interval` | `15s` | Applies to the node, self and cAdvisor scrapes |
+| `alloy_cluster` | `homelab` | External label on every metric, log line and profile |
+| `alloy_ebpf_interval` | `15s` | eBPF profile collection interval |
+| `alloy_docker_host` | `unix:///var/run/docker.sock` | Docker socket used by cAdvisor and log discovery |
+| `alloy_agent_version` | `1.18.1` | **Pinned.** Bumping this and re-running is the upgrade path; upstream's `latest` would query the GitHub API each run. Deliberately not called `alloy_version` — that name collides with the upstream role's own default |
+| `alloy_service_user` | `root` | Written into the systemd override. Required for cAdvisor's cgroup reads, `/dev/kmsg` and eBPF |
+| `alloy_service_extra_groups` | `[]` | Supplementary groups for the `alloy` user; only meaningful on the unprivileged path |
 
 ## Usage
 
@@ -249,8 +343,15 @@ The render check exists because the other two happily accept a Jinja expression
 that parses but evaluates to the wrong type — a list that becomes a string, a
 dict that stops being valid JSON. It also pins the design decisions that are
 easy to reverse by accident: fail2ban staying duller than CrowdSec, user
-namespace remapping staying off, and only both-family chains in
-`crowdsec_bouncer_iptables_chains`.
+namespace remapping staying off, only both-family chains in
+`crowdsec_bouncer_iptables_chains`, Alloy's three listeners staying on loopback,
+and every Alloy signal endpoint still deriving from `alloy_ingest_base`.
+
+It renders `config.alloy.j2` too, and asserts the toggles actually add and
+remove the pipelines they name and that nothing reaches
+`grafana.grafana.alloy`'s own templating pass still holding a Jinja delimiter —
+a block that does would be evaluated away silently, leaving a config Alloy
+starts perfectly happily without.
 
 ### Dry run (check mode)
 
