@@ -18,4 +18,4 @@ alloy_access_logs:
     format: traefik
 
 alloy_extra_scrape_targets:
-  - { name: "traefik", address: "127.0.0.1:8082" }
+  - { name: "instance/traefik", address: "127.0.0.1:8082" }
