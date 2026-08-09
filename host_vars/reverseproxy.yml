@@ -26,7 +26,7 @@ ansible_port: 22
 # `time_format rfc3339_nano`; see docs/alloy.md#caddy. Until the file exists
 # local.file_match simply matches nothing, so this is safe to land early.
 alloy_access_logs:
-  - path: /mnt/docker/caddy/logs/access.log
+  - path: /var/lib/docker/volumes/cpm_caddy-logs/_data/access.log
     format: caddy
     drop_paths:
       - "^/favicon\\.ico$"
