@@ -191,9 +191,15 @@ Per-host settings go in `host_vars/<name>.yml`:
 alloy_enable_docker: false
 alloy_enable_profiles: false
 
-# An application writing logs to disk rather than stdout
+# An application writing logs to disk rather than stdout. Shipped raw and
+# parsed at query time with LogQL, which is the right default.
 alloy_extra_log_paths:
   - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+
+# Traefik's access log, which is the exception: parsed at ingest, so its
+# timestamps are real and its trace IDs click through to Tempo. Needs
+# `accessLog.format: json` in Traefik.
+alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
 
 # The one host where whole-host eBPF profiling is wanted
 alloy_enable_ebpf: true
@@ -300,7 +306,10 @@ each pipeline actually collects.
 | `alloy_enable_otlp` | `true` | OTLP trace receiver on loopback |
 | `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
 | `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
-| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable |
+| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable. Lines are shipped raw and parsed at query time with LogQL |
+| `alloy_traefik_access_log` | `""` | Traefik's access log, given its own parsing pipeline rather than an entry above; requires `accessLog.format: json` — see [docs/alloy.md](docs/alloy.md#traefik) |
+| `alloy_traefik_job` | `traefik` | The Loki `job` label for those lines |
+| `alloy_traefik_drop_paths` | `[]` | Regexes matched against `RequestPath`, dropped at the agent before they count against Loki's rate limits |
 | `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |
 | `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |

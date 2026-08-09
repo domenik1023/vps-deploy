@@ -53,7 +53,45 @@ alloy_enable_ebpf: false
 #   alloy_extra_log_paths:
 #     - { path: "/tmp/logs/*.log", job: "python" }
 #     - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+#
+# Lines are shipped raw and parsed at query time with LogQL, which is the
+# idiomatic Loki approach. The Traefik access log below is the one exception.
 alloy_extra_log_paths: []
+
+# Traefik's access log, which gets its own pipeline rather than an entry in the
+# list above. Empty on every host that does not run Traefik; set it to the path
+# of the access log on the host that does:
+#
+#   alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
+#
+# It is parsed rather than shipped raw, and the parser is a JSON one, so
+# Traefik needs `accessLog.format: json`. Pointed at the default common-log
+# format it errors on every line - a failure that shows up as an error counter
+# on the component rather than as anything the play notices.
+#
+# Two things the parsing buys beyond queryable fields:
+#
+#   - correct timestamps, so a backlog replayed after a restart or a rotation
+#     does not land all at once and invent a traffic spike
+#   - trace_id as structured metadata, which is what makes a log line clickable
+#     through to its trace in Tempo - see docs/alloy.md
+alloy_traefik_access_log: ""
+
+# The Loki `job` label for those lines. Kept separate from the `path` so the
+# label does not change when the file moves.
+alloy_traefik_job: "traefik"
+
+# Request paths dropped before they count against Loki's ingestion rate limits.
+# Regular expressions, matched against Traefik's RequestPath field. An edge
+# proxy is the most likely thing in the estate to reach per_stream_rate_limit,
+# and health checks and favicon requests are the usual bulk of it:
+#
+#   alloy_traefik_drop_paths:
+#     - "^/health$"
+#     - "^/favicon\\.ico$"
+#
+# A list, not a set, for the same byte-stability reason as the log paths above.
+alloy_traefik_drop_paths: []
 
 # Anything on this host that already exposes a Prometheus endpoint - Traefik,
 # a bare node_exporter, an application's own /metrics. A list of mappings:

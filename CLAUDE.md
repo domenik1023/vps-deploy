@@ -132,6 +132,23 @@ upstream's `"latest"` — which queries the GitHub API every run and can upgrade
 host unasked. Include parameters outrank every default while still leaving
 host_vars free to override. Do not "simplify" this back into matching names.
 
+**Log sources are shipped raw except Traefik's access log.**
+`alloy_extra_log_paths` tails files and forwards them unparsed, on the Loki
+principle that parsing belongs at query time. `alloy_traefik_access_log` is the
+one exception, with a `loki.process` pipeline behind it, because three things
+cannot be recovered at query time: a real timestamp (otherwise a replayed
+backlog invents a traffic spike), `trace_id` as structured metadata (which is
+what makes a line clickable through to Tempo), and dropping lines before they
+count against Loki's ingestion limits. Only `entrypoint` becomes a real label —
+anything with unbounded values would create a Loki stream per value.
+
+**Regexes interpolated into the Alloy config must go through `to_json`.** Alloy
+string literals take Go's escape sequences, so an everyday
+`^/favicon\.ico$` in `alloy_traefik_drop_paths` is an "unknown escape sequence"
+that fails the entire config file — not just its stage — and the agent stops on
+its next restart. `alloy validate` from the pinned release catches it;
+`tests/render-check.yml` asserts the escaping so CI catches it first.
+
 `alloy_config` is rendered with `set_fact` rather than inline in the
 `include_role` vars, and that is also not stylistic: variables are templated
 lazily at the point of use, and a relative template lookup resolves against the
@@ -179,7 +196,7 @@ bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
 
 **Alloy's `instance` label comes from the system hostname, not the inventory.**
-`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in seven places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
 `hostname.yml` closes that by setting the system hostname to

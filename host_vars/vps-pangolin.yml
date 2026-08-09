@@ -9,8 +9,11 @@ ansible_port: 22822
 # ssh_port: 22822
 # crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-nftables
 
-alloy_extra_log_paths:
-  - { path: "/mnt/docker/pangolin/logs/access.log", job: "traefik" }
+# Traefik's access log. Not an alloy_extra_log_paths entry: that ships lines
+# raw, and this one is parsed, which is what gives the lines their real
+# timestamps and the trace_id that makes them clickable through to Tempo.
+# Requires `accessLog.format: json` in Traefik - see docs/alloy.md.
+alloy_traefik_access_log: "/mnt/docker/pangolin/logs/access.log"
 
 alloy_extra_scrape_targets:
   - { name: "traefik", address: "127.0.0.1:8082" }

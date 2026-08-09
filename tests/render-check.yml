@@ -232,6 +232,25 @@
           glob and a `job`, e.g.
           [{ path: "/tmp/logs/*.log", job: "python" }].
 
+    - name: The Traefik access log must be an absolute path and its drops regexes
+      # The path is interpolated into local.file_match's __path__, where a
+      # relative path resolves against Alloy's working directory rather than
+      # failing, so the pipeline sits there matching nothing. Empty is the
+      # normal case - the whole block is omitted for a host without Traefik.
+      # The drop expressions are strings, not a mapping, for the same
+      # byte-stability reason as the log paths; the template escapes them, so
+      # backslashes and quotes in a regex are safe here.
+      ansible.builtin.assert:
+        that:
+          - alloy_traefik_access_log | length == 0 or alloy_traefik_access_log is match('^/')
+          - alloy_traefik_job | length > 0
+          - alloy_traefik_drop_paths is sequence
+          - alloy_traefik_drop_paths is not string
+          - alloy_traefik_drop_paths | select('string') | list | length == alloy_traefik_drop_paths | length
+        fail_msg: >-
+          alloy_traefik_access_log must be empty or an absolute path, and
+          alloy_traefik_drop_paths a list of regex strings, e.g. ["^/health$"].
+
     - name: Extra scrape targets must name a valid component and a bare host port
       # `name` is interpolated straight into the block name, where anything but
       # an Alloy identifier is a parse error that stops the agent dead on the
@@ -262,17 +281,34 @@
       # The delimiters are concatenated a character at a time on purpose: a
       # literal opening delimiter written out in this file is read by the very
       # lexer being tested, and the task fails to parse instead of running.
+      #
+      # Both the default render and the everything-on one are checked: the
+      # blocks most likely to reintroduce a delimiter are the optional ones,
+      # and those are exactly the blocks a default render never reaches. The
+      # Traefik pipeline's nested braces are the current worst offender.
       ansible.builtin.assert:
         that:
           - alloy_rendered.count('{' ~ '{') == 0
           - alloy_rendered.count('{' ~ '%') == 0
           - alloy_rendered.count('{' ~ '#') == 0
+          - alloy_everything.count('{' ~ '{') == 0
+          - alloy_everything.count('{' ~ '%') == 0
+          - alloy_everything.count('{' ~ '#') == 0
         fail_msg: >-
           The rendered Alloy config still contains a Jinja opening delimiter,
           which grafana.grafana.alloy's own templating will consume. Escaping
           it for this pass is not enough; it has to survive both.
       vars:
         alloy_rendered: "{{ lookup('ansible.builtin.template', alloy_template) }}"
+        alloy_everything_vars:
+          alloy_enable_ebpf: true
+          alloy_traefik_access_log: /mnt/docker/pangolin/logs/access.log
+          alloy_traefik_drop_paths: ["^/health$"]
+          alloy_extra_log_paths:
+            - { path: "/tmp/logs/*.log", job: "python" }
+          alloy_extra_scrape_targets:
+            - { name: "traefik", address: "127.0.0.1:8082" }
+        alloy_everything: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=alloy_everything_vars) }}"
 
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional
@@ -292,6 +328,26 @@
           - alloy_default is not search('prometheus.scrape "traefik"')
           - alloy_scrape is search('prometheus.scrape "traefik"')
           - alloy_scrape is search('job_name        = "integrations/traefik"')
+          # The node job name is what every dashboard and every query in
+          # docs/alloy.md filters on, and renaming it silently orphans them
+          # all - the metrics keep arriving under a name nothing looks for.
+          - alloy_default is search('job_name        = "integrations/node_exporter"')
+          # The Traefik pipeline is off unless a host names its access log, and
+          # naming one has to bring the parser with it: the file tailed without
+          # loki.process ships JSON blobs Loki cannot break into fields.
+          - alloy_default is not search('loki.process "traefik"')
+          - alloy_traefik is search('loki.process "traefik"')
+          - alloy_traefik is search('stage.structured_metadata')
+          - alloy_traefik is search('trace_id')
+          - alloy_traefik is not search('stage.drop')
+          - alloy_traefik_dropping is search('stage.drop')
+          - alloy_traefik_dropping is search('expression          = "\^/health\$"')
+          # Alloy's strings take Go's escape sequences, so the backslash in an
+          # everyday regex is an "unknown escape sequence" that fails the whole
+          # config file - not just the stage - and stops the agent on its next
+          # restart. The template runs each expression through to_json, which
+          # doubles it. Verified against `alloy validate` from 1.18.1.
+          - alloy_escaped_drop in alloy_traefik_dropping
         fail_msg: >-
           A pipeline toggle in config.alloy.j2 no longer adds or removes the
           block it names. Render it by hand to compare:
@@ -304,3 +360,21 @@
           - name: traefik
             address: 127.0.0.1:8082
         alloy_scrape: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_extra_scrape_targets': alloy_probe_targets}) }}"
+        alloy_probe_access_log: /mnt/docker/pangolin/logs/access.log
+        alloy_traefik: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_traefik_access_log': alloy_probe_access_log}) }}"
+        # Single-quoted YAML, which passes backslashes through untouched - so
+        # this is one backslash, exactly what a host_vars entry produces. Do
+        # not write it as a Jinja string literal inside the lookup below: that
+        # unescapes the pair and feeds the template a value already doubled,
+        # which makes this test pass whether the template escapes or not.
+        alloy_probe_drop_paths:
+          - '^/health$'
+          - '^/favicon\.ico$'
+        # The expected output, likewise single-quoted: two backslashes, which
+        # is what Alloy reads back as the one the regex needs.
+        alloy_escaped_drop: 'expression          = "^/favicon\\.ico$"'
+        alloy_traefik_dropping: >-
+          {{ lookup('ansible.builtin.template', alloy_template, template_vars={
+               'alloy_traefik_access_log': alloy_probe_access_log,
+               'alloy_traefik_drop_paths': alloy_probe_drop_paths,
+             }) }}
