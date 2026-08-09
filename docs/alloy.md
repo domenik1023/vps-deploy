@@ -180,6 +180,14 @@ restart for exactly this reason; a rule added from the Alloy role would be
 outside that handler's scope and would leave the host unprotected until the next
 bouncer restart.
 
+Note that upstream's own `alloy_expose_port` is **not** the escape hatch it
+looks like. It drives `ansible.posix.firewalld`, and these hosts run UFW —
+firewalld is not installed. The role queries the `firewalld` unit first, gets
+`LoadState=not-found` back, and skips the rule without failing, so setting
+`alloy_expose_port: true` on Ubuntu opens nothing and reports nothing. Opening
+a port here means a `community.general.ufw` task, which is what the paragraph
+above says not to add.
+
 The UI is worth reaching — it shows the live component graph and is how you
 diagnose a pipeline that quietly stopped collecting. Use a tunnel:
 
@@ -302,4 +310,5 @@ every 30 seconds, so it needs no restart.
 | eBPF profiles missing, other profiles fine | `pyroscope.ebpf` is in an error state. Needs root, `/sys/kernel/tracing` and a writable `/tmp/symb-cache`; check the component graph in the UI. |
 | A host stopped reporting and nothing alerted | It was never added to `server/prometheus/targets/blackbox-icmp.yml`. Agents push, so silence is indistinguishable from a healthy idle host without the ICMP probe. |
 | Playbook fails on `ansible.utils.ipaddr` | `alloy_ui_bind` was widened, which makes the upstream role's preflight validate the listen address. Add `ansible.utils` to `requirements.yml`, or put the UI back on loopback. |
+| `alloy_expose_port: true` opened nothing | It is firewalld-only, and these hosts run UFW. The role skips the rule silently when the `firewalld` unit is not found. See [Firewall](#firewall) before adding a UFW rule instead. |
 | Version keeps changing across runs | `alloy_agent_version` is not reaching the upstream role, which falls back to `latest` and queries the GitHub API each run. Check the include parameters in `roles/alloy/tasks/main.yml`. |
