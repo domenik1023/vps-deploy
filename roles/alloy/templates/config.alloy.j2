@@ -111,6 +111,27 @@ prometheus.scrape "cadvisor" {
   forward_to      = [prometheus.remote_write.default.receiver]
 }
 {% endif %}
+{% if alloy_extra_scrape_targets | length > 0 %}
+
+// =============================================================================
+// Metrics - endpoints already exposed on this host
+// =============================================================================
+{% for target in alloy_extra_scrape_targets %}
+
+prometheus.scrape "{{ target.name }}" {
+  // instance is pinned to the hostname so this job filters the same way as
+  // every other one; the default would be the host:port scraped.
+  targets = [
+    { __address__ = "{{ target.address }}", instance = constants.hostname },
+  ]
+  job_name        = "{{ target.job | default('integrations/' ~ target.name) }}"
+  metrics_path    = "{{ target.path | default('/metrics') }}"
+  scheme          = "{{ target.scheme | default('http') }}"
+  scrape_interval = "{{ target.interval | default(alloy_scrape_interval) }}"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+{% endfor %}
+{% endif %}
 {% if alloy_enable_journal %}
 
 // =============================================================================

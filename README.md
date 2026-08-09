@@ -292,6 +292,7 @@ each pipeline actually collects.
 | `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
 | `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
 | `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable |
+| `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |
 | `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_ui_bind` | `127.0.0.1` | Alloy UI and `/metrics`; reach it over an SSH tunnel |

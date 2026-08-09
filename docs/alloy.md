@@ -94,6 +94,7 @@ head -3 /etc/alloy/config.alloy
 | systemd journal | `loki.source.journal`, relabelled to `unit` / `level` / `boot_id` | `alloy_enable_journal` |
 | Container stdout | `loki.source.docker`, labelled with the compose project and service | `alloy_enable_docker` |
 | Log files | `loki.source.file` | `alloy_extra_log_paths` |
+| Endpoints already on the host | `prometheus.scrape` (Traefik, an app's `/metrics`) | `alloy_extra_scrape_targets` |
 | Traces | `otelcol.receiver.otlp` on `127.0.0.1:4317` and `:4318` | `alloy_enable_otlp` |
 | Profiles (SDK) | `pyroscope.receive_http` on `127.0.0.1:4041` | `alloy_enable_profiles` |
 | Profiles (whole host) | `pyroscope.ebpf` | `alloy_enable_ebpf` |
@@ -161,6 +162,88 @@ nothing in Grafana is looking for them.
 
 Files are tailed from the end on first run, so a large existing log is not
 replayed into Loki.
+
+## Scraping something that already exposes metrics
+
+Anything on the host with its own Prometheus endpoint — a reverse proxy, an
+application's `/metrics`, a bare exporter — is added as a scrape target:
+
+```yaml
+alloy_extra_scrape_targets:
+  - { name: "traefik", address: "127.0.0.1:8082" }
+```
+
+`name` becomes the component label and the job suffix (`integrations/traefik`),
+so it has to be a valid Alloy identifier — letters, digits and underscores, not
+starting with a digit. It is interpolated straight into the block name, where
+anything else is a parse error that stops the agent on its next restart.
+`address` is a bare `host:port`, not a URL. Both are asserted in
+`tests/render-check.yml`. `job`, `path`, `scheme` and `interval` are optional.
+
+The `instance` label is pinned to the hostname rather than left to default to
+the scraped `host:port`, so these jobs filter the same way as every other one.
+
+> **Publish the port to loopback.** A target on a Docker-published port must be
+> published as `127.0.0.1:8082:8082`, never `8082:8082`. Docker's `FORWARD` jump
+> precedes UFW's, so a plainly published port is reachable from the internet
+> whatever the firewall says — the same trap CrowdSec compensates for via
+> `DOCKER-USER`.
+
+### Traefik
+
+`vps-pangolin` runs Traefik as part of the Pangolin stack. The two signals need
+quite different amounts of work.
+
+**Logs need nothing here.** Traefik in Docker logs to stdout, so
+`loki.source.docker` already collects it — the lines are in Loki under
+`{job="integrations/docker", instance="vps-pangolin"}`, labelled with the
+compose project and service. What is missing is *access* logs, which Traefik
+does not emit by default. Turn them on in Traefik, not in this repo:
+
+```yaml
+# static config
+accessLog:
+  format: json      # or: --accesslog=true --accesslog.format=json
+```
+
+JSON because a structured access log is worth querying; Loki can filter on the
+fields directly. They then arrive through the same Docker stdout pipeline with
+no Ansible change at all.
+
+**Metrics need enabling and then scraping.** Traefik serves Prometheus metrics
+on the `traefik` entryPoint at `/metrics` once switched on, and that entryPoint
+is the same one the insecure API dashboard uses — so give metrics their own:
+
+```yaml
+# static config
+entryPoints:
+  metrics:
+    address: ":8082"
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addRoutersLabels: true    # off by default; per-router series
+```
+
+```yaml
+# compose: loopback only, so the port is not published to the internet
+ports:
+  - "127.0.0.1:8082:8082"
+```
+
+```yaml
+# host_vars/vps-pangolin.yml
+alloy_extra_scrape_targets:
+  - { name: "traefik", address: "127.0.0.1:8082" }
+```
+
+`addEntryPointsLabels` and `addServicesLabels` are already on by default;
+`addRoutersLabels` is not, and it is the one that gives per-router request rates
+and latencies. It also multiplies series count by the number of routers, so turn
+it on deliberately.
+
+Verify from Grafana: `up{job="integrations/traefik", instance="vps-pangolin"}`
+should be `1`, and `traefik_service_requests_total` should have series.
 
 ## Firewall
 
@@ -308,6 +391,8 @@ every 30 seconds, so it needs no restart.
 | Traces sent but never appear in Tempo | `alloy_tempo_endpoint` has a path on it. It must be a base URL — the exporter appends `/v1/traces` itself, and the doubled path 404s silently. |
 | Profiles sent but never appear in Pyroscope | Same shape of mistake: `alloy_pyroscope_endpoint` is a base URL, and `pyroscope.write` appends `/push.v1.PusherService/Push`. Check the reverse proxy routes both that and `/ingest`. |
 | eBPF profiles missing, other profiles fine | `pyroscope.ebpf` is in an error state. Needs root, `/sys/kernel/tracing` and a writable `/tmp/symb-cache`; check the component graph in the UI. |
+| An extra scrape target never comes up | `address` is a bare `host:port` — a URL there scrapes a host that does not exist. If the endpoint is a Docker-published port, check it is published (`docker port <container>`) and that the bind is `127.0.0.1`, which Alloy on the host can still reach. |
+| Traefik metrics missing, Traefik logs present | Metrics are off in Traefik itself until `metrics.prometheus` is set; the container logging to stdout is independent of it. Per-router series additionally need `addRoutersLabels: true`. |
 | A host stopped reporting and nothing alerted | It was never added to `server/prometheus/targets/blackbox-icmp.yml`. Agents push, so silence is indistinguishable from a healthy idle host without the ICMP probe. |
 | Playbook fails on `ansible.utils.ipaddr` | `alloy_ui_bind` was widened, which makes the upstream role's preflight validate the listen address. Add `ansible.utils` to `requirements.yml`, or put the UI back on loopback. |
 | `alloy_expose_port: true` opened nothing | It is firewalld-only, and these hosts run UFW. The role skips the rule silently when the `firewalld` unit is not found. See [Firewall](#firewall) before adding a UFW rule instead. |

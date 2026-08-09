@@ -55,6 +55,31 @@ alloy_enable_ebpf: false
 #     - { path: "/tmp/pangolin/*.log", job: "pangolin" }
 alloy_extra_log_paths: []
 
+# Anything on this host that already exposes a Prometheus endpoint - Traefik,
+# a bare node_exporter, an application's own /metrics. A list of mappings:
+#
+#   name      component label and the job suffix; must be a valid Alloy
+#             identifier (letters, digits, underscore, not starting with a
+#             digit), because it is interpolated straight into the block name
+#   address   host:port, as Prometheus would write it
+#   job       optional, defaults to integrations/<name>
+#   path      optional, defaults to /metrics
+#   scheme    optional, defaults to http
+#   interval  optional, defaults to alloy_scrape_interval
+#
+#   alloy_extra_scrape_targets:
+#     - { name: "traefik", address: "127.0.0.1:8082" }
+#
+# The `instance` label is pinned to the hostname rather than left to default to
+# host:port, so these line up with every other job in Grafana - the dashboards
+# and the queries in docs/alloy.md all filter on instance="<host>".
+#
+# A target on a Docker-published port must be published to loopback
+# ("127.0.0.1:8082:8082", not "8082:8082"). Docker's FORWARD jump precedes
+# UFW's, so a plainly published port is reachable from the internet whatever
+# the firewall says - see the same trap in roles/config/defaults/main.yml.
+alloy_extra_scrape_targets: []
+
 # --- Tuning ---
 alloy_log_level: info
 alloy_scrape_interval: "15s"

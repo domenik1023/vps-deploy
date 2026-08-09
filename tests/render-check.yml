@@ -214,6 +214,25 @@
           glob and a `job`, e.g.
           [{ path: "/tmp/logs/*.log", job: "python" }].
 
+    - name: Extra scrape targets must name a valid component and a bare host port
+      # `name` is interpolated straight into the block name, where anything but
+      # an Alloy identifier is a parse error that stops the agent dead on the
+      # next restart. `address` fills __address__, which is a host:port and not
+      # a URL - a scheme pasted in there scrapes a nonexistent host and shows up
+      # only as a target that never comes up.
+      ansible.builtin.assert:
+        that:
+          - alloy_extra_scrape_targets is sequence
+          - alloy_extra_scrape_targets is not string
+          - alloy_extra_scrape_targets is not mapping
+          - alloy_extra_scrape_targets | map(attribute='name', default='') | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+          - alloy_extra_scrape_targets | map(attribute='address', default='') | reject('match', '^[^\\s/]+:[0-9]+$') | list | length == 0
+        fail_msg: >-
+          alloy_extra_scrape_targets must be a list of mappings, each with a
+          `name` that is a valid Alloy identifier and an `address` of the form
+          host:port - no scheme, no path, e.g.
+          [{ name: "traefik", address: "127.0.0.1:8082" }].
+
     - name: The rendered Alloy config must survive being templated a second time
       # grafana.grafana.alloy writes alloy_config with ansible.builtin.template,
       # so whatever this repo renders passes through Jinja again on the way to
@@ -252,6 +271,9 @@
           - alloy_no_docker is not search('cadvisor')
           - alloy_no_docker is not search('discovery.docker')
           - alloy_ebpf is search('pyroscope.ebpf')
+          - alloy_default is not search('prometheus.scrape "traefik"')
+          - alloy_scrape is search('prometheus.scrape "traefik"')
+          - alloy_scrape is search('job_name        = "integrations/traefik"')
         fail_msg: >-
           A pipeline toggle in config.alloy.j2 no longer adds or removes the
           block it names. Render it by hand to compare:
@@ -260,3 +282,7 @@
         alloy_default: "{{ lookup('ansible.builtin.template', alloy_template) }}"
         alloy_no_docker: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_enable_docker': false}) }}"
         alloy_ebpf: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_enable_ebpf': true}) }}"
+        alloy_probe_targets:
+          - name: traefik
+            address: 127.0.0.1:8082
+        alloy_scrape: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_extra_scrape_targets': alloy_probe_targets}) }}"
