@@ -232,8 +232,8 @@ alloy_custom_args: >-
 # Two ingest hostnames reach the same reverse proxy and the same backends; only
 # the network path differs:
 #
-#   https://ingest.net.d1023.de   LAN and tunnel only - the default, for hosts
-#                                 on 192.168.2.x
+#   https://ingest.net.d1023.de   LAN and tunnel only - the default, and what
+#                                 every host in the [local] group uses
 #   https://ingest.d1023.de       internet-facing - for off-site hosts
 #
 # Each signal has a distinct write path, so one hostname routes all four with

@@ -4,46 +4,35 @@
 ansible_host: 192.168.4.6
 ansible_port: 22
 
-# --- Before the first run, check two things ---
+# Alloy needs nothing here: every LAN host reaches ingest.net.d1023.de, which
+# is what alloy_ingest_base already defaults to. Only the off-site `vps` group
+# overrides it, in group_vars/vps.yml.
+
+# --- Before the first run, check UFW ---
 #
-# 1. UFW. Being in [local] skips the SSH port move, but NOT `ufw enable`, which
-#    activates default-deny incoming on every host this playbook touches. Only
-#    the SSH ports are allowed. That is fine for a reverse proxy whose 80/443
-#    are Docker-published, because Docker's FORWARD jump precedes UFW's and the
-#    published ports stay reachable regardless - the same trap documented in
-#    roles/config/defaults/main.yml, working in our favour here. It is NOT fine
-#    for a Caddy running natively on the host: the first run would take the
-#    proxy off the network. Confirm which one this is before deploying.
-#
-# 2. Ingest routing. This host is on 192.168.4.x, not the 192.168.2.x the LAN
-#    ingest hostname is documented for. alloy_ingest_base defaults to
-#    https://ingest.net.d1023.de, so that name has to resolve and route from
-#    this subnet. If it does not, telemetry never arrives and the only symptom
-#    is silence - the agent retries forever. Check with:
-#
-#      curl -sS -o /dev/null -w '%{http_code}\n' https://ingest.net.d1023.de/
-#
-#    If it cannot get there, either fix the routing or point this host at the
-#    public name, which reaches the same backends:
-#
-#      alloy_ingest_base: "https://ingest.d1023.de"
+# Being in [local] skips the SSH port move, but NOT `ufw enable`, which
+# activates default-deny incoming on every host this playbook touches. Only the
+# SSH ports are allowed. That is fine for a reverse proxy whose 80/443 are
+# Docker-published, because Docker's FORWARD jump precedes UFW's and the
+# published ports stay reachable regardless - the same trap documented in
+# roles/config/defaults/main.yml, working in our favour here. It is NOT fine
+# for a Caddy running natively on the host: the first run would take the proxy
+# off the network. Confirm which one this is before deploying.
 
 # --- Caddy telemetry ---
 #
-# Both of these need a change on the Caddy side first, and the paths below are
-# the convention rather than anything verified against this host - confirm them
-# against Caddy Proxy Manager's compose file before uncommenting. See
-# docs/alloy.md#caddy for the Caddy-side configuration.
-#
-# The access log entry is safe to land early: until the file exists,
-# local.file_match simply matches nothing. The scrape target is not - it
-# reports up == 0 rather than nothing at all until Caddy serves that port.
-#
-# alloy_access_logs:
-#   - path: /mnt/docker/caddy/logs/access.log
-#     format: caddy
-#     drop_paths:
-#       - "^/favicon\\.ico$"
+# PATH NOT YET VERIFIED against this host - point it at whatever Caddy Proxy
+# Manager actually writes. Caddy also has to be writing JSON with
+# `time_format rfc3339_nano`; see docs/alloy.md#caddy. Until the file exists
+# local.file_match simply matches nothing, so this is safe to land early.
+alloy_access_logs:
+  - path: /mnt/docker/caddy/logs/access.log
+    format: caddy
+    drop_paths:
+      - "^/favicon\\.ico$"
+
+# Metrics are left off until Caddy serves them: unlike the access log, a scrape
+# target that cannot connect reports up == 0 rather than nothing at all.
 #
 # Deliberately NOT the admin endpoint on :2019 - that one is unauthenticated
 # and can rewrite Caddy's running config, so it stays inside the container and

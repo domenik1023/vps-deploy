@@ -2,7 +2,7 @@
 #
 # The two ingest hostnames reach the same reverse proxy and the same backends;
 # only the network path differs. ingest.net.d1023.de is LAN and tunnel only, so
-# hosts outside 192.168.2.x cannot resolve or route to it and every push would
+# hosts outside the LAN cannot resolve or route to it and every push would
 # fail. All four signal endpoints derive from this one value, which is why
 # switching a whole group is one line - see roles/alloy/defaults/main.yml.
 #

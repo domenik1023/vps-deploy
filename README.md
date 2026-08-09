@@ -174,7 +174,7 @@ them all to one ingest hostname.
 
 Two hostnames reach the same reverse proxy and the same backends; only the
 network path differs. `https://ingest.net.d1023.de` is LAN-routed and is the
-default, so a host on 192.168.2.x needs no configuration. Off-site hosts are
+default, so a LAN host needs no configuration at all. Off-site hosts are
 switched a whole group at a time — `group_vars/vps.yml` is the entire override:
 
 ```yaml

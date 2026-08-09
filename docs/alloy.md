@@ -55,11 +55,11 @@ path differs:
 
 | Hostname | Reachable from | Used by |
 |---|---|---|
-| `https://ingest.net.d1023.de` | LAN and tunnel only | hosts on 192.168.2.x — the default |
+| `https://ingest.net.d1023.de` | LAN and tunnel only | every LAN host — the default |
 | `https://ingest.d1023.de` | the internet | off-site hosts — the `vps` group |
 
-The LAN name is the default in `roles/alloy/defaults/main.yml`, so a host on the
-LAN needs no configuration at all. Off-site hosts are switched a whole group at a
+The LAN name is the default in `roles/alloy/defaults/main.yml`, so a LAN host
+needs no configuration at all, whichever subnet it sits on. Off-site hosts are switched a whole group at a
 time, which `group_vars/vps.yml` already does:
 
 ```yaml
