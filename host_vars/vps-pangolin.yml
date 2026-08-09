@@ -11,3 +11,6 @@ ansible_port: 22822
 
 alloy_extra_log_paths:
   - { path: "/mnt/docker/pangolin/logs/access.log", job: "traefik" }
+
+alloy_extra_scrape_targets:
+  - { name: "traefik", address: "127.0.0.1:8082" }
