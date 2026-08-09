@@ -1,0 +1,332 @@
+{#
+  Rendered by roles/alloy/tasks/main.yml into the upstream role's alloy_config
+  variable, which writes it to /etc/alloy/config.alloy.
+
+  Every value this reads has a default in ../defaults/main.yml, so a host with
+  no host_vars gets the full pipeline set pointed at the LAN ingest hostname.
+  Defaults live there and not in `| default(...)` filters here, so there is one
+  place to read them and tests/render-check.yml can assert their shapes.
+
+  Two things to know before editing:
+
+  1. This output is templated a second time. grafana.grafana.alloy writes
+     alloy_config with ansible.builtin.template, so whatever this renders
+     passes through Jinja again on the way to disk. Alloy's own syntax uses
+     single braces and survives that untouched, but anything emitting Go
+     template syntax - a loki.process stage_template, say - produces doubled
+     braces that the second pass evaluates and discards silently.
+     tests/render-check.yml asserts the rendered output carries no Jinja
+     delimiters, so a regression here fails CI rather than a host. Escaping
+     such a block for Jinja here is not enough; it has to survive both passes.
+
+  2. The output has to be byte-stable across runs. Iterate lists, never bare
+     dicts, and never interpolate anything time-derived: unstable output makes
+     the config task report `changed` on every play and restarts Alloy with it.
+
+  The conditionals are not cosmetic. A host without Docker that still has the
+  container-discovery blocks compiled in logs socket errors continuously, and
+  pyroscope.ebpf on an unsupported kernel fails the component at startup.
+#}
+// Managed by Ansible - edit roles/alloy/templates/config.alloy.j2, not this file.
+// Host: {{ inventory_hostname }}
+// Ingest: {{ alloy_ingest_base }}
+
+logging {
+  level    = "{{ alloy_log_level }}"
+  format   = "logfmt"
+  write_to = [loki.write.default.receiver]
+}
+
+// =============================================================================
+// Outputs
+// =============================================================================
+
+loki.write "default" {
+  endpoint {
+    url = coalesce(sys.env("LOKI_ENDPOINT"), "{{ alloy_loki_endpoint }}")
+  }
+  external_labels = {
+    cluster = "{{ alloy_cluster }}",
+  }
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = coalesce(sys.env("PROM_ENDPOINT"), "{{ alloy_prom_endpoint }}")
+  }
+  external_labels = {
+    cluster = "{{ alloy_cluster }}",
+  }
+}
+{% if alloy_enable_profiles %}
+
+// Base URL only - pyroscope.write appends /push.v1.PusherService/Push, which
+// is the path agents write on. /ingest is the language-SDK path, served here
+// by pyroscope.receive_http below; the reverse proxy has to route both.
+pyroscope.write "default" {
+  endpoint {
+    url = coalesce(sys.env("PYROSCOPE_ENDPOINT"), "{{ alloy_pyroscope_endpoint }}")
+  }
+  external_labels = {
+    cluster  = "{{ alloy_cluster }}",
+    hostname = constants.hostname,
+  }
+}
+{% endif %}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+prometheus.exporter.unix "node" {
+  // systemd is not enabled by default; HostSystemdUnitFailed needs it.
+  enable_collectors = ["systemd"]
+}
+
+prometheus.scrape "node" {
+  targets         = prometheus.exporter.unix.node.targets
+  job_name        = "integrations/node"
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.exporter.self "alloy" {}
+
+prometheus.scrape "alloy" {
+  targets         = prometheus.exporter.self.alloy.targets
+  job_name        = "integrations/alloy"
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+{% if alloy_enable_docker %}
+
+prometheus.exporter.cadvisor "containers" {
+  docker_host = "{{ alloy_docker_host }}"
+}
+
+prometheus.scrape "cadvisor" {
+  targets         = prometheus.exporter.cadvisor.containers.targets
+  job_name        = "integrations/docker"
+  scrape_interval = "{{ alloy_scrape_interval }}"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+{% endif %}
+{% if alloy_extra_scrape_targets | length > 0 %}
+
+// =============================================================================
+// Metrics - endpoints already exposed on this host
+// =============================================================================
+{% for target in alloy_extra_scrape_targets %}
+
+prometheus.scrape "{{ target.name }}" {
+  // instance is pinned to the hostname so this job filters the same way as
+  // every other one; the default would be the host:port scraped.
+  targets = [
+    { __address__ = "{{ target.address }}", instance = constants.hostname },
+  ]
+  job_name        = "{{ target.job | default('integrations/' ~ target.name) }}"
+  metrics_path    = "{{ target.path | default('/metrics') }}"
+  scheme          = "{{ target.scheme | default('http') }}"
+  scrape_interval = "{{ target.interval | default(alloy_scrape_interval) }}"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+{% endfor %}
+{% endif %}
+{% if alloy_enable_journal %}
+
+// =============================================================================
+// Logs - journald
+// =============================================================================
+
+loki.relabel "journal" {
+  forward_to = [loki.write.default.receiver]
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal__hostname"]
+    target_label  = "instance"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+  rule {
+    source_labels = ["__journal__transport"]
+    target_label  = "transport"
+  }
+  rule {
+    source_labels = ["__journal__boot_id"]
+    target_label  = "boot_id"
+  }
+}
+
+loki.source.journal "system" {
+  relabel_rules = loki.relabel.journal.rules
+  forward_to    = [loki.relabel.journal.receiver]
+  labels        = { job = "integrations/journal" }
+}
+{% endif %}
+{% if alloy_enable_docker %}
+
+// =============================================================================
+// Logs - Docker containers
+// =============================================================================
+
+discovery.docker "containers" {
+  host             = "{{ alloy_docker_host }}"
+  refresh_interval = "15s"
+}
+
+discovery.relabel "docker_logs" {
+  targets = []
+
+  rule {
+    target_label = "job"
+    replacement  = "integrations/docker"
+  }
+  rule {
+    target_label = "instance"
+    replacement  = constants.hostname
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_id"]
+    target_label  = "container_id"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_image"]
+    target_label  = "image"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+  // Tempo's tracesToLogsV2 maps span service.name onto this label.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_version"]
+    target_label  = "compose_version"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "{{ alloy_docker_host }}"
+  refresh_interval = "15s"
+  targets          = discovery.docker.containers.targets
+  relabel_rules    = discovery.relabel.docker_logs.rules
+  forward_to       = [loki.write.default.receiver]
+}
+{% endif %}
+{% if alloy_extra_log_paths | length > 0 %}
+
+// =============================================================================
+// Logs - files
+// =============================================================================
+
+local.file_match "extra" {
+  path_targets = [
+{% for entry in alloy_extra_log_paths %}
+    { __path__ = "{{ entry.path }}", job = "{{ entry.job }}", hostname = constants.hostname },
+{% endfor %}
+  ]
+  sync_period = "5s"
+}
+
+loki.source.file "extra" {
+  targets       = local.file_match.extra.targets
+  forward_to    = [loki.write.default.receiver]
+  tail_from_end = true
+}
+{% endif %}
+{% if alloy_enable_otlp %}
+
+// =============================================================================
+// Traces - OTLP
+// =============================================================================
+
+// Applications on this host send to localhost:4318 / :4317. The receiver is
+// unauthenticated, so the bind address stays on loopback unless remote senders
+// are deliberately wanted - and a host that needs to send should run its own
+// agent instead.
+otelcol.receiver.otlp "default" {
+  grpc { endpoint = "{{ alloy_otlp_bind }}:4317" }
+  http { endpoint = "{{ alloy_otlp_bind }}:4318" }
+
+  output {
+    traces = [otelcol.processor.resourcedetection.default.input]
+  }
+}
+
+otelcol.processor.resourcedetection "default" {
+  detectors = ["env", "system"]
+
+  system {
+    hostname_sources = ["os"]
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  send_batch_size = 1000
+  timeout         = "2s"
+
+  output {
+    traces = [otelcol.exporter.otlphttp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlphttp "tempo" {
+  client {
+    // Base URL only - the exporter appends /v1/traces.
+    endpoint = coalesce(sys.env("TEMPO_ENDPOINT"), "{{ alloy_tempo_endpoint }}")
+  }
+
+  retry_on_failure {
+    enabled = true
+  }
+}
+{% endif %}
+{% if alloy_enable_profiles %}
+
+// =============================================================================
+// Profiles
+// =============================================================================
+
+// Language SDKs on this host push to localhost:4041/ingest; the profiles are
+// forwarded to pyroscope.write above. Unauthenticated, same as OTLP.
+pyroscope.receive_http "default" {
+  http {
+    listen_address = "{{ alloy_profiles_bind }}"
+    listen_port    = 4041
+  }
+  forward_to = [pyroscope.write.default.receiver]
+}
+{% if alloy_enable_ebpf %}
+
+// Whole-host eBPF profiling. Needs Alloy running as root in the host PID
+// namespace, /sys/kernel/tracing readable and a writable /tmp/symb-cache; see
+// docs/alloy.md. Generally available since Alloy 1.18, so no --stability.level
+// flag is involved.
+pyroscope.ebpf "host" {
+  forward_to       = [pyroscope.write.default.receiver]
+  collect_interval = "{{ alloy_ebpf_interval }}"
+}
+{% endif %}
+{% endif %}

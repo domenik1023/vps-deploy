@@ -31,37 +31,60 @@ ansible-playbook main.yml -i inventory --ask-vault-pass --limit <host> # one hos
 ansible-vault edit group_vars/all/vault.yml
 ```
 
+`requirements.yml` pins `grafana.grafana` for the `alloy` role, so re-run the
+collection install after pulling.
+
 Most bugs here are Jinja, not Ansible, and neither `--syntax-check` nor
 `ansible-lint` catches an expression that parses but evaluates to the wrong
 type. `tests/render-check.yml` covers the derived variables; when adding a
 tricky expression, add an assertion there — and confirm it fails when the
 regression is present (`-e var=badvalue`), or it is not testing anything.
 
-For task-level templates the render check cannot reach, write a throwaway play
-that loads `roles/config/defaults/main.yml` via `vars_files`, renders the
-expression to a file, and parse it back with Python to confirm the shape.
+The render check also renders `roles/alloy/templates/config.alloy.j2` — a
+relative `lookup('ansible.builtin.template', …)` resolves fine from `tests/`,
+and `template_vars=` lets one assertion compare renders under different
+toggles. Validate a rendered Alloy config against the real parser before
+trusting it: `alloy fmt <file>` and `alloy validate <file>`, from the binary in
+the release matching `alloy_agent_version`.
+
+For anything the render check still cannot reach, write a throwaway play that
+loads the role's `defaults/main.yml` via `vars_files`, renders the expression to
+a file, and parse it back with Python to confirm the shape.
 
 ## Architecture
 
-One role, `config`, included by `main.yml`. Its `tasks/main.yml` includes five
-files **and the order is load-bearing**:
+Two roles and two plays in `main.yml`, in this order: `config` (hardening) then
+`alloy` (telemetry). The split is a play boundary rather than a second
+`include_role` so the hardening role's task order stays a statement about
+itself; `hardening.yml` records the switched SSH port with `set_fact`, and host
+facts persist across plays within a run, so the second play still connects.
 
-`user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` → `crowdsec.yml`
+`config/tasks/main.yml` includes six files **and the order is load-bearing**:
 
+`hostname.yml` → `user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` →
+`crowdsec.yml`
+
+- `hostname.yml` is first because the host's own name is what everything after
+  it records itself as, and the Alloy play labels all its telemetry with it.
 - `hardening.yml` installs `python3-debian`, which `deb822_repository` in
   `software.yml` and `crowdsec.yml` needs and a stock Ubuntu image lacks.
 - `software.yml` starts Docker before `crowdsec.yml` probes for `DOCKER-USER`.
 
+The `alloy` play must stay after it: cAdvisor and the Docker log discovery both
+expect the socket `software.yml` creates.
+
 ### Host targeting
 
-`main.yml` runs against `all:!lapi`. The `[lapi]` group holds the central
+Both plays run against `all:!lapi`. The `[lapi]` group holds the central
 CrowdSec LAPI server, which exists in the inventory **only** as a `delegate_to`
 target — a delegate absent from the inventory silently falls back to SSH
 defaults (port 22, no `ansible_user`). Configuring it would disable the very
 LAPI the fleet depends on.
 
-Within the play, `when: "'local' not in group_names"` skips SSH hardening (to
-avoid self-lockout on LAN test boxes) and the entire CrowdSec include.
+Within the hardening play, `when: "'local' not in group_names"` skips SSH
+hardening (to avoid self-lockout on LAN test boxes) and the entire CrowdSec
+include. Alloy is not skipped there — a LAN box reaches the default
+`ingest.net.d1023.de` without any override.
 
 Hosts are named in `inventory`; addresses and per-host settings live in
 `host_vars/<name>.yml`. The name is not cosmetic — `crowdsec_lapi_login` and
@@ -92,6 +115,28 @@ for the bouncer key) and only generate a new secret when the existing one is
 missing, points elsewhere, or is rejected. Preserve that property when editing.
 `crowdsec_lapi_cscli` is the invocation prefix, which is how a LAPI running in
 a container is reached (`docker exec <container> cscli …`).
+
+### Alloy
+
+`roles/alloy` is a thin wrapper: it renders `templates/config.alloy.j2` and
+hands it to `grafana.grafana.alloy`, which does the install. Everything tunable
+lives in its `defaults/main.yml`; see `docs/alloy.md` for the operational side.
+
+Three of its variables are deliberately renamed because upstream defines the
+same names — `alloy_agent_version`, `alloy_service_user` and
+`alloy_service_extra_groups`, mapped onto `alloy_version`,
+`alloy_systemd_override` and `alloy_user_groups` as **include parameters**.
+Role defaults from both roles sit at the same precedence and the role loaded
+second wins, so an `alloy_version` in our defaults would be silently replaced by
+upstream's `"latest"` — which queries the GitHub API every run and can upgrade a
+host unasked. Include parameters outrank every default while still leaving
+host_vars free to override. Do not "simplify" this back into matching names.
+
+`alloy_config` is rendered with `set_fact` rather than inline in the
+`include_role` vars, and that is also not stylistic: variables are templated
+lazily at the point of use, and a relative template lookup resolves against the
+role of the task doing the using — which for `alloy_config` is a task inside
+`grafana.grafana.alloy`, whose `templates/` does not contain our file.
 
 ## Conventions and traps
 
@@ -132,6 +177,37 @@ checking it against the `ssh-bf` / `ssh-slow-bf` thresholds inverts that.
 **`docker_userns_remap` is off deliberately.** It breaks any container that
 bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
+
+**Alloy's `instance` label comes from the system hostname, not the inventory.**
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
+across the config — so a host whose local name differs from its inventory name
+ships telemetry no dashboard filtering on the inventory name will match.
+`hostname.yml` closes that by setting the system hostname to
+`inventory_hostname`, which is why it fixes all six at once and no relabelling
+is needed. Alloy reads the hostname once at startup and its config carries no
+literal copy, so a rename does not change the config and upstream's handler
+never fires — `roles/alloy` restarts it explicitly on the fact `hostname.yml`
+sets. Facts persist across plays, which is what makes that work.
+
+**The Alloy config is templated twice.** `grafana.grafana.alloy` writes
+`alloy_config` with `ansible.builtin.template`, so whatever `config.alloy.j2`
+renders passes through Jinja again on the way to disk. Anything reaching that
+second pass still holding an opening Jinja delimiter is evaluated and discarded
+silently — the file lands short of a pipeline and Alloy starts happily without
+it. `tests/render-check.yml` asserts against this.
+
+**Alloy's three listeners stay on loopback.** OTLP (4317/4318), the profile
+receiver (4041) and the UI (12345) are all unauthenticated and Alloy has no
+credential checking to enable. No UFW rule is added for any of them, and that is
+deliberate twice over: nothing needs to reach them, and any `ufw` rule change
+reloads UFW, which deletes every non-builtin chain and takes the CrowdSec
+bouncer's rules with it. The `Reload UFW` handler notifies a bouncer restart for
+that reason, and it is scoped to `roles/config` — a rule added from `roles/alloy`
+could not reach it.
+
+**Alloy's ingest endpoints are unauthenticated by design.** Agents cannot do
+interactive OIDC. Do not add credentials to the agent config expecting the
+server to check them; nothing does.
 
 `group_vars/all/vault.yml` holds only `vault_admin_password`, which must be a
 crypt hash — `user.yml` asserts this, because the `user` module writes the value

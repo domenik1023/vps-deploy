@@ -1,0 +1,60 @@
+# --- HOST IDENTITY ---
+# Makes the system hostname match the name this host is called in the
+# inventory. They drift apart easily - a VPS provider names the box, or the
+# inventory name is chosen later - and the drift is invisible until something
+# reports the machine's own idea of its name.
+#
+# Grafana Alloy is that something: it labels every metric, log line and profile
+# with `instance`, taken from the system hostname (`constants.hostname` and the
+# journal's own `_HOSTNAME` field), not from anything Ansible controls. A host
+# called `pangolin` locally but `vps-pangolin` in the inventory ships perfectly
+# good telemetry that no dashboard filtering on the inventory name can find.
+#
+# CrowdSec has the same split for a different reason: it registers by
+# inventory_hostname explicitly, so its machine and bouncer names were always
+# right. Setting the hostname closes the gap for everything that is not so
+# careful.
+
+- name: Verify the hostname is a valid DNS name
+  # Written to /etc/hostname and handed to hostnamectl. Underscores are the
+  # usual trap: legal in an inventory name, illegal in a hostname, and systemd
+  # rejects the value rather than mangling it.
+  ansible.builtin.assert:
+    that:
+      - system_hostname is match(system_hostname_pattern)
+    fail_msg: >-
+      system_hostname ({{ system_hostname }}) is not a valid DNS name. Letters,
+      digits and hyphens only, no underscores, each label starting and ending
+      alphanumeric. It defaults to inventory_hostname; set system_hostname in
+      host_vars to use a different name, or system_hostname_manage: false to
+      leave the host's own name alone.
+  when: system_hostname_manage | bool
+
+# Before the hostname itself, not after. sudo resolves the hostname on every
+# invocation, so the moment hostnamectl switches it the new name has to already
+# be in /etc/hosts - otherwise every become until the next task warns "unable to
+# resolve host" and, on some resolver configs, stalls waiting for a timeout.
+- name: Map the hostname in /etc/hosts
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s'
+    line: "127.0.1.1 {{ system_hostname }}{{ ' ' ~ system_hostname.split('.')[0] if '.' in system_hostname else '' }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: system_hostname_manage | bool
+
+- name: Set the system hostname
+  ansible.builtin.hostname:
+    name: "{{ system_hostname }}"
+  register: hostname_set
+  when: system_hostname_manage | bool
+
+# Read in the Alloy play, which is a separate play: host facts set here persist
+# for the rest of the run. Alloy reads constants.hostname once at startup and
+# its rendered config carries no literal hostname, so a rename leaves it
+# labelling itself with the old name and nothing in the upstream role notices.
+- name: Record that the hostname changed this run
+  ansible.builtin.set_fact:
+    system_hostname_changed: true
+  when: hostname_set.changed | default(false)

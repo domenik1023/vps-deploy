@@ -2,3 +2,10 @@
 collections:
   - name: community.general
   - name: ansible.posix
+  # Provides the alloy role, which installs Grafana Alloy from its GitHub
+  # release assets rather than an APT repository - so there is no repo to add
+  # and no `apt upgrade` path. Version bumps happen by changing
+  # alloy_agent_version and re-running, which keeps the version declarative.
+  # Pinned to a floor because the alloy role only exists from 6.0.0 onwards.
+  - name: grafana.grafana
+    version: ">=6.0.0"

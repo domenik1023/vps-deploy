@@ -1,0 +1,68 @@
+# --- GRAFANA ALLOY (native install, agent per host) ---
+# The install itself is grafana.grafana.alloy's job: it fetches the release
+# asset from GitHub, installs the deb, writes the config, the env file and a
+# systemd override, and notifies its own `restart alloy` handler. This file
+# renders the config and pins the handful of settings that must not be left to
+# upstream's defaults.
+
+# eBPF is the only pipeline here with prerequisites that fail at run time
+# rather than at render time, and it fails by putting one component into an
+# error state - the rest of the agent keeps working, so nothing obvious breaks
+# and the profiles simply never arrive. Catch the one prerequisite that is
+# knowable from the inventory before the play touches the host.
+- name: Assert eBPF profiling has the privileges it needs
+  ansible.builtin.assert:
+    that:
+      - not alloy_enable_ebpf | bool or alloy_service_user == 'root'
+      - not alloy_enable_ebpf | bool or alloy_enable_profiles | bool
+    fail_msg: >-
+      alloy_enable_ebpf is on for {{ inventory_hostname }}, which requires
+      alloy_service_user to be root (Grafana documents pyroscope.ebpf as
+      root-only) and alloy_enable_profiles to be true, since pyroscope.ebpf
+      forwards to the pyroscope.write block that toggle controls. The host also
+      needs /sys/kernel/tracing readable, a writable /tmp/symb-cache and
+      ideally kernel 5.9+ - see docs/alloy.md.
+
+# Rendered here rather than inline in the include below, and this is not a
+# style choice. Variables are templated lazily, at the point of use, and a
+# relative template lookup resolves against the role of the task doing the
+# using - which for alloy_config is a task inside grafana.grafana.alloy, whose
+# templates directory does not contain this file. set_fact evaluates now, in
+# this role's context, where config.alloy.j2 is found.
+- name: Render the Alloy configuration
+  ansible.builtin.set_fact:
+    alloy_rendered_config: "{{ lookup('ansible.builtin.template', 'config.alloy.j2') }}"
+
+# Every variable below shadows one grafana.grafana.alloy defines itself. They
+# are passed as include parameters rather than left to fall through, because
+# role defaults from both roles sit at the same precedence and the role loaded
+# second wins: an alloy_version in our defaults would be silently replaced by
+# upstream's "latest", which is exactly the unpinned-upgrade behaviour we are
+# avoiding. Include parameters outrank every default, and still leave host_vars
+# and group_vars free to override the alloy_* variables they are built from.
+- name: Install and configure Grafana Alloy
+  ansible.builtin.include_role:
+    name: grafana.grafana.alloy
+  vars:
+    alloy_version: "{{ alloy_agent_version }}"
+    alloy_config: "{{ alloy_rendered_config }}"
+    alloy_systemd_override: |
+      [Service]
+      User={{ alloy_service_user }}
+    alloy_env_file_vars:
+      CUSTOM_ARGS: "{{ alloy_custom_args }}"
+    alloy_user_groups: "{{ alloy_service_extra_groups }}"
+
+# Alloy reads constants.hostname once, at startup, and every `instance` label it
+# produces comes from there. A host renamed by hostname.yml earlier in this run
+# therefore keeps labelling itself with the old name - and the rendered config
+# carries no literal hostname, so it does not change, so upstream's own
+# `restart alloy` handler never fires. The fact is set in the hardening play;
+# host facts persist across plays within a run.
+- name: Restart Alloy after a hostname change
+  ansible.builtin.service:
+    name: alloy
+    state: restarted
+  when:
+    - system_hostname_changed | default(false) | bool
+    - not ansible_check_mode
