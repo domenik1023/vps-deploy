@@ -13,6 +13,7 @@ vps-docker
 
 [local]
 komodo
+reverseproxy
 #testvm
 
 # The central CrowdSec LAPI server, listed here so crowdsec_lapi_host can
