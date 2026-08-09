@@ -8,3 +8,6 @@ ansible_port: 22822
 # Per-host overrides go here, for example:
 # ssh_port: 22822
 # crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-nftables
+
+alloy_extra_log_paths:
+  - { path: "/mnt/docker/pangolin/logs/access.log", job: "traefik" }
