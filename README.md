@@ -308,7 +308,7 @@ each pipeline actually collects.
 | `alloy_enable_otlp` | `true` | OTLP trace receiver on loopback |
 | `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
 | `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
-| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable. Lines are shipped raw and parsed at query time with LogQL |
+| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable. Lines are shipped raw and parsed at query time with LogQL. `job` is the suffix; the label is `integrations/<job>` |
 | `alloy_access_logs` | `[]` | Reverse-proxy access logs, as `{ path, format }` mappings with optional `job` and `drop_paths`. Parsed at ingest rather than shipped raw; the proxy must be writing JSON — see [docs/alloy.md](docs/alloy.md#access-logs) |
 | `alloy_access_log_formats` | `traefik`, `caddy` | How to read each proxy's JSON: time field, field map, and which fields are bounded enough to be real labels. Adding a proxy is an entry here |
 | `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |

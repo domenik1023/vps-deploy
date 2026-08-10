@@ -343,6 +343,63 @@
             - { name: "traefik", address: "127.0.0.1:8082" }
         alloy_everything: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=alloy_everything_vars) }}"
 
+    - name: Every host_vars file must render a config Alloy can parse
+      # The assertions above read this role's defaults, which is where the
+      # shapes are defined - but a host_vars file can put anything it likes in
+      # the same variables, and nothing here used to look at those. That gap is
+      # not theoretical: `name: "instance/traefik"` in a host_vars scrape
+      # target passed CI green and rendered
+      # `prometheus.scrape "instance/traefik"`, which Alloy rejects outright
+      # with "expected block label to be a valid identifier". The agent then
+      # fails to start on that host and nothing before this point noticed.
+      #
+      # So render each host for real and check the two properties that make a
+      # config parseable at all: every block label is an Alloy identifier, and
+      # nothing survived holding a Jinja delimiter.
+      ansible.builtin.assert:
+        that:
+          - labels | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+          - rendered.count('{' ~ '{') == 0
+          - rendered.count('{' ~ '%') == 0
+          # One naming convention across every signal. The template owns the
+          # prefix so a host_vars `job` cannot opt out of it - a job label that
+          # does not start with integrations/ is invisible to every dashboard
+          # and every query in docs/alloy.md, and it fails by showing nothing
+          # rather than by erroring.
+          - jobs | reject('match', '^integrations/') | list | length == 0
+        fail_msg: >-
+          host_vars/{{ item | basename }} renders a config Alloy cannot parse,
+          or one that breaks the job naming convention.
+          Invalid block labels:
+          {{ labels | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | join(', ') | default('none', true) }}.
+          Job labels missing the integrations/ prefix:
+          {{ jobs | reject('match', '^integrations/') | list | join(', ') | default('none', true) }}.
+          A component label is an identifier - letters, digits and underscores,
+          not starting with a digit - so it cannot hold a slash, a dot or a
+          dash. `job` on a scrape target, a log path or an access log is the
+          suffix only; the template adds integrations/ itself.
+        success_msg: >-
+          {{ item | basename }} renders {{ labels | length }} components,
+          jobs: {{ jobs | unique | sort | join(', ') }}
+      loop: "{{ query('ansible.builtin.fileglob', alloy_host_vars) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        alloy_host_vars: ../host_vars/*.yml
+        host_overrides: "{{ lookup('ansible.builtin.file', item) | from_yaml | default({}, true) }}"
+        rendered: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=host_overrides) }}"
+        # Every `component.kind "label" {` at the start of a line.
+        labels: "{{ rendered | regex_findall('^[a-z_][a-z0-9_.]* \"([^\"]*)\" \\{', multiline=True) }}"
+        # Every job label a host can influence: `job_name =` on a scrape, and
+        # `job =` inside a file_match target mapping. The Docker relabel rule
+        # sets its job through `replacement` instead, but that one is a literal
+        # in the template rather than anything host_vars can reach.
+        #
+        # Kept on one line: as a folded scalar the concatenation silently
+        # yields an empty list, and an assertion over an empty list passes
+        # whatever the config says.
+        jobs: "{{ (rendered | regex_findall('job_name\\s*=\\s*\"([^\"]*)\"')) + (rendered | regex_findall('\\bjob\\s*=\\s*\"([^\"]*)\"')) }}"
+
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional
       # fails quietly in the direction that matters: a host without Docker

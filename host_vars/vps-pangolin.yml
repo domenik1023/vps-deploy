@@ -17,5 +17,8 @@ alloy_access_logs:
   - path: /mnt/docker/pangolin/logs/access.log
     format: traefik
 
+# `name` is the Alloy component label, so it has to be a bare identifier - a
+# slash there is a parse error that stops the agent. To change the Loki job
+# instead, add `job:` to the entry; it defaults to integrations/<name>.
 alloy_extra_scrape_targets:
-  - { name: "instance/traefik", address: "127.0.0.1:8082" }
+  - { name: "traefik", address: "127.0.0.1:8082" }

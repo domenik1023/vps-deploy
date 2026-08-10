@@ -154,7 +154,9 @@ alloy_extra_log_paths:
   - { path: "/tmp/pangolin/*.log", job: "pangolin" }
 ```
 
-`job` becomes the Loki `job` label, which is what you query on. It is a list and
+`job` is the *suffix*: the rendered label is `integrations/<job>`, so
+`job: python` is queried as `{job="integrations/python"}`. The template owns the
+prefix so every signal in the fleet shares one naming convention. It is a list and
 not a mapping so the rendered config keeps a stable order — unordered output
 would make the deploy report `changed` on every run and restart Alloy with it.
 `tests/render-check.yml` asserts both the list shape and that every entry has
@@ -203,9 +205,10 @@ alloy_access_logs:
 
 `format` picks the field map out of `alloy_access_log_formats` in the role
 defaults — `traefik` or `caddy` today, and adding a third proxy is a new entry
-there and nothing else. `job` defaults to the format name and becomes both the
-Loki `job` label and part of the component names, so it has to be a valid Alloy
-identifier. Two logs on one host therefore need distinct `job` values.
+there and nothing else. `job` defaults to the format name and is the suffix of
+the Loki label (`integrations/traefik`) as well as part of the component names,
+so it has to be a valid Alloy identifier — no slashes, dots or dashes. Two logs
+on one host therefore need distinct `job` values.
 
 > **Both parsers are JSON parsers.** A proxy left on its default plain-text
 > access log errors on every line, which surfaces as an error counter on the
@@ -236,12 +239,14 @@ alloy_extra_scrape_targets:
   - { name: "traefik", address: "127.0.0.1:8082" }
 ```
 
-`name` becomes the component label and the job suffix (`integrations/traefik`),
-so it has to be a valid Alloy identifier — letters, digits and underscores, not
-starting with a digit. It is interpolated straight into the block name, where
-anything else is a parse error that stops the agent on its next restart.
-`address` is a bare `host:port`, not a URL. Both are asserted in
-`tests/render-check.yml`. `job`, `path`, `scheme` and `interval` are optional.
+`name` becomes the component label and the default job suffix
+(`integrations/traefik`), so it has to be a valid Alloy identifier — letters,
+digits and underscores, not starting with a digit. It is interpolated straight
+into the block name, where anything else is a parse error that stops the agent
+on its next restart. `address` is a bare `host:port`, not a URL. Both are
+asserted in `tests/render-check.yml`. `job`, `path`, `scheme` and `interval` are
+optional; `job` is the suffix only, so do not write the `integrations/` prefix
+yourself.
 
 The `instance` label is pinned to the hostname rather than left to default to
 the scraped `host:port`, so these jobs filter the same way as every other one.
@@ -577,6 +582,7 @@ every 30 seconds, so it needs no restart.
 | Profiles sent but never appear in Pyroscope | Same shape of mistake: `alloy_pyroscope_endpoint` is a base URL, and `pyroscope.write` appends `/push.v1.PusherService/Push`. Check the reverse proxy routes both that and `/ingest`. |
 | eBPF profiles missing, other profiles fine | `pyroscope.ebpf` is in an error state. Needs root, `/sys/kernel/tracing` and a writable `/tmp/symb-cache`; check the component graph in the UI. |
 | An extra scrape target never comes up | `address` is a bare `host:port` — a URL there scrapes a host that does not exist. If the endpoint is a Docker-published port, check it is published (`docker port <container>`) and that the bind is `127.0.0.1`, which Alloy on the host can still reach. |
+| `alloy` will not start after editing a host_vars entry | A block label that is not an Alloy identifier — a `name` or `job` holding a slash, dot or dash renders `prometheus.scrape "instance/traefik"`, which fails with "expected block label to be a valid identifier". `tests/render-check.yml` renders every host_vars file and checks this, so CI catches it now. |
 | `alloy` will not start after adding a drop path | An "unknown escape sequence" in the rendered config. Alloy's strings take Go's escapes, so a regex backslash must be doubled — the template's `to_json` does that, and `tests/render-check.yml` asserts it. A drop path that reached the file unescaped fails the whole config, not just its stage. |
 | Access log lines missing, or the component erroring | The pipeline parses JSON and the proxy is not writing it. Traefik needs `accessLog.format: json`, Caddy needs `format json`; a plain-text access log errors on every line. Check the `alloy_access_logs` path is the one the host sees, not the container-side path. |
 | Access log arrives, but all at the same timestamp | `stage.timestamp` could not read the time field and fell back. It is `fudge` rather than `skip`, so lines still arrive. Traefik: check `StartUTC` is present. Caddy: this is the default float `ts` — set `time_format rfc3339_nano`. |

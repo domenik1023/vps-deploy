@@ -124,7 +124,7 @@ prometheus.scrape "{{ target.name }}" {
   targets = [
     { __address__ = "{{ target.address }}", instance = constants.hostname },
   ]
-  job_name        = "{{ target.job | default('integrations/' ~ target.name) }}"
+  job_name        = "integrations/{{ target.job | default(target.name) }}"
   metrics_path    = "{{ target.path | default('/metrics') }}"
   scheme          = "{{ target.scheme | default('http') }}"
   scrape_interval = "{{ target.interval | default(alloy_scrape_interval) }}"
@@ -240,7 +240,7 @@ loki.source.docker "containers" {
 local.file_match "extra" {
   path_targets = [
 {% for entry in alloy_extra_log_paths %}
-    { __path__ = "{{ entry.path }}", job = "{{ entry.job }}", hostname = constants.hostname },
+    { __path__ = "{{ entry.path }}", job = "integrations/{{ entry.job }}", hostname = constants.hostname },
 {% endfor %}
   ]
   sync_period = "5s"
@@ -269,7 +269,7 @@ loki.source.file "extra" {
 
 local.file_match "access_{{ job }}" {
   path_targets = [
-    { __path__ = {{ entry.path | to_json }}, job = "{{ job }}", instance = constants.hostname },
+    { __path__ = {{ entry.path | to_json }}, job = "integrations/{{ job }}", instance = constants.hostname },
   ]
   sync_period = "5s"
 }
