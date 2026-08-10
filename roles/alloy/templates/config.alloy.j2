@@ -85,7 +85,7 @@ prometheus.exporter.unix "node" {
 
 prometheus.scrape "node" {
   targets         = prometheus.exporter.unix.node.targets
-  job_name        = "integrations/node"
+  job_name        = "integrations/node_exporter"
   scrape_interval = "{{ alloy_scrape_interval }}"
   forward_to      = [prometheus.remote_write.default.receiver]
 }
@@ -124,7 +124,7 @@ prometheus.scrape "{{ target.name }}" {
   targets = [
     { __address__ = "{{ target.address }}", instance = constants.hostname },
   ]
-  job_name        = "{{ target.job | default('integrations/' ~ target.name) }}"
+  job_name        = "integrations/{{ target.job | default(target.name) }}"
   metrics_path    = "{{ target.path | default('/metrics') }}"
   scheme          = "{{ target.scheme | default('http') }}"
   scrape_interval = "{{ target.interval | default(alloy_scrape_interval) }}"
@@ -240,7 +240,7 @@ loki.source.docker "containers" {
 local.file_match "extra" {
   path_targets = [
 {% for entry in alloy_extra_log_paths %}
-    { __path__ = "{{ entry.path }}", job = "{{ entry.job }}", hostname = constants.hostname },
+    { __path__ = "{{ entry.path }}", job = "integrations/{{ entry.job }}", hostname = constants.hostname },
 {% endfor %}
   ]
   sync_period = "5s"
@@ -251,6 +251,100 @@ loki.source.file "extra" {
   forward_to    = [loki.write.default.receiver]
   tail_from_end = true
 }
+{% endif %}
+{% if alloy_access_logs | length > 0 %}
+
+// =============================================================================
+// Logs - reverse-proxy access logs, parsed
+// =============================================================================
+// Separate from the raw file tailing above because these lines are parsed at
+// ingest, which buys three things LogQL at query time cannot: real timestamps,
+// trace_id as structured metadata, and dropping noise before it counts against
+// Loki's rate limits. Both parsers are JSON ones - a proxy writing plain text
+// errors on every line. See docs/alloy.md and alloy_access_log_formats.
+{% for entry in alloy_access_logs %}
+{% set job = entry.job | default(entry.format) %}
+{% set fmt = alloy_access_log_formats[entry.format] %}
+{% set width = (fmt.fields | map(attribute='name') | map('length') | list + [2]) | max %}
+
+local.file_match "access_{{ job }}" {
+  path_targets = [
+    { __path__ = {{ entry.path | to_json }}, job = "integrations/{{ job }}", instance = constants.hostname },
+  ]
+  sync_period = "5s"
+}
+
+loki.source.file "access_{{ job }}" {
+  targets       = local.file_match.access_{{ job }}.targets
+  forward_to    = [loki.process.access_{{ job }}.receiver]
+  tail_from_end = true
+}
+
+loki.process "access_{{ job }}" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.json {
+    expressions = {
+      {{ "ts".ljust(width) }} = "{{ fmt.timestamp_field }}",
+{% for f in fmt.fields %}
+      {{ f.name.ljust(width) }} = "{{ f.json }}",
+{% endfor %}
+    }
+  }
+
+  // Without this Loki stamps each line with its ingest time, which is fine
+  // until the agent replays a backlog after a restart or a log rotation: a
+  // burst of old lines all land at "now" and invent a traffic spike that never
+  // happened. Fudged rather than skipped on failure, so a proxy whose time
+  // format drifts degrades instead of dropping its logs entirely.
+  stage.timestamp {
+    source            = "ts"
+    format            = "{{ fmt.timestamp_format }}"
+    action_on_failure = "fudge"
+  }
+
+  // Structured metadata, deliberately not labels: queryable and indexed
+  // without creating a Loki stream per distinct value.
+  stage.structured_metadata {
+    values = {
+{% for f in fmt.fields if f.name not in fmt.labels %}
+      {{ f.name.ljust(width) }} = "",
+{% endfor %}
+    }
+  }
+{% if fmt.labels | length > 0 %}
+
+  // Promoted to real labels, which is only safe because these are bounded to a
+  // handful of values. Do not add path, client or router: every distinct value
+  // becomes its own stream, which is the quickest way to make Loki miserable.
+  stage.labels {
+    values = {
+{% for label in fmt.labels %}
+      {{ label.ljust(width) }} = "",
+{% endfor %}
+    }
+  }
+{% endif %}
+{% if entry.drop_paths | default([]) | length > 0 %}
+
+  // Dropped before the lines count against Loki's ingestion rate limits.
+  //
+  // The expression goes through to_json rather than being wrapped in quotes
+  // here, and that is load-bearing: Alloy's string literals take Go's escape
+  // sequences, so the backslash in a perfectly ordinary regex like
+  // ^/favicon\.ico$ is an "unknown escape sequence" that fails the whole file
+  // and stops the agent on its next restart. to_json emits the quotes and
+  // doubles the backslash, which Alloy then reads back as one.
+{% for expr in entry.drop_paths %}
+  stage.drop {
+    source              = "path"
+    expression          = {{ expr | to_json }}
+    drop_counter_reason = "{{ job }}_noise"
+  }
+{% endfor %}
+{% endif %}
+}
+{% endfor %}
 {% endif %}
 {% if alloy_enable_otlp %}
 
@@ -270,6 +364,21 @@ otelcol.receiver.otlp "default" {
     traces = [otelcol.processor.resourcedetection.default.input]
   }
 }
+
+{% for receiver in alloy_otlp_extra_receivers %}
+
+// An additional receiver for senders that cannot reach the host's loopback -
+// a container sharing another container's network namespace, typically, where
+// "localhost" is that namespace and not this host. Same pipeline as above.
+otelcol.receiver.otlp "{{ receiver.name }}" {
+  grpc { endpoint = "{{ receiver.address }}:4317" }
+  http { endpoint = "{{ receiver.address }}:4318" }
+
+  output {
+    traces = [otelcol.processor.resourcedetection.default.input]
+  }
+}
+{% endfor %}
 
 otelcol.processor.resourcedetection "default" {
   detectors = ["env", "system"]

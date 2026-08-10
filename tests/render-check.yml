@@ -232,6 +232,57 @@
           glob and a `job`, e.g.
           [{ path: "/tmp/logs/*.log", job: "python" }].
 
+    - name: Every access log must name a known format and an absolute path
+      # `format` selects the field map, and an unknown one is an undefined-key
+      # error at render time rather than anything subtle. `path` is
+      # interpolated into local.file_match's __path__, where a relative path
+      # resolves against Alloy's working directory instead of failing, so the
+      # pipeline sits there matching nothing. `job` is interpolated into the
+      # component names, where anything but an Alloy identifier is a parse
+      # error that stops the agent on its next restart.
+      ansible.builtin.assert:
+        that:
+          - alloy_access_logs is sequence
+          - alloy_access_logs is not string
+          - alloy_access_logs is not mapping
+          - alloy_access_logs | rejectattr('path', 'defined') | list | length == 0
+          - alloy_access_logs | map(attribute='path') | reject('match', '^/') | list | length == 0
+          - alloy_access_logs | map(attribute='format', default='') | reject('in', alloy_access_log_formats) | list | length == 0
+          - alloy_access_logs | map(attribute='job', default='x') | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+        fail_msg: >-
+          alloy_access_logs must be a list of mappings, each with an absolute
+          `path` and a `format` from
+          {{ alloy_access_log_formats.keys() | list | join(', ') }}, e.g.
+          [{ path: /mnt/docker/pangolin/logs/access.log, format: traefik }].
+
+    - name: Each access log format must map fields and keep its labels bounded
+      # `labels` become real Loki labels, and every distinct value of one is a
+      # new stream. Promoting an unbounded field - a path, a client IP - is the
+      # quickest way to make Loki miserable, and it is the kind of edit that
+      # looks harmless in review. The names are also interpolated into Alloy
+      # identifiers, and every label has to be a field that was extracted.
+      ansible.builtin.assert:
+        that:
+          - alloy_access_log_formats is mapping
+          - fmt.timestamp_field | length > 0
+          - fmt.timestamp_format | length > 0
+          - fmt.fields is sequence
+          - fmt.fields is not mapping
+          - fmt.fields | rejectattr('name', 'defined') | list | length == 0
+          - fmt.fields | rejectattr('json', 'defined') | list | length == 0
+          - fmt.fields | map(attribute='name') | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+          - fmt.fields | map(attribute='name') | unique | list | length == fmt.fields | length
+          - fmt.labels | length <= 2
+          - fmt.labels | difference(fmt.fields | map(attribute='name') | list) | length == 0
+        fail_msg: >-
+          alloy_access_log_formats.{{ item }} must map every field it names and
+          promote at most two bounded ones to labels. Everything else belongs
+          in structured metadata, which is queryable without creating a Loki
+          stream per distinct value.
+      loop: "{{ alloy_access_log_formats.keys() | list }}"
+      vars:
+        fmt: "{{ alloy_access_log_formats[item] }}"
+
     - name: Extra scrape targets must name a valid component and a bare host port
       # `name` is interpolated straight into the block name, where anything but
       # an Alloy identifier is a parse error that stops the agent dead on the
@@ -262,17 +313,107 @@
       # The delimiters are concatenated a character at a time on purpose: a
       # literal opening delimiter written out in this file is read by the very
       # lexer being tested, and the task fails to parse instead of running.
+      #
+      # Both the default render and the everything-on one are checked: the
+      # blocks most likely to reintroduce a delimiter are the optional ones,
+      # and those are exactly the blocks a default render never reaches. The
+      # Traefik pipeline's nested braces are the current worst offender.
       ansible.builtin.assert:
         that:
           - alloy_rendered.count('{' ~ '{') == 0
           - alloy_rendered.count('{' ~ '%') == 0
           - alloy_rendered.count('{' ~ '#') == 0
+          - alloy_everything.count('{' ~ '{') == 0
+          - alloy_everything.count('{' ~ '%') == 0
+          - alloy_everything.count('{' ~ '#') == 0
         fail_msg: >-
           The rendered Alloy config still contains a Jinja opening delimiter,
           which grafana.grafana.alloy's own templating will consume. Escaping
           it for this pass is not enough; it has to survive both.
       vars:
         alloy_rendered: "{{ lookup('ansible.builtin.template', alloy_template) }}"
+        alloy_everything_vars:
+          alloy_enable_ebpf: true
+          alloy_access_logs:
+            - { path: /mnt/docker/pangolin/logs/access.log, format: traefik, drop_paths: ["^/health$"] }
+            - { path: /mnt/docker/caddy/logs/access.log, format: caddy }
+          alloy_extra_log_paths:
+            - { path: "/tmp/logs/*.log", job: "python" }
+          alloy_extra_scrape_targets:
+            - { name: "traefik", address: "127.0.0.1:8082" }
+        alloy_everything: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=alloy_everything_vars) }}"
+
+    - name: Every host_vars file must render a config Alloy can parse
+      # The assertions above read this role's defaults, which is where the
+      # shapes are defined - but a host_vars file can put anything it likes in
+      # the same variables, and nothing here used to look at those. That gap is
+      # not theoretical: `name: "instance/traefik"` in a host_vars scrape
+      # target passed CI green and rendered
+      # `prometheus.scrape "instance/traefik"`, which Alloy rejects outright
+      # with "expected block label to be a valid identifier". The agent then
+      # fails to start on that host and nothing before this point noticed.
+      #
+      # So render each host for real and check the two properties that make a
+      # config parseable at all: every block label is an Alloy identifier, and
+      # nothing survived holding a Jinja delimiter.
+      ansible.builtin.assert:
+        that:
+          - labels | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | length == 0
+          - rendered.count('{' ~ '{') == 0
+          - rendered.count('{' ~ '%') == 0
+          # One naming convention across every signal. The template owns the
+          # prefix so a host_vars `job` cannot opt out of it - a job label that
+          # does not start with integrations/ is invisible to every dashboard
+          # and every query in docs/alloy.md, and it fails by showing nothing
+          # rather than by erroring.
+          - jobs | reject('match', '^integrations/') | list | length == 0
+          # Every address Alloy listens on. All three receivers are
+          # unauthenticated and there is no option that changes that, so what
+          # keeps them safe is the address they bind. Loopback is the default;
+          # a Docker bridge gateway is the one sanctioned widening, for a
+          # sender that genuinely cannot reach loopback - a container in
+          # another container's network namespace. 0.0.0.0 is the mistake this
+          # catches, and it would also collide with the loopback receiver.
+          - binds | reject('match', private_address) | list | length == 0
+        fail_msg: >-
+          host_vars/{{ item | basename }} renders a config Alloy cannot parse,
+          or one that breaks the job naming convention.
+          Invalid block labels:
+          {{ labels | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | join(', ') | default('none', true) }}.
+          Job labels missing the integrations/ prefix:
+          {{ jobs | reject('match', '^integrations/') | list | join(', ') | default('none', true) }}.
+          Listeners bound outside a private range:
+          {{ binds | reject('match', private_address) | list | join(', ') | default('none', true) }}.
+          A component label is an identifier - letters, digits and underscores,
+          not starting with a digit - so it cannot hold a slash, a dot or a
+          dash. `job` on a scrape target, a log path or an access log is the
+          suffix only; the template adds integrations/ itself.
+        success_msg: >-
+          {{ item | basename }} renders {{ labels | length }} components,
+          jobs: {{ jobs | unique | sort | join(', ') }}
+      loop: "{{ query('ansible.builtin.fileglob', alloy_host_vars) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        alloy_host_vars: ../host_vars/*.yml
+        host_overrides: "{{ lookup('ansible.builtin.file', item) | from_yaml | default({}, true) }}"
+        rendered: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=host_overrides) }}"
+        # Every `component.kind "label" {` at the start of a line.
+        labels: "{{ rendered | regex_findall('^[a-z_][a-z0-9_.]* \"([^\"]*)\" \\{', multiline=True) }}"
+        # Every job label a host can influence: `job_name =` on a scrape, and
+        # `job =` inside a file_match target mapping. The Docker relabel rule
+        # sets its job through `replacement` instead, but that one is a literal
+        # in the template rather than anything host_vars can reach.
+        #
+        # Kept on one line: as a folded scalar the concatenation silently
+        # yields an empty list, and an assertion over an empty list passes
+        # whatever the config says.
+        jobs: "{{ (rendered | regex_findall('job_name\\s*=\\s*\"([^\"]*)\"')) + (rendered | regex_findall('\\bjob\\s*=\\s*\"([^\"]*)\"')) }}"
+        # Every address a receiver binds: the OTLP grpc/http one-liners and the
+        # Pyroscope listener. Deliberately not `endpoint =` in general - that
+        # also names the outbound loki.write and remote_write URLs.
+        binds: "{{ (rendered | regex_findall('(?:grpc|http) \\{ endpoint = \"([^\":]*):')) + (rendered | regex_findall('listen_address = \"([^\"]*)\"')) }}"
+        private_address: '^(10\.|192\.168\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
 
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional
@@ -292,6 +433,31 @@
           - alloy_default is not search('prometheus.scrape "traefik"')
           - alloy_scrape is search('prometheus.scrape "traefik"')
           - alloy_scrape is search('job_name        = "integrations/traefik"')
+          # The node job name is what every dashboard and every query in
+          # docs/alloy.md filters on, and renaming it silently orphans them
+          # all - the metrics keep arriving under a name nothing looks for.
+          - alloy_default is search('job_name        = "integrations/node_exporter"')
+          # An access log pipeline appears only when a host names one, and
+          # naming one has to bring the parser with it: the file tailed without
+          # loki.process ships JSON blobs Loki cannot break into fields.
+          - alloy_default is not search('loki.process')
+          - alloy_traefik is search('loki.process "access_traefik"')
+          - alloy_traefik is search('stage.structured_metadata')
+          - alloy_traefik is search('trace_id')
+          - alloy_traefik is not search('stage.drop')
+          # Each format renders its own pipeline, and two on one host must not
+          # collide - the component names are what keep them apart.
+          - alloy_both is search('loki.process "access_traefik"')
+          - alloy_both is search('loki.process "access_caddy"')
+          - alloy_both is search('request.uri')
+          - alloy_traefik_dropping is search('stage.drop')
+          - alloy_traefik_dropping is search('expression          = "\^/health\$"')
+          # Alloy's strings take Go's escape sequences, so the backslash in an
+          # everyday regex is an "unknown escape sequence" that fails the whole
+          # config file - not just the stage - and stops the agent on its next
+          # restart. The template runs each expression through to_json, which
+          # doubles it. Verified against `alloy validate` from 1.18.1.
+          - alloy_escaped_drop in alloy_traefik_dropping
         fail_msg: >-
           A pipeline toggle in config.alloy.j2 no longer adds or removes the
           block it names. Render it by hand to compare:
@@ -304,3 +470,25 @@
           - name: traefik
             address: 127.0.0.1:8082
         alloy_scrape: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_extra_scrape_targets': alloy_probe_targets}) }}"
+        alloy_probe_traefik:
+          - { path: /mnt/docker/pangolin/logs/access.log, format: traefik }
+        alloy_traefik: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_traefik}) }}"
+        alloy_probe_both:
+          - { path: /mnt/docker/pangolin/logs/access.log, format: traefik }
+          - { path: /mnt/docker/caddy/logs/access.log, format: caddy }
+        alloy_both: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_both}) }}"
+        # Single-quoted YAML, which passes backslashes through untouched - so
+        # this is one backslash, exactly what a host_vars entry produces. Do
+        # not write it as a Jinja string literal inside the lookup below: that
+        # unescapes the pair and feeds the template a value already doubled,
+        # which makes this test pass whether the template escapes or not.
+        alloy_probe_dropping:
+          - path: /mnt/docker/pangolin/logs/access.log
+            format: traefik
+            drop_paths:
+              - '^/health$'
+              - '^/favicon\.ico$'
+        # The expected output, likewise single-quoted: two backslashes, which
+        # is what Alloy reads back as the one the regex needs.
+        alloy_escaped_drop: 'expression          = "^/favicon\\.ico$"'
+        alloy_traefik_dropping: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_dropping}) }}"

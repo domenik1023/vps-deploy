@@ -1,0 +1,42 @@
+# Caddy Proxy Manager on the LAN. It is in the [local] group, so SSH hardening
+# is skipped to avoid locking yourself out, and CrowdSec is not installed at
+# all - see roles/config/tasks/main.yml.
+ansible_host: 192.168.4.6
+ansible_port: 22
+
+# Alloy needs nothing here: every LAN host reaches ingest.net.d1023.de, which
+# is what alloy_ingest_base already defaults to. Only the off-site `vps` group
+# overrides it, in group_vars/vps.yml.
+
+# --- Before the first run, check UFW ---
+#
+# Being in [local] skips the SSH port move, but NOT `ufw enable`, which
+# activates default-deny incoming on every host this playbook touches. Only the
+# SSH ports are allowed. That is fine for a reverse proxy whose 80/443 are
+# Docker-published, because Docker's FORWARD jump precedes UFW's and the
+# published ports stay reachable regardless - the same trap documented in
+# roles/config/defaults/main.yml, working in our favour here. It is NOT fine
+# for a Caddy running natively on the host: the first run would take the proxy
+# off the network. Confirm which one this is before deploying.
+
+# --- Caddy telemetry ---
+#
+# PATH NOT YET VERIFIED against this host - point it at whatever Caddy Proxy
+# Manager actually writes. Caddy also has to be writing JSON with
+# `time_format rfc3339_nano`; see docs/alloy.md#caddy. Until the file exists
+# local.file_match simply matches nothing, so this is safe to land early.
+alloy_access_logs:
+  - path: /var/lib/docker/volumes/cpm_caddy-logs/_data/access.log
+    format: caddy
+    drop_paths:
+      - "^/favicon\\.ico$"
+
+# Metrics are left off until Caddy serves them: unlike the access log, a scrape
+# target that cannot connect reports up == 0 rather than nothing at all.
+#
+# Deliberately NOT the admin endpoint on :2019 - that one is unauthenticated
+# and can rewrite Caddy's running config, so it stays inside the container and
+# a dedicated `metrics` route is published to loopback instead.
+#
+# alloy_extra_scrape_targets:
+#   - { name: "caddy", address: "127.0.0.1:2020" }

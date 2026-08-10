@@ -30,7 +30,7 @@ vps-deploy/
 │   └── render-check.yml              # Variable shapes and design invariants
 ├── group_vars/
 │   ├── all/
-│   │   └── vault.yml                 # Encrypted secrets (ansible-vault)
+│   │   └── vault.yml                 # Admin password hash — encrypt with ansible-vault
 │   └── vps.yml                       # Off-site hosts: the public ingest hostname
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
@@ -38,6 +38,8 @@ vps-deploy/
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
 │   ├── vps-pangolin.yml
+│   ├── komodo.yml
+│   ├── reverseproxy.yml              # Caddy Proxy Manager on the LAN
 │   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
@@ -174,7 +176,7 @@ them all to one ingest hostname.
 
 Two hostnames reach the same reverse proxy and the same backends; only the
 network path differs. `https://ingest.net.d1023.de` is LAN-routed and is the
-default, so a host on 192.168.2.x needs no configuration. Off-site hosts are
+default, so a LAN host needs no configuration at all. Off-site hosts are
 switched a whole group at a time — `group_vars/vps.yml` is the entire override:
 
 ```yaml
@@ -191,21 +193,33 @@ Per-host settings go in `host_vars/<name>.yml`:
 alloy_enable_docker: false
 alloy_enable_profiles: false
 
-# An application writing logs to disk rather than stdout
+# An application writing logs to disk rather than stdout. Shipped raw and
+# parsed at query time with LogQL, which is the right default.
 alloy_extra_log_paths:
   - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+
+# A reverse proxy's access log, which is the exception: parsed at ingest, so
+# its timestamps are real and (on Traefik) its trace IDs click through to
+# Tempo. Needs the proxy configured to write JSON.
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
 
 # The one host where whole-host eBPF profiling is wanted
 alloy_enable_ebpf: true
 ```
 
 Two things are deliberate and easy to undo by accident. The OTLP receiver, the
-profile receiver and the Alloy UI are all **unauthenticated** and all stay on
-loopback — reach the UI with `ssh -L 12345:localhost:12345 <host>` rather than
-opening the port, and note that no UFW rule is added for any of them, because
-`ufw reload` flushes the CrowdSec bouncer's chains. And `alloy_agent_version` is
-**pinned**: upstream's default of `latest` queries the GitHub API on every run
-and can upgrade a host unasked. Both are asserted in `tests/render-check.yml`.
+profile receiver and the Alloy UI are all **unauthenticated** and stay on
+loopback by default — reach the UI with `ssh -L 12345:localhost:12345 <host>`
+rather than opening the port, and note that no UFW rule is added for them,
+because `ufw reload` flushes the CrowdSec bouncer's chains. The one sanctioned
+exception is `alloy_otlp_extra_receivers`, which adds a *second* OTLP receiver
+on a private address for a container that cannot reach loopback at all; the
+render check requires every listener to sit in a private range. And
+`alloy_agent_version` is **pinned**: upstream's default of `latest` queries the
+GitHub API on every run and can upgrade a host unasked. All of it is asserted in
+`tests/render-check.yml`.
 
 The ingest endpoints are unauthenticated by design — agents cannot do
 interactive OIDC. Do not add credentials to the agent config expecting the
@@ -222,7 +236,18 @@ host-specific otherwise (address, SSH port, per-host overrides) goes in
 [vps]
 vps-pangolin
 vps-docker
+
+[local]
+komodo
+reverseproxy
 ```
+
+The group is not cosmetic either. `[local]` skips the SSH port move (so a LAN
+box cannot lock you out) and skips CrowdSec entirely — a NAT'd host sees none of
+the traffic CrowdSec exists to catch, and each agent would still consume a
+machine registration and a bouncer key on the central LAPI. `[vps]` additionally
+switches the Alloy ingest hostname to the public one. UFW is enabled everywhere,
+including `[local]`.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own
@@ -269,6 +294,7 @@ Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 | `crowdsec_collections` | `[crowdsecurity/linux, crowdsecurity/iptables]` | Base collections every agent gets |
 | `crowdsec_collections_extra` | `[]` | Per-host additions — add here rather than replacing the base list |
 | `ufw_logging` | `low` | UFW log level; the port-scan scenario reads these drop lines |
+| `ufw_allow_rules` | `[]` | Extra UFW allow rules, as `{ src, dest, port, proto, comment }` mappings. Lives here rather than with the role that needs it, because `ufw reload` flushes the CrowdSec bouncer's chains and only this role's handler restores them |
 | `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
@@ -300,9 +326,12 @@ each pipeline actually collects.
 | `alloy_enable_otlp` | `true` | OTLP trace receiver on loopback |
 | `alloy_enable_profiles` | `true` | Pyroscope SDK receiver on loopback, and the write output eBPF also needs |
 | `alloy_enable_ebpf` | `false` | Whole-host eBPF profiling; requires root and a few kernel prerequisites |
-| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable |
+| `alloy_extra_log_paths` | `[]` | Log files to tail, as `{ path, job }` mappings — a list, so the rendered config stays byte-stable. Lines are shipped raw and parsed at query time with LogQL. `job` is the suffix; the label is `integrations/<job>` |
+| `alloy_access_logs` | `[]` | Reverse-proxy access logs, as `{ path, format }` mappings with optional `job` and `drop_paths`. Parsed at ingest rather than shipped raw; the proxy must be writing JSON — see [docs/alloy.md](docs/alloy.md#access-logs) |
+| `alloy_access_log_formats` | `traefik`, `caddy` | How to read each proxy's JSON: time field, field map, and which fields are bounded enough to be real labels. Adding a proxy is an entry here |
 | `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |
 | `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
+| `alloy_otlp_extra_receivers` | `[]` | Additional OTLP receivers, as `{ name, address }` mappings, for containers that cannot reach the host's loopback. Private addresses only, and needs a matching `ufw_allow_rules` entry — see [docs/alloy.md](docs/alloy.md#traefik) |
 | `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_ui_bind` | `127.0.0.1` | Alloy UI and `/metrics`; reach it over an SSH tunnel |
 | `alloy_custom_args` | `--disable-reporting` | Extra `ExecStart` flags; adds `--server.http.listen-addr` only when the UI bind differs from Alloy's own default |
@@ -354,14 +383,30 @@ that parses but evaluates to the wrong type — a list that becomes a string, a
 dict that stops being valid JSON. It also pins the design decisions that are
 easy to reverse by accident: fail2ban staying duller than CrowdSec, user
 namespace remapping staying off, only both-family chains in
-`crowdsec_bouncer_iptables_chains`, Alloy's three listeners staying on loopback,
-and every Alloy signal endpoint still deriving from `alloy_ingest_base`.
+`crowdsec_bouncer_iptables_chains`, Alloy's listeners staying on private
+addresses, and every Alloy signal endpoint still deriving from
+`alloy_ingest_base`.
 
 It renders `config.alloy.j2` too, and asserts the toggles actually add and
 remove the pipelines they name and that nothing reaches
 `grafana.grafana.alloy`'s own templating pass still holding a Jinja delimiter —
 a block that does would be evaluated away silently, leaving a config Alloy
 starts perfectly happily without.
+
+Crucially it renders **every `host_vars/*.yml`**, not just the role defaults. An
+assertion naming a variable the defaults define is only checking the default; a
+host overriding it is invisible. That gap once shipped a
+`prometheus.scrape "instance/traefik"` past green CI, which Alloy rejects
+outright. The per-host pass checks what decides whether a config parses at all:
+block labels are valid Alloy identifiers, every job label carries the
+`integrations/` prefix, and every listener binds a private address.
+
+None of that replaces the real parser. For anything touching the template,
+validate a render with the Alloy binary from the pinned release:
+
+```bash
+alloy fmt /path/to/rendered.alloy && alloy validate /path/to/rendered.alloy
+```
 
 ### Dry run (check mode)
 

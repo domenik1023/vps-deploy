@@ -132,6 +132,36 @@ upstream's `"latest"` — which queries the GitHub API every run and can upgrade
 host unasked. Include parameters outrank every default while still leaving
 host_vars free to override. Do not "simplify" this back into matching names.
 
+**Log sources are shipped raw except proxy access logs.**
+`alloy_extra_log_paths` tails files and forwards them unparsed, on the Loki
+principle that parsing belongs at query time. `alloy_access_logs` is the
+exception, with a `loki.process` pipeline per entry, because three things
+cannot be recovered at query time: a real timestamp (otherwise a replayed
+backlog invents a traffic spike), `trace_id` as structured metadata (which is
+what makes a line clickable through to Tempo), and dropping lines before they
+count against Loki's ingestion limits.
+
+Each entry names a `format`, which indexes `alloy_access_log_formats` — the
+field maps for `traefik` and `caddy`, kept as data so adding a proxy is one
+entry there and no template change. `job` defaults to the format name and is
+interpolated into the component names, so two access logs on one host need
+distinct jobs. Only fields bounded to a handful of values become real Loki
+labels (`entrypoint` on Traefik, nothing on Caddy); everything else is
+structured metadata, because each distinct value of a real label is another
+Loki stream. `tests/render-check.yml` caps the label list to keep that from
+being undone by accident. Note Caddy emits no trace IDs in access log lines,
+unlike Traefik — the timestamps and dropping are the reason to parse its logs.
+
+**Regexes interpolated into the Alloy config must go through `to_json`.** Alloy
+string literals take Go's escape sequences, so an everyday
+`^/favicon\.ico$` in an entry's `drop_paths` is an "unknown escape sequence"
+that fails the entire config file — not just its stage — and the agent stops on
+its next restart. `alloy validate` from the pinned release catches it;
+`tests/render-check.yml` asserts the escaping so CI catches it first. Note that
+single-quoted YAML passes backslashes through untouched while a Jinja string
+literal unescapes them — writing the test fixture the wrong way makes that
+assertion pass whether the template escapes or not.
+
 `alloy_config` is rendered with `set_fact` rather than inline in the
 `include_role` vars, and that is also not stylistic: variables are templated
 lazily at the point of use, and a relative template lookup resolves against the
@@ -179,7 +209,7 @@ bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
 
 **Alloy's `instance` label comes from the system hostname, not the inventory.**
-`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in seven places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
 `hostname.yml` closes that by setting the system hostname to
@@ -196,14 +226,35 @@ second pass still holding an opening Jinja delimiter is evaluated and discarded
 silently — the file lands short of a pipeline and Alloy starts happily without
 it. `tests/render-check.yml` asserts against this.
 
-**Alloy's three listeners stay on loopback.** OTLP (4317/4318), the profile
+**Alloy's listeners stay on loopback by default.** OTLP (4317/4318), the profile
 receiver (4041) and the UI (12345) are all unauthenticated and Alloy has no
-credential checking to enable. No UFW rule is added for any of them, and that is
-deliberate twice over: nothing needs to reach them, and any `ufw` rule change
-reloads UFW, which deletes every non-builtin chain and takes the CrowdSec
-bouncer's rules with it. The `Reload UFW` handler notifies a bouncer restart for
-that reason, and it is scoped to `roles/config` — a rule added from `roles/alloy`
-could not reach it.
+credential checking to enable. No UFW rule is added for any of them by default,
+and that is deliberate twice over: nothing needs to reach them, and any `ufw`
+rule change reloads UFW, which deletes every non-builtin chain and takes the
+CrowdSec bouncer's rules with it. The `Reload UFW` handler notifies a bouncer
+restart for that reason, and it is scoped to `roles/config` — a rule added from
+`roles/alloy` could not reach it, which is why `ufw_allow_rules` lives in
+`roles/config` even though its only current caller is Alloy.
+
+`alloy_otlp_extra_receivers` is the one sanctioned widening, for a sender that
+genuinely cannot reach loopback — a container run with
+`network_mode: service:<other>` has no namespace of its own, so `localhost`
+inside it is the *other* container's loopback. Traefik on `vps-pangolin` is
+exactly this. It renders a second `otelcol.receiver.otlp` on a Docker bridge
+gateway, keeping the loopback one, and it needs a matching `ufw_allow_rules`
+entry: container-to-gateway traffic traverses `INPUT`, where UFW's default-deny
+drops it, and Docker's own rules are in `FORWARD` and never see it.
+`tests/render-check.yml` asserts every rendered listener stays in a private
+range, so `0.0.0.0` cannot be set by accident.
+
+**`tests/render-check.yml` must assert against rendered host_vars, not just
+defaults.** It loads both roles' `defaults/main.yml` with `vars_files`, so any
+assertion naming one of those variables is checking the *default* — a host_vars
+file overriding it is invisible. That gap shipped a `prometheus.scrape
+"instance/traefik"` past green CI, which Alloy rejects outright. The per-host
+task renders every `host_vars/*.yml` through the template and checks the
+properties that decide whether the config parses at all; new invariants about
+host-settable variables belong there.
 
 **Alloy's ingest endpoints are unauthenticated by design.** Agents cannot do
 interactive OIDC. Do not add credentials to the agent config expecting the

@@ -45,24 +45,130 @@ alloy_enable_profiles: true
 alloy_enable_ebpf: false
 
 # Log files to tail, for applications that write to disk instead of stdout.
-# A list of mappings, each with a `path` glob and a `job`, which becomes the
-# Loki job label. It is a list and not a dict so the rendered config keeps a
-# stable order - an unordered mapping here would make the config file change on
-# every run and the deploy report `changed` forever.
+# A list of mappings, each with a `path` glob and a `job`. The job is the
+# SUFFIX only - the template emits integrations/<job>, so every signal in this
+# fleet carries the same naming convention and one dashboard filter matches
+# them all. It is a list and not a dict so the rendered config keeps a stable
+# order - an unordered mapping here would make the config file change on every
+# run and the deploy report `changed` forever.
 #
 #   alloy_extra_log_paths:
 #     - { path: "/tmp/logs/*.log", job: "python" }
 #     - { path: "/tmp/pangolin/*.log", job: "pangolin" }
+#
+# Lines are shipped raw and parsed at query time with LogQL, which is the
+# idiomatic Loki approach and the right default. Reverse-proxy access logs are
+# the exception - see alloy_access_logs below.
 alloy_extra_log_paths: []
+
+# Reverse-proxy access logs, which get a parsing pipeline each rather than an
+# entry in the raw list above. One mapping per log file:
+#
+#   path         the file to tail; absolute, and visible from the host rather
+#                than only from inside a container
+#   format       which proxy wrote it - a key of alloy_access_log_formats
+#                below, so `traefik` or `caddy`
+#   job          optional job suffix, defaulting to the format name; the
+#                rendered label is integrations/<job>. It is also interpolated
+#                into the component names, so it must be a valid Alloy
+#                identifier - no slashes, dots or dashes
+#   drop_paths   optional list of regexes, matched against the request path and
+#                dropped at the agent
+#
+#   alloy_access_logs:
+#     - path: /mnt/docker/pangolin/logs/access.log
+#       format: traefik
+#       drop_paths: ["^/health$"]
+#
+# Parsing at ingest rather than with LogQL at query time buys three things that
+# cannot be recovered later:
+#
+#   - real timestamps, so a backlog replayed after a restart or a log rotation
+#     does not land all at once and invent a traffic spike that never happened
+#   - trace_id as structured metadata, which is what makes a log line clickable
+#     through to its trace in Tempo - query-time extraction is too late
+#   - dropping, since a line dropped here never counts against Loki's ingestion
+#     rate limits, and an edge proxy is the likeliest thing in the estate to
+#     reach per_stream_rate_limit
+#
+# Both parsers are JSON ones, so both proxies need configuring to write JSON -
+# see docs/alloy.md. Pointed at a plain-text access log the stage errors on
+# every line, which surfaces as an error counter on the component rather than
+# as anything the play notices.
+alloy_access_logs: []
+
+# How to read each proxy's JSON. Data rather than logic, so adding a third
+# proxy is a new entry here and nothing else.
+#
+#   timestamp_field   the JSON field holding the event time
+#   timestamp_format  a stage.timestamp format - both proxies are configured to
+#                     emit RFC3339Nano, because the alternative is Caddy's
+#                     default float epoch, which that stage reads far less
+#                     predictably
+#   fields            extracted name -> JMESPath into the log line, in a fixed
+#                     order. A list of mappings and not a mapping, for the same
+#                     byte-stability reason as everything else here
+#   labels            the extracted names promoted to real Loki labels;
+#                     everything else becomes structured metadata
+#
+# Keep `labels` tiny and bounded. Every distinct value of a real label is a new
+# Loki stream, so promoting a path, a client IP or a router name is the fastest
+# way to make Loki miserable - which is why `path` is deliberately metadata
+# even though it is the field most people reach for first.
+alloy_access_log_formats:
+  # Field names are Traefik's own, from pkg/middlewares/accesslog/logdata.go.
+  # It emits the trace identifiers twice - TraceId/SpanId and trace_id/span_id
+  # - and the snake_case pair is taken, because that is what the Loki
+  # datasource's derived field matches on.
+  traefik:
+    timestamp_field: StartUTC
+    timestamp_format: RFC3339Nano
+    fields:
+      - { name: status, json: DownstreamStatus }
+      - { name: method, json: RequestMethod }
+      - { name: host, json: RequestHost }
+      - { name: path, json: RequestPath }
+      - { name: duration, json: Duration }
+      - { name: router, json: RouterName }
+      - { name: service, json: ServiceName }
+      - { name: entrypoint, json: entryPointName }
+      - { name: client, json: ClientHost }
+      - { name: retries, json: RetryAttempts }
+      - { name: trace_id, json: trace_id }
+      - { name: span_id, json: span_id }
+    # Bounded to the entryPoints Traefik defines - web, websecure and so on.
+    labels: [entrypoint]
+  # Caddy nests most of the request under a `request` object, so these are
+  # JMESPath expressions rather than bare keys. There is no trace_id here:
+  # unlike Traefik, Caddy does not put trace identifiers into access log lines
+  # just because tracing is enabled, so these lines do not get a "View trace"
+  # button. The timestamp and drop handling are the reason to parse them.
+  caddy:
+    timestamp_field: ts
+    timestamp_format: RFC3339Nano
+    fields:
+      - { name: status, json: status }
+      - { name: method, json: "request.method" }
+      - { name: host, json: "request.host" }
+      - { name: path, json: "request.uri" }
+      - { name: proto, json: "request.proto" }
+      - { name: duration, json: duration }
+      - { name: size, json: size }
+      - { name: client, json: "request.client_ip" }
+      - { name: remote, json: "request.remote_ip" }
+    # Nothing here is bounded enough to be worth a stream of its own.
+    labels: []
 
 # Anything on this host that already exposes a Prometheus endpoint - Traefik,
 # a bare node_exporter, an application's own /metrics. A list of mappings:
 #
-#   name      component label and the job suffix; must be a valid Alloy
-#             identifier (letters, digits, underscore, not starting with a
-#             digit), because it is interpolated straight into the block name
+#   name      component label and the default job suffix; must be a valid
+#             Alloy identifier (letters, digits, underscore, not starting with
+#             a digit), because it is interpolated straight into the block
+#             name. A slash here is a parse error that stops the agent
 #   address   host:port, as Prometheus would write it
-#   job       optional, defaults to integrations/<name>
+#   job       optional job suffix, defaulting to `name`; the rendered label is
+#             integrations/<job>, so do not include the prefix yourself
 #   path      optional, defaults to /metrics
 #   scheme    optional, defaults to http
 #   interval  optional, defaults to alloy_scrape_interval
@@ -101,6 +207,41 @@ alloy_docker_host: "unix:///var/run/docker.sock"
 alloy_otlp_bind: "127.0.0.1"
 alloy_profiles_bind: "127.0.0.1"
 
+# Additional OTLP receivers, for senders that cannot reach this host's
+# loopback. The case that forces it: a container run with
+# `network_mode: service:<other>` has no network namespace of its own, so
+# "localhost" inside it is that other container's loopback and not the host's.
+# Traefik in the Pangolin stack is exactly this - it shares gerbil's namespace,
+# so it can only reach Alloy on the Docker bridge gateway.
+#
+# A list of mappings, each with a `name` (a valid Alloy identifier, since it
+# becomes the component label, and not `default`, which the loopback receiver
+# already uses) and an `address` to bind. Both ports move together: the
+# receiver listens on <address>:4317 and <address>:4318.
+#
+#   alloy_otlp_extra_receivers:
+#     - { name: docker, address: "172.19.0.1" }
+#
+# The loopback receiver above stays regardless, so host-local senders keep a
+# path that never leaves the machine.
+#
+# Three things this needs to actually work, none of which this variable does:
+#
+#   - a UFW rule. Traffic from a container to the bridge gateway arrives on the
+#     bridge interface and traverses the host's INPUT chain, where UFW's
+#     default-deny drops it. ufw_allow_rules in roles/config exists for this;
+#     the rule has to live there rather than here, because `ufw reload` flushes
+#     the CrowdSec bouncer's chains and only that role's handler puts them back
+#   - a pinned subnet. A compose network's subnet is allocated dynamically, so
+#     the gateway address can change when the network is recreated - and the
+#     agent then listens on an address nothing reaches, silently
+#   - a decision about exposure. The receiver is unauthenticated and there is
+#     no option that changes that, so every container on the host can push
+#     spans to it. A gateway address is not routable from the internet, which
+#     is what keeps this bounded - tests/render-check.yml asserts the address
+#     stays in a private range so a public one cannot be set by accident.
+alloy_otlp_extra_receivers: []
+
 # The Alloy UI and its own /metrics endpoint, on port 12345. Worth reaching -
 # the UI shows the live component graph and is how you diagnose a pipeline that
 # quietly stopped collecting - but it exposes the config structure, so it stays
@@ -131,8 +272,8 @@ alloy_custom_args: >-
 # Two ingest hostnames reach the same reverse proxy and the same backends; only
 # the network path differs:
 #
-#   https://ingest.net.d1023.de   LAN and tunnel only - the default, for hosts
-#                                 on 192.168.2.x
+#   https://ingest.net.d1023.de   LAN and tunnel only - the default, and what
+#                                 every host in the [local] group uses
 #   https://ingest.d1023.de       internet-facing - for off-site hosts
 #
 # Each signal has a distinct write path, so one hostname routes all four with

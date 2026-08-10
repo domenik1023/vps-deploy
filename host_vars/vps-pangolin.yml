@@ -9,8 +9,51 @@ ansible_port: 22822
 # ssh_port: 22822
 # crowdsec_firewall_bouncer_package: crowdsec-firewall-bouncer-nftables
 
-alloy_extra_log_paths:
-  - { path: "/mnt/docker/pangolin/logs/access.log", job: "traefik" }
+# Traefik's access log. Not an alloy_extra_log_paths entry: that ships lines
+# raw, and this one is parsed, which is what gives the lines their real
+# timestamps and the trace_id that makes them clickable through to Tempo.
+# Requires `accessLog.format: json` in Traefik - see docs/alloy.md.
+alloy_access_logs:
+  - path: /mnt/docker/pangolin/logs/access.log
+    format: traefik
 
+# `name` is the Alloy component label, so it has to be a bare identifier - a
+# slash there is a parse error that stops the agent. To change the Loki job
+# instead, add `job:` to the entry; it defaults to integrations/<name>.
 alloy_extra_scrape_targets:
   - { name: "traefik", address: "127.0.0.1:8082" }
+
+# Traefik runs with `network_mode: service:gerbil`, so it has no network
+# namespace of its own: "localhost" inside it is gerbil's loopback, not this
+# host's, and it cannot reach the loopback OTLP receiver at all. This adds a
+# second receiver on the Docker bridge gateway, which it can reach. The
+# loopback one stays, so anything running on the host itself is unaffected.
+#
+# Traefik's side wants the FULL path, unlike OTEL_EXPORTER_OTLP_ENDPOINT
+# elsewhere - see docs/alloy.md#traefik:
+#
+#   tracing:
+#     otlp:
+#       http:
+#         endpoint: http://172.19.0.1:4318/v1/traces
+#
+# Confirm the gateway still matches before a run, and pin the subnet in the
+# Pangolin compose file. A compose network's subnet is allocated dynamically,
+# so recreating the network can move this address - and Alloy would then listen
+# somewhere nothing reaches, with no error anywhere:
+#
+#   docker inspect gerbil -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'
+alloy_otlp_extra_receivers:
+  - { name: "docker", address: "172.19.0.1" }
+
+# ...and the rule that lets that traffic in. Container-to-gateway packets
+# arrive on the bridge interface and traverse INPUT, where UFW's default-deny
+# drops them - Docker's own rules are in FORWARD and never see this. Scoped to
+# the bridge subnet and the gateway address so it opens nothing on the public
+# interface. See ufw_allow_rules in roles/config/defaults/main.yml.
+ufw_allow_rules:
+  - src: "172.19.0.0/16"
+    dest: "172.19.0.1"
+    port: "4317,4318"
+    proto: tcp
+    comment: "Traefik in gerbil's netns to the Alloy OTLP receiver"
