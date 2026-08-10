@@ -365,6 +365,21 @@ otelcol.receiver.otlp "default" {
   }
 }
 
+{% for receiver in alloy_otlp_extra_receivers %}
+
+// An additional receiver for senders that cannot reach the host's loopback -
+// a container sharing another container's network namespace, typically, where
+// "localhost" is that namespace and not this host. Same pipeline as above.
+otelcol.receiver.otlp "{{ receiver.name }}" {
+  grpc { endpoint = "{{ receiver.address }}:4317" }
+  http { endpoint = "{{ receiver.address }}:4318" }
+
+  output {
+    traces = [otelcol.processor.resourcedetection.default.input]
+  }
+}
+{% endfor %}
+
 otelcol.processor.resourcedetection "default" {
   detectors = ["env", "system"]
 

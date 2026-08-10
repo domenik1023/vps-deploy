@@ -228,12 +228,33 @@ it. `tests/render-check.yml` asserts against this.
 
 **Alloy's three listeners stay on loopback.** OTLP (4317/4318), the profile
 receiver (4041) and the UI (12345) are all unauthenticated and Alloy has no
-credential checking to enable. No UFW rule is added for any of them, and that is
-deliberate twice over: nothing needs to reach them, and any `ufw` rule change
-reloads UFW, which deletes every non-builtin chain and takes the CrowdSec
-bouncer's rules with it. The `Reload UFW` handler notifies a bouncer restart for
-that reason, and it is scoped to `roles/config` — a rule added from `roles/alloy`
-could not reach it.
+credential checking to enable. No UFW rule is added for any of them by default,
+and that is deliberate twice over: nothing needs to reach them, and any `ufw`
+rule change reloads UFW, which deletes every non-builtin chain and takes the
+CrowdSec bouncer's rules with it. The `Reload UFW` handler notifies a bouncer
+restart for that reason, and it is scoped to `roles/config` — a rule added from
+`roles/alloy` could not reach it, which is why `ufw_allow_rules` lives in
+`roles/config` even though its only current caller is Alloy.
+
+`alloy_otlp_extra_receivers` is the one sanctioned widening, for a sender that
+genuinely cannot reach loopback — a container run with
+`network_mode: service:<other>` has no namespace of its own, so `localhost`
+inside it is the *other* container's loopback. Traefik on `vps-pangolin` is
+exactly this. It renders a second `otelcol.receiver.otlp` on a Docker bridge
+gateway, keeping the loopback one, and it needs a matching `ufw_allow_rules`
+entry: container-to-gateway traffic traverses `INPUT`, where UFW's default-deny
+drops it, and Docker's own rules are in `FORWARD` and never see it.
+`tests/render-check.yml` asserts every rendered listener stays in a private
+range, so `0.0.0.0` cannot be set by accident.
+
+**`tests/render-check.yml` must assert against rendered host_vars, not just
+defaults.** It loads both roles' `defaults/main.yml` with `vars_files`, so any
+assertion naming one of those variables is checking the *default* — a host_vars
+file overriding it is invisible. That gap shipped a `prometheus.scrape
+"instance/traefik"` past green CI, which Alloy rejects outright. The per-host
+task renders every `host_vars/*.yml` through the template and checks the
+properties that decide whether the config parses at all; new invariants about
+host-settable variables belong there.
 
 **Alloy's ingest endpoints are unauthenticated by design.** Agents cannot do
 interactive OIDC. Do not add credentials to the agent config expecting the

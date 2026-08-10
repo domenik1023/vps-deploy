@@ -47,6 +47,34 @@
     state: enabled
     logging: "{{ ufw_logging }}"
 
+# Host-specific allow rules, for things UFW's default-deny would otherwise drop
+# on the way in. The case this exists for is a container reaching a service the
+# host binds on the Docker bridge gateway: that traffic arrives on the bridge
+# interface and traverses INPUT, so Docker's own FORWARD rules never see it and
+# UFW drops it.
+#
+# These live here rather than in the role that wants them, and that is not
+# arbitrary. Any rule change reloads UFW, `ufw reload` is a stop/start that
+# deletes every non-builtin chain, and that takes the CrowdSec bouncer's rules
+# with it. The `Reload UFW` handler puts them back by notifying the bouncer
+# restart - and handlers are only reachable from the role that defines them, so
+# a ufw task in roles/alloy could not notify it.
+#
+# Scope each rule as tightly as it will go. `to` and `port` in particular:
+# without them a rule opens the address on every port.
+- name: Apply host-specific UFW allow rules
+  community.general.ufw:
+    rule: allow
+    src: "{{ item.src | default(omit) }}"
+    dest: "{{ item.dest | default(omit) }}"
+    port: "{{ item.port | default(omit) }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    comment: "{{ item.comment | default(omit) }}"
+  loop: "{{ ufw_allow_rules }}"
+  loop_control:
+    label: "{{ item.comment | default(item.port | default(item.src)) }}"
+  notify: Reload UFW
+
 # --- Fail2ban jail for sshd on custom port ---
 - name: Configure fail2ban jail for sshd
   ansible.builtin.copy:

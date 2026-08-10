@@ -367,6 +367,14 @@
           # and every query in docs/alloy.md, and it fails by showing nothing
           # rather than by erroring.
           - jobs | reject('match', '^integrations/') | list | length == 0
+          # Every address Alloy listens on. All three receivers are
+          # unauthenticated and there is no option that changes that, so what
+          # keeps them safe is the address they bind. Loopback is the default;
+          # a Docker bridge gateway is the one sanctioned widening, for a
+          # sender that genuinely cannot reach loopback - a container in
+          # another container's network namespace. 0.0.0.0 is the mistake this
+          # catches, and it would also collide with the loopback receiver.
+          - binds | reject('match', private_address) | list | length == 0
         fail_msg: >-
           host_vars/{{ item | basename }} renders a config Alloy cannot parse,
           or one that breaks the job naming convention.
@@ -374,6 +382,8 @@
           {{ labels | reject('match', '^[a-zA-Z_][a-zA-Z0-9_]*$') | list | join(', ') | default('none', true) }}.
           Job labels missing the integrations/ prefix:
           {{ jobs | reject('match', '^integrations/') | list | join(', ') | default('none', true) }}.
+          Listeners bound outside a private range:
+          {{ binds | reject('match', private_address) | list | join(', ') | default('none', true) }}.
           A component label is an identifier - letters, digits and underscores,
           not starting with a digit - so it cannot hold a slash, a dot or a
           dash. `job` on a scrape target, a log path or an access log is the
@@ -399,6 +409,11 @@
         # yields an empty list, and an assertion over an empty list passes
         # whatever the config says.
         jobs: "{{ (rendered | regex_findall('job_name\\s*=\\s*\"([^\"]*)\"')) + (rendered | regex_findall('\\bjob\\s*=\\s*\"([^\"]*)\"')) }}"
+        # Every address a receiver binds: the OTLP grpc/http one-liners and the
+        # Pyroscope listener. Deliberately not `endpoint =` in general - that
+        # also names the outbound loki.write and remote_write URLs.
+        binds: "{{ (rendered | regex_findall('(?:grpc|http) \\{ endpoint = \"([^\":]*):')) + (rendered | regex_findall('listen_address = \"([^\"]*)\"')) }}"
+        private_address: '^(10\.|192\.168\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
 
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional

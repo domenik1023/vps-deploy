@@ -47,6 +47,27 @@ ssh_old_port: 22
 # actually reads is installed by crowdsec.yml and carries no limit.
 ufw_logging: low
 
+# Host-specific allow rules, applied after `ufw enable`. Empty by default: the
+# only ports that should be open on an internet-facing host are the ones the
+# hardening tasks open themselves, and Docker-published ports bypass UFW
+# entirely (see docker_daemon_options below for that trap).
+#
+# The case this exists for is the reverse of that trap - a container reaching
+# something the *host* binds on the Docker bridge gateway. That traffic
+# traverses INPUT rather than FORWARD, so Docker's rules never see it and UFW's
+# default-deny drops it. Alloy's extra OTLP receiver is the current example:
+#
+#   ufw_allow_rules:
+#     - src: "172.19.0.0/16"
+#       dest: "172.19.0.1"
+#       port: "4317,4318"
+#       proto: tcp
+#       comment: "Traefik in gerbil's netns to the Alloy OTLP receiver"
+#
+# `src` and `dest` both matter. Without `dest` the rule opens those ports on
+# every address the host holds, including the public one.
+ufw_allow_rules: []
+
 # --- Fail2ban ---
 # Deliberately duller than CrowdSec, which should ban first: its decisions go to
 # the central LAPI and apply across the whole fleet, while a fail2ban ban only

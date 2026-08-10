@@ -313,6 +313,7 @@ each pipeline actually collects.
 | `alloy_access_log_formats` | `traefik`, `caddy` | How to read each proxy's JSON: time field, field map, and which fields are bounded enough to be real labels. Adding a proxy is an entry here |
 | `alloy_extra_scrape_targets` | `[]` | Prometheus endpoints already on the host (Traefik, an app's `/metrics`), as `{ name, address }` mappings — see [docs/alloy.md](docs/alloy.md#scraping-something-that-already-exposes-metrics) |
 | `alloy_otlp_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
+| `alloy_otlp_extra_receivers` | `[]` | Additional OTLP receivers, as `{ name, address }` mappings, for containers that cannot reach the host's loopback. Private addresses only, and needs a matching `ufw_allow_rules` entry — see [docs/alloy.md](docs/alloy.md#traefik) |
 | `alloy_profiles_bind` | `127.0.0.1` | Unauthenticated receiver; asserted to stay on loopback |
 | `alloy_ui_bind` | `127.0.0.1` | Alloy UI and `/metrics`; reach it over an SSH tunnel |
 | `alloy_custom_args` | `--disable-reporting` | Extra `ExecStart` flags; adds `--server.http.listen-addr` only when the UI bind differs from Alloy's own default |

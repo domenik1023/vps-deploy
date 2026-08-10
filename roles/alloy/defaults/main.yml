@@ -207,6 +207,41 @@ alloy_docker_host: "unix:///var/run/docker.sock"
 alloy_otlp_bind: "127.0.0.1"
 alloy_profiles_bind: "127.0.0.1"
 
+# Additional OTLP receivers, for senders that cannot reach this host's
+# loopback. The case that forces it: a container run with
+# `network_mode: service:<other>` has no network namespace of its own, so
+# "localhost" inside it is that other container's loopback and not the host's.
+# Traefik in the Pangolin stack is exactly this - it shares gerbil's namespace,
+# so it can only reach Alloy on the Docker bridge gateway.
+#
+# A list of mappings, each with a `name` (a valid Alloy identifier, since it
+# becomes the component label, and not `default`, which the loopback receiver
+# already uses) and an `address` to bind. Both ports move together: the
+# receiver listens on <address>:4317 and <address>:4318.
+#
+#   alloy_otlp_extra_receivers:
+#     - { name: docker, address: "172.19.0.1" }
+#
+# The loopback receiver above stays regardless, so host-local senders keep a
+# path that never leaves the machine.
+#
+# Three things this needs to actually work, none of which this variable does:
+#
+#   - a UFW rule. Traffic from a container to the bridge gateway arrives on the
+#     bridge interface and traverses the host's INPUT chain, where UFW's
+#     default-deny drops it. ufw_allow_rules in roles/config exists for this;
+#     the rule has to live there rather than here, because `ufw reload` flushes
+#     the CrowdSec bouncer's chains and only that role's handler puts them back
+#   - a pinned subnet. A compose network's subnet is allocated dynamically, so
+#     the gateway address can change when the network is recreated - and the
+#     agent then listens on an address nothing reaches, silently
+#   - a decision about exposure. The receiver is unauthenticated and there is
+#     no option that changes that, so every container on the host can push
+#     spans to it. A gateway address is not routable from the internet, which
+#     is what keeps this bounded - tests/render-check.yml asserts the address
+#     stays in a private range so a public one cannot be set by accident.
+alloy_otlp_extra_receivers: []
+
 # The Alloy UI and its own /metrics endpoint, on port 12345. Worth reaching -
 # the UI shows the live component graph and is how you diagnose a pipeline that
 # quietly stopped collecting - but it exposes the config structure, so it stays

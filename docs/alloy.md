@@ -318,6 +318,71 @@ external can reach it, and the agent handles batching and retry on the way to
 Tempo. Once tracing is on, Traefik adds trace IDs to every access log line by
 itself — no `fields` configuration — and the pipeline above picks them up.
 
+#### When Traefik shares another container's network namespace
+
+`localhost` only works if Traefik can reach *this host's* loopback. In the
+Pangolin stack it cannot: Traefik runs with `network_mode: service:gerbil`, so
+it has no network namespace of its own and `localhost` inside it is gerbil's
+loopback. Nothing is listening there, and the export fails.
+
+Note this also rules out `extra_hosts: host.docker.internal:host-gateway` on
+the Traefik service — Docker rejects host mappings on a container that joins
+another container's namespace, because `/etc/hosts` comes from the owner. It
+would have to go on gerbil.
+
+Three things have to line up, and each fails silently on its own:
+
+**1. Alloy needs a second receiver on the bridge gateway.** The loopback one
+stays, so host-local senders are unaffected:
+
+```yaml
+# host_vars/vps-pangolin.yml
+alloy_otlp_extra_receivers:
+  - { name: "docker", address: "172.19.0.1" }
+```
+
+**2. UFW has to let that traffic in.** Container-to-gateway packets arrive on
+the bridge interface and traverse the host's `INPUT` chain — Docker's own rules
+live in `FORWARD` and never see them — so UFW's default-deny drops them. The
+rule belongs in `roles/config`, because `ufw reload` flushes the CrowdSec
+bouncer's chains and only that role's handler puts them back:
+
+```yaml
+ufw_allow_rules:
+  - src: "172.19.0.0/16"
+    dest: "172.19.0.1"
+    port: "4317,4318"
+    proto: tcp
+    comment: "Traefik in gerbil's netns to the Alloy OTLP receiver"
+```
+
+**3. Traefik points at the gateway, with the full path:**
+
+```yaml
+tracing:
+  otlp:
+    http:
+      endpoint: http://172.19.0.1:4318/v1/traces
+```
+
+Find the gateway with:
+
+```bash
+docker inspect gerbil -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'
+```
+
+> **Pin the subnet in the compose file.** A user-defined network's subnet is
+> allocated dynamically, so recreating it can move the gateway — and Alloy would
+> then be listening on an address nothing reaches, with no error anywhere.
+
+The receiver is still unauthenticated, so every container on the host can push
+spans to it. A gateway address is not routable from the internet, which is what
+keeps that bounded; `tests/render-check.yml` asserts every listener stays in a
+private range so `0.0.0.0` cannot be set by accident.
+
+If gerbil itself runs with `network_mode: host`, none of this applies —
+Traefik is already in the host namespace and plain `localhost:4318` works.
+
 **Metrics need enabling and then scraping.** Traefik serves Prometheus metrics
 on the `traefik` entryPoint at `/metrics` once switched on, and that entryPoint
 is the same one the insecure API dashboard uses — so give metrics their own:
@@ -440,6 +505,7 @@ the Caddy side and the playbook run close together.
 | 4317, 4318 | OTLP receiver | host-local only |
 | 4041 | Pyroscope SDK receiver | host-local only |
 | 12345 | Alloy UI and `/metrics` | host-local only |
+| 4317, 4318 on a bridge gateway | OTLP, for containers that cannot reach loopback | opt-in per host, private range only |
 
 All three are unauthenticated, and Alloy has no credential checking to turn on.
 **No UFW rule is added for any of them**, which is a decision rather than an
@@ -578,6 +644,8 @@ every 30 seconds, so it needs no restart.
 | Container metrics missing, everything else fine | cAdvisor's cgroup access. `systemctl show alloy -p User` should say `root`; a host on the unprivileged path will not have it. |
 | Container logs missing, container metrics present | `discovery.docker` cannot reach the socket. Check `alloy_docker_host` and that the containers are actually running — discovery lists nothing when there is nothing to list. |
 | Journal logs missing | The `alloy` user is not in `systemd-journal` and is not root. Only relevant on the unprivileged path. |
+| Traefik traces never arrive, everything else fine | Traefik cannot reach the agent. If it runs with `network_mode: service:<other>`, `localhost` is that container's loopback, not the host's — see [Traefik](#traefik). Check all three: `alloy_otlp_extra_receivers`, the `ufw_allow_rules` entry, and Traefik's endpoint carrying the full `/v1/traces` path. |
+| Traces stopped after recreating a Docker network | The bridge gateway moved. `alloy_otlp_extra_receivers` still names the old address, so Alloy listens where nothing sends. Pin the subnet in the compose file. |
 | Traces sent but never appear in Tempo | `alloy_tempo_endpoint` has a path on it. It must be a base URL — the exporter appends `/v1/traces` itself, and the doubled path 404s silently. |
 | Profiles sent but never appear in Pyroscope | Same shape of mistake: `alloy_pyroscope_endpoint` is a base URL, and `pyroscope.write` appends `/push.v1.PusherService/Push`. Check the reverse proxy routes both that and `/ingest`. |
 | eBPF profiles missing, other profiles fine | `pyroscope.ebpf` is in an error state. Needs root, `/sys/kernel/tracing` and a writable `/tmp/symb-cache`; check the component graph in the UI. |
