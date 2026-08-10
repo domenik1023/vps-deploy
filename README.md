@@ -30,7 +30,7 @@ vps-deploy/
 │   └── render-check.yml              # Variable shapes and design invariants
 ├── group_vars/
 │   ├── all/
-│   │   └── vault.yml                 # Encrypted secrets (ansible-vault)
+│   │   └── vault.yml                 # Admin password hash — encrypt with ansible-vault
 │   └── vps.yml                       # Off-site hosts: the public ingest hostname
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
@@ -38,6 +38,8 @@ vps-deploy/
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
 │   ├── vps-pangolin.yml
+│   ├── komodo.yml
+│   ├── reverseproxy.yml              # Caddy Proxy Manager on the LAN
 │   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
@@ -208,12 +210,16 @@ alloy_enable_ebpf: true
 ```
 
 Two things are deliberate and easy to undo by accident. The OTLP receiver, the
-profile receiver and the Alloy UI are all **unauthenticated** and all stay on
-loopback — reach the UI with `ssh -L 12345:localhost:12345 <host>` rather than
-opening the port, and note that no UFW rule is added for any of them, because
-`ufw reload` flushes the CrowdSec bouncer's chains. And `alloy_agent_version` is
-**pinned**: upstream's default of `latest` queries the GitHub API on every run
-and can upgrade a host unasked. Both are asserted in `tests/render-check.yml`.
+profile receiver and the Alloy UI are all **unauthenticated** and stay on
+loopback by default — reach the UI with `ssh -L 12345:localhost:12345 <host>`
+rather than opening the port, and note that no UFW rule is added for them,
+because `ufw reload` flushes the CrowdSec bouncer's chains. The one sanctioned
+exception is `alloy_otlp_extra_receivers`, which adds a *second* OTLP receiver
+on a private address for a container that cannot reach loopback at all; the
+render check requires every listener to sit in a private range. And
+`alloy_agent_version` is **pinned**: upstream's default of `latest` queries the
+GitHub API on every run and can upgrade a host unasked. All of it is asserted in
+`tests/render-check.yml`.
 
 The ingest endpoints are unauthenticated by design — agents cannot do
 interactive OIDC. Do not add credentials to the agent config expecting the
@@ -230,7 +236,18 @@ host-specific otherwise (address, SSH port, per-host overrides) goes in
 [vps]
 vps-pangolin
 vps-docker
+
+[local]
+komodo
+reverseproxy
 ```
+
+The group is not cosmetic either. `[local]` skips the SSH port move (so a LAN
+box cannot lock you out) and skips CrowdSec entirely — a NAT'd host sees none of
+the traffic CrowdSec exists to catch, and each agent would still consume a
+machine registration and a bouncer key on the central LAPI. `[vps]` additionally
+switches the Alloy ingest hostname to the public one. UFW is enabled everywhere,
+including `[local]`.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own
@@ -277,6 +294,7 @@ Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 | `crowdsec_collections` | `[crowdsecurity/linux, crowdsecurity/iptables]` | Base collections every agent gets |
 | `crowdsec_collections_extra` | `[]` | Per-host additions — add here rather than replacing the base list |
 | `ufw_logging` | `low` | UFW log level; the port-scan scenario reads these drop lines |
+| `ufw_allow_rules` | `[]` | Extra UFW allow rules, as `{ src, dest, port, proto, comment }` mappings. Lives here rather than with the role that needs it, because `ufw reload` flushes the CrowdSec bouncer's chains and only this role's handler restores them |
 | `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
@@ -365,14 +383,30 @@ that parses but evaluates to the wrong type — a list that becomes a string, a
 dict that stops being valid JSON. It also pins the design decisions that are
 easy to reverse by accident: fail2ban staying duller than CrowdSec, user
 namespace remapping staying off, only both-family chains in
-`crowdsec_bouncer_iptables_chains`, Alloy's three listeners staying on loopback,
-and every Alloy signal endpoint still deriving from `alloy_ingest_base`.
+`crowdsec_bouncer_iptables_chains`, Alloy's listeners staying on private
+addresses, and every Alloy signal endpoint still deriving from
+`alloy_ingest_base`.
 
 It renders `config.alloy.j2` too, and asserts the toggles actually add and
 remove the pipelines they name and that nothing reaches
 `grafana.grafana.alloy`'s own templating pass still holding a Jinja delimiter —
 a block that does would be evaluated away silently, leaving a config Alloy
 starts perfectly happily without.
+
+Crucially it renders **every `host_vars/*.yml`**, not just the role defaults. An
+assertion naming a variable the defaults define is only checking the default; a
+host overriding it is invisible. That gap once shipped a
+`prometheus.scrape "instance/traefik"` past green CI, which Alloy rejects
+outright. The per-host pass checks what decides whether a config parses at all:
+block labels are valid Alloy identifiers, every job label carries the
+`integrations/` prefix, and every listener binds a private address.
+
+None of that replaces the real parser. For anything touching the template,
+validate a render with the Alloy binary from the pinned release:
+
+```bash
+alloy fmt /path/to/rendered.alloy && alloy validate /path/to/rendered.alloy
+```
 
 ### Dry run (check mode)
 

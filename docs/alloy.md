@@ -507,15 +507,29 @@ the Caddy side and the playbook run close together.
 | 12345 | Alloy UI and `/metrics` | host-local only |
 | 4317, 4318 on a bridge gateway | OTLP, for containers that cannot reach loopback | opt-in per host, private range only |
 
-All three are unauthenticated, and Alloy has no credential checking to turn on.
-**No UFW rule is added for any of them**, which is a decision rather than an
-omission: nothing needs to reach them from outside, and touching UFW here would
-be actively harmful. Adding a rule reloads UFW, `ufw reload` is a stop/start that
-deletes every non-builtin chain, and that takes the CrowdSec firewall bouncer's
-rules with it. The `Reload UFW` handler in `roles/config` notifies a bouncer
-restart for exactly this reason; a rule added from the Alloy role would be
-outside that handler's scope and would leave the host unprotected until the next
-bouncer restart.
+All of them are unauthenticated, and Alloy has no credential checking to turn
+on. **No UFW rule is added by default**, which is a decision rather than an
+omission: nothing needs to reach them from outside, and touching UFW is not
+free. Adding a rule reloads UFW, `ufw reload` is a stop/start that deletes every
+non-builtin chain, and that takes the CrowdSec firewall bouncer's rules with it.
+The `Reload UFW` handler in `roles/config` notifies a bouncer restart for
+exactly this reason — which is also why `ufw_allow_rules` lives in that role and
+not in `roles/alloy`, since handlers are only reachable from the role that
+defines them.
+
+The last row is the one sanctioned exception, and it is not a widening of the
+first: it adds a *second* receiver rather than moving the first off loopback.
+The case that forces it is a container that cannot reach this host's loopback at
+all — one run with `network_mode: service:<other>`, where `localhost` is the
+other container's namespace. That needs both `alloy_otlp_extra_receivers` and a
+matching `ufw_allow_rules` entry, because container-to-gateway traffic traverses
+`INPUT` where UFW's default-deny drops it. See
+[When Traefik shares another container's network namespace](#when-traefik-shares-another-containers-network-namespace).
+
+What keeps that bounded is the address: a Docker bridge gateway is not routable
+from the internet, though every container on the host can reach it.
+`tests/render-check.yml` renders each host and asserts every listener it finds
+sits in a private range, so `0.0.0.0` cannot be set by accident.
 
 Note that upstream's own `alloy_expose_port` is **not** the escape hatch it
 looks like. It drives `ansible.posix.firewalld`, and these hosts run UFW —
@@ -533,8 +547,8 @@ ssh -p 22822 -L 12345:localhost:12345 domenik1023@vps-docker
 # then open http://localhost:12345
 ```
 
-Widening `alloy_ui_bind` needs more than editing one variable: the loopback
-binds are asserted in `tests/render-check.yml`, and the upstream role's preflight
+Widening `alloy_ui_bind` needs more than editing one variable: the binds are
+asserted in `tests/render-check.yml`, and the upstream role's preflight
 validates a non-default listen address with `ansible.utils.ipaddr`, which is not
 in `requirements.yml`. A host that needs to send telemetry should run its own
 agent rather than reach across to this one.

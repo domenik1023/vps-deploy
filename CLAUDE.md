@@ -226,7 +226,7 @@ second pass still holding an opening Jinja delimiter is evaluated and discarded
 silently — the file lands short of a pipeline and Alloy starts happily without
 it. `tests/render-check.yml` asserts against this.
 
-**Alloy's three listeners stay on loopback.** OTLP (4317/4318), the profile
+**Alloy's listeners stay on loopback by default.** OTLP (4317/4318), the profile
 receiver (4041) and the UI (12345) are all unauthenticated and Alloy has no
 credential checking to enable. No UFW rule is added for any of them by default,
 and that is deliberate twice over: nothing needs to reach them, and any `ufw`
