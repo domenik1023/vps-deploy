@@ -19,7 +19,7 @@ ansible_port: 22822
 # first run; it follows the same /mnt/docker/<stack>/logs convention as
 # vps-pangolin.
 alloy_access_logs:
-  - path: /mnt/docker/caddy/logs/access.log
+  - path: /etc/komodo/stacks/vps-docker-caddy/caddy/logs/access.log
     format: caddy
     drop_paths:
       - "^/favicon\\.ico$"
