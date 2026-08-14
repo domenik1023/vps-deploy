@@ -56,4 +56,4 @@ ufw_allow_rules:
     dest: "172.19.0.1"
     port: "4317,4318"
     proto: tcp
-    comment: "Traefik in gerbil's netns to the Alloy OTLP receiver"
+    comment: "Traefik in gerbils netns to the Alloy OTLP receiver"
