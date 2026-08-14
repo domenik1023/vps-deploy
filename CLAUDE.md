@@ -32,7 +32,13 @@ ansible-vault edit group_vars/all/vault.yml
 ```
 
 `requirements.yml` pins `grafana.grafana` for the `alloy` role, so re-run the
-collection install after pulling.
+collection install after pulling. CI pins its tooling too —
+`ansible-core~=2.19.0` and `ansible-lint~=26.6.0` in `.github/workflows/ci.yml`
+— so a newer local `ansible-lint` can report findings CI never sees, and the
+reverse. `.ansible-lint` skips two rules on purpose; `no-handler` is the one
+that matters, because the four tasks it flags are the mid-play SSH port switch
+and the sysctl apply, which must run inline (a handler fires at the end of the
+play, by which point sshd has already moved and the connection is dead).
 
 Most bugs here are Jinja, not Ansible, and neither `--syntax-check` nor
 `ansible-lint` catches an expression that parses but evaluates to the wrong
@@ -162,6 +168,28 @@ single-quoted YAML passes backslashes through untouched while a Jinja string
 literal unescapes them — writing the test fixture the wrong way makes that
 assertion pass whether the template escapes or not.
 
+**Every job label is `integrations/<suffix>`, and the template owns the
+prefix.** A `job` in `alloy_extra_log_paths`, `alloy_access_logs` or
+`alloy_extra_scrape_targets` is the suffix only — writing the prefix yourself
+doubles it. This is the convention every dashboard and every query in
+`docs/alloy.md` filters on, so a job that opts out fails by showing nothing
+rather than by erroring; `tests/render-check.yml` rejects any rendered job label
+without the prefix.
+
+`alloy_extra_scrape_targets` covers anything already exposing a Prometheus
+endpoint on the host. Two of its fields are sharper than they look: `name`
+becomes the `prometheus.scrape` block label, so it must be a bare Alloy
+identifier (a slash there is the parse error that motivated the per-host render
+check), and `address` is a bare `host:port` — a URL scrapes a host that does not
+exist and only shows up as a target that never comes up. `instance` is pinned to
+the hostname rather than left to default to `host:port`, so these line up with
+every other job.
+
+**The tunable Alloy collections are lists of mappings, never mappings.** Ansible
+does not guarantee mapping order, and an unordered render changes the config
+file on every run — which reports `changed` forever and restarts Alloy each
+time. The render check asserts the shape for each of them.
+
 `alloy_config` is rendered with `set_fact` rather than inline in the
 `include_role` vars, and that is also not stylistic: variables are templated
 lazily at the point of use, and a relative template lookup resolves against the
@@ -199,6 +227,17 @@ UFW's, so `-p 8080:80` is reachable regardless of firewall rules. This is
 accepted, not fixed; CrowdSec compensates via `DOCKER-USER`. Fail2ban shares
 the blind spot.
 
+**`crowdsec_firewall_log_prefix` is written verbatim into `before.rules`.** It
+lands inside a double-quoted `--log-prefix` argument that `iptables-restore`
+parses, so a stray quote or newline does not fail the play — it fails `ufw
+reload`, which leaves the firewall stopped with a default-ACCEPT policy. iptables
+also caps prefixes at 29 characters, and the prefix must contain neither
+`ACCEPT` nor `UFW AUDIT`: those are `crowdsecurity/iptables-logs`' two filter
+exclusions, and matching either makes the parser silently discard every line it
+exists to read. Note also that `ufw_logging` is for reading by hand only —
+ufw rate-limits its own LOG rules at every level below `high`, so the rule
+CrowdSec actually reads is a separate, unlimited one installed by `crowdsec.yml`.
+
 **Fail2ban is deliberately duller than CrowdSec** so CrowdSec bans first and the
 decision reaches the whole fleet. The two are not independent — whichever bans
 first starves the other of events. Changing `fail2ban_maxretry` without
@@ -209,7 +248,7 @@ bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
 
 **Alloy's `instance` label comes from the system hostname, not the inventory.**
-`constants.hostname` and the journal's `_HOSTNAME` field feed it, in seven places
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
 `hostname.yml` closes that by setting the system hostname to
@@ -235,6 +274,14 @@ CrowdSec bouncer's rules with it. The `Reload UFW` handler notifies a bouncer
 restart for that reason, and it is scoped to `roles/config` — a rule added from
 `roles/alloy` could not reach it, which is why `ufw_allow_rules` lives in
 `roles/config` even though its only current caller is Alloy.
+
+Widening `alloy_ui_bind` costs more than the bind address. `alloy_custom_args`
+emits `--server.http.listen-addr` only when the bind differs from Alloy's own
+default, because upstream's post-install preflight parses that flag and runs the
+address through `ansible.utils.ipaddr` — and `ansible.utils` is neither in
+`requirements.yml` nor a dependency of `grafana.grafana`, so emitting the flag
+fails the play with a missing-filter error. Reach the UI over
+`ssh -L 12345:localhost:12345 <host>` instead.
 
 `alloy_otlp_extra_receivers` is the one sanctioned widening, for a sender that
 genuinely cannot reach loopback — a container run with
