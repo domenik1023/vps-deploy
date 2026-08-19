@@ -6,3 +6,31 @@ ansible_port: 22
 
 alloy_extra_scrape_targets:
   - { name: "crowdsec", address: "127.0.0.1:32840" }
+
+# --- LAN access to host-bound services ---
+#
+# Being in [local] skips the SSH port move and CrowdSec, but NOT `ufw enable`,
+# which turns on default-deny incoming here like everywhere else with only the
+# SSH port allowed. Docker-published ports survive that - Docker's FORWARD jump
+# precedes UFW's, the trap in roles/config/defaults/main.yml working in our
+# favour - but anything the host itself binds is dropped: Periphery as a
+# systemd unit, a native exporter, anything not published by a container.
+#
+# This lets the LAN back in, which is the trade this host makes: it sits behind
+# NAT, sees none of the internet noise default-deny is there for, and its
+# services exist to be reached from the LAN. `src` keeps it to RFC 1918 space -
+# 192.168.0.0/16 rather than komodo's own /24, because the LAN is segmented
+# (reverseproxy sits on 192.168.4.6) and a rule scoped to 192.168.2.0/24 would
+# still drop a client on another segment.
+#
+# `proto: any` rather than the role's tcp default, so UDP services are covered
+# too. Note the rule opens no port that is not already listening: with nothing
+# bound, the kernel answers with RST or ICMP port-unreachable whatever UFW
+# allows. What widens is the set of *existing* listeners the LAN can reach -
+# and a service bound to 127.0.0.1, or published as `127.0.0.1:PORT:PORT`,
+# stays unreachable no matter what is in this list. Check `ss -tlnp` on the
+# host before assuming UFW is what is in the way.
+ufw_allow_rules:
+  - src: "192.168.0.0/16"
+    proto: any
+    comment: "LAN to host-bound services"

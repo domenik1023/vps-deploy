@@ -247,7 +247,12 @@ box cannot lock you out) and skips CrowdSec entirely — a NAT'd host sees none 
 the traffic CrowdSec exists to catch, and each agent would still consume a
 machine registration and a bouncer key on the central LAPI. `[vps]` additionally
 switches the Alloy ingest hostname to the public one. UFW is enabled everywhere,
-including `[local]`.
+including `[local]` — worth knowing before a first run on a LAN box, because
+default-deny incoming applies there too and only the SSH port is allowed.
+Docker-published ports stay reachable regardless (Docker's `FORWARD` jump
+precedes UFW's), but anything the host *itself* binds drops off the LAN until a
+`ufw_allow_rules` entry lets it back in; `host_vars/komodo.yml` is the worked
+example.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own

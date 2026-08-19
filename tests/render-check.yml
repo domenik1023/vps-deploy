@@ -415,6 +415,40 @@
         binds: "{{ (rendered | regex_findall('(?:grpc|http) \\{ endpoint = \"([^\":]*):')) + (rendered | regex_findall('listen_address = \"([^\"]*)\"')) }}"
         private_address: '^(10\.|192\.168\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
 
+    - name: Every host UFW allow rule must be scoped to a private source
+      # Same gap as the task above, one variable over: ufw_allow_rules is
+      # host-settable and its default is empty, so an assertion naming it up
+      # here would check nothing. These rules exist to let a LAN back in past
+      # default-deny, and both fields that keep them bounded are optional in
+      # the task that applies them - an entry with no `src` opens its ports on
+      # every address the host holds, the public one included, and an entry
+      # naming a public src does the same for whoever it names. Neither fails
+      # the play; both quietly widen a firewall. A genuinely public rule would
+      # be a deliberate decision, so it should have to change this assertion
+      # rather than ride in on a copied line.
+      ansible.builtin.assert:
+        that:
+          - host_rules is sequence
+          - host_rules is not string
+          - host_rules | rejectattr('src', 'defined') | list | length == 0
+          - bad_sources | length == 0
+        fail_msg: >-
+          host_vars/{{ item | basename }} has a ufw_allow_rules entry with no
+          src, or with a src outside RFC 1918:
+          {{ bad_sources | join(', ') | default('none', true) }}.
+        success_msg: >-
+          {{ item | basename }}: {{ host_rules | length }} UFW allow rule(s),
+          sources: {{ host_rules | map(attribute='src', default='(none)') | join(', ') | default('none', true) }}
+      loop: "{{ query('ansible.builtin.fileglob', ufw_host_vars) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        ufw_host_vars: ../host_vars/*.yml
+        host_file: "{{ lookup('ansible.builtin.file', item) | from_yaml | default({}, true) }}"
+        host_rules: "{{ host_file.ufw_allow_rules | default([], true) }}"
+        bad_sources: "{{ host_rules | map(attribute='src', default='(none)') | reject('match', private_address) | list }}"
+        private_address: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
+
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional
       # fails quietly in the direction that matters: a host without Docker

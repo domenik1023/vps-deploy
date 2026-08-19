@@ -24,7 +24,13 @@
     name: crowdsec
     state: restarted
 
+# CrowdSec is installed on internet-facing hosts only, so on a [local] host
+# there is no unit here to restart and `service:` fails on the missing one.
+# That path is reachable rather than theoretical: `Reload UFW` notifies this
+# handler, and ufw_allow_rules is host-settable - the moment a local host sets
+# one, the run ends by trying to restart a bouncer that was never installed.
 - name: Restart CrowdSec bouncer
+  when: "'local' not in group_names"
   ansible.builtin.service:
     name: "{{ crowdsec_firewall_bouncer_service }}"
     state: restarted
