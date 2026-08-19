@@ -30,7 +30,35 @@ alloy_extra_scrape_targets:
 # and a service bound to 127.0.0.1, or published as `127.0.0.1:PORT:PORT`,
 # stays unreachable no matter what is in this list. Check `ss -tlnp` on the
 # host before assuming UFW is what is in the way.
+#
+# The second rule is for senders on this host rather than on the LAN, and it is
+# a separate rule because a container does not source from LAN space - its
+# packets carry a bridge address, so the rule above never matches them. Two
+# paths to a host address behave differently, and only one of them was ever
+# working here:
+#
+#   - a container reaching a *published* port on a container in a DIFFERENT
+#     Docker network is DNATed in PREROUTING, which makes the destination
+#     non-local and sends it to FORWARD, where Docker's rules accept it and
+#     UFW never gets a say. This has always worked and still does.
+#   - a container reaching a published port on a container in the SAME network
+#     is not DNATed at all - Docker's rule carries `! -i <that bridge>` - so
+#     the destination stays local, the packet goes to INPUT, and docker-proxy
+#     is what answers. Same for anything the host itself binds. Both are what
+#     default-deny has been dropping.
+#
+# 172.16.0.0/12 is Docker's whole default pool: docker0 on 172.17.0.0/16 and
+# user-defined networks from 172.18 up. A compose file that pins a subnet
+# outside it needs its own entry - check with `docker network inspect`.
+#
+# This does mean any container on the host can reach any host-bound service,
+# which is the same trade the OTLP receiver on vps-pangolin makes. A service
+# bound to 127.0.0.1 stays out of reach either way; no firewall rule reaches
+# a loopback bind.
 ufw_allow_rules:
   - src: "192.168.0.0/16"
     proto: any
     comment: "LAN to host-bound services"
+  - src: "172.16.0.0/12"
+    proto: any
+    comment: "Containers to host-bound services and published ports"
