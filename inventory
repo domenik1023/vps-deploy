@@ -28,6 +28,7 @@ vps-docker
 #
 # Every entry needs the wg_* settings in its host_vars - see docs/wireguard.md.
 [vpn]
+vpn-gwdg-01
 #vpn-example
 
 # On the LAN, behind NAT. SSH hardening is skipped to avoid locking yourself

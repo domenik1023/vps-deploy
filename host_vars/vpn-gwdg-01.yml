@@ -16,8 +16,9 @@
 # sshd to ssh_port and then deny ssh_old_port, so set this to 22822 afterwards
 # - and keep using the public address, not the tunnel address: the tunnel is
 # built by the run, so on a bootstrap run it does not exist yet.
-ansible_host: 
+ansible_host: 141.5.110.173
 ansible_port: 22
+ansible_user: cloud
 
 # --- The tunnel ---
 # Straight out of the [Interface] block of the generated client config.
