@@ -252,6 +252,41 @@
                     template_vars=base_vars | combine({'wg_killswitch_extra_allow':
                       ['-p tcp --dport 443 -d 203.0.113.10']})) }}
 
+    # Reload UFW fires on any host that changes a ufw rule, which since
+    # docker_host_access_cidrs includes LAN boxes - and it notifies handlers
+    # for two services that only exist where CrowdSec or WireGuard was
+    # installed. An unguarded one of those kills the run at the very end, after
+    # every task has succeeded, with "Could not find the requested service".
+    #
+    # Read out of the handlers file rather than restated, so adding a third
+    # notify to Reload UFW puts it under the same rule automatically.
+    - name: Everything Reload UFW notifies must be safe on every host class
+      ansible.builtin.assert:
+        that:
+          - ufw_notifies | length > 0
+          - unguarded | length == 0
+        fail_msg: >-
+          {{ unguarded | join(', ') }} in roles/baseline/handlers/main.yml
+          {{ 'is' if unguarded | length == 1 else 'are' }} notified by Reload
+          UFW but carr{{ 'ies' if unguarded | length == 1 else 'y' }} no `when`.
+          Reload UFW runs on every host that touches a ufw rule, LAN boxes
+          included, so anything it notifies has to be gated on the same switch
+          that decided whether its service was installed at all.
+        success_msg: >-
+          Reload UFW notifies {{ ufw_notifies | join(', ') }}, all guarded
+      vars:
+        baseline_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/handlers/main.yml')
+             | from_yaml }}
+        reload_ufw: "{{ baseline_handlers | selectattr('name', 'equalto', 'Reload UFW') | first }}"
+        # `notify` may be a single string or a list.
+        ufw_notifies: >-
+          {{ reload_ufw.notify if reload_ufw.notify is sequence
+             and reload_ufw.notify is not string else [reload_ufw.notify] }}
+        unguarded: >-
+          {{ baseline_handlers | selectattr('name', 'in', ufw_notifies)
+             | rejectattr('when', 'defined') | map(attribute='name') | list }}
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with

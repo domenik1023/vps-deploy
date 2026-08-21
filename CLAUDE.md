@@ -310,6 +310,17 @@ dead.
 **Handlers fire in definition order, not notification order.** `Reload systemd`
 is first in `handlers/main.yml` so it precedes any service it affects.
 
+**Anything `Reload UFW` notifies has to be safe on every host class.** It fires
+on any host that changes a ufw rule, LAN boxes included since
+`docker_host_access_cidrs` adds one there, and it notifies restarts for two
+services that only exist where CrowdSec or WireGuard was installed. Both carry
+a `when` on the matching `*_manage` switch — not `failed_when: false`, so a
+service genuinely missing from a host that should have it still fails. An
+unguarded one kills the run at the very end, after every task has already
+succeeded, with `Could not find the requested service`.
+`tests/render-check.yml` reads the notify list out of the handlers file, so a
+third one added later falls under the same rule automatically.
+
 **Facts must be read as `ansible_facts['name']`.** `ansible.cfg` sets
 `inject_facts_as_vars = False`, so `ansible_distribution_release` and friends
 are undefined.

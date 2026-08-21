@@ -188,6 +188,10 @@ exactly that reason — the same reason it restarts the CrowdSec bouncer. Adding
 a `ufw_allow_rules` entry to a `[vpn]` host without that handler would silently
 disarm the kill switch.
 
+Both of those restarts are gated on `wireguard_manage` and `crowdsec_manage`
+respectively, because `Reload UFW` also fires on hosts where neither service
+exists.
+
 ## Verifying
 
 ```bash
