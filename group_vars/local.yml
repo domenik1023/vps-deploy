@@ -1,0 +1,20 @@
+# Settings shared by every host on the LAN.
+#
+# Alloy needs nothing here: alloy_ingest_base already defaults to the LAN name
+# ingest.net.d1023.de, which is what these hosts should use. Only [vps]
+# overrides it, in group_vars/vps.yml.
+
+# Let containers reach services the host binds, by the host's own address.
+#
+# Without this a container on one compose network cannot reach <host IP>:<port>
+# for a service on another: the packet arrives on the bridge and traverses
+# INPUT, where UFW's default-deny drops it, because Docker's own rules are in
+# FORWARD and never see it. It opens every host port to Docker's default
+# address pool, which is a trade worth making on a box behind NAT and not one
+# to copy to group_vars/vps.yml.
+#
+# Diagnosing it from a container looks like a timeout, not a refusal:
+#   docker run --rm alpine sh -c 'nc -vz <host IP> <port>'
+# and `sudo ufw status verbose` on the host shows the allow once this is on.
+docker_host_access_cidrs:
+  - "172.16.0.0/12"

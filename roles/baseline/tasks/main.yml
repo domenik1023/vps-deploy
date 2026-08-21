@@ -3,6 +3,8 @@
 # constraint someone has already been bitten by; the file that depends on one
 # repeats it at its own top.
 #
+#   00 classify    fails the run before anything changes if this host is not in
+#                  exactly one of [local], [vps] and [vpn]
 #   10 hostname    the host's own name is what everything after it records
 #                  itself as, and the Alloy play labels all of its telemetry
 #                  with it
@@ -15,11 +17,18 @@
 #   42 ssh         moves sshd mid-play and records the new port with set_fact
 #   62 docker      starts Docker before 70 probes for DOCKER-USER
 #   70 crowdsec    agent + bouncer, internet-facing hosts only
+#   80 wireguard   last: every apt install above then happens over the direct
+#                  connection, before the default route moves into the tunnel
 #
 # The tags are for re-running one concern against an already-converged host.
 # They are not a bootstrap tool: `--tags crowdsec` on a fresh box skips
 # 42_ssh.yml, so the set_fact that moves ansible_port never runs and every task
 # after it tries the wrong port.
+
+- name: Include host classification checks
+  ansible.builtin.include_tasks:
+    file: 00_classify.yml
+  tags: [always]
 
 - name: Include hostname tasks
   ansible.builtin.include_tasks:
@@ -71,14 +80,23 @@
     file: 62_docker.yml
   tags: [docker]
 
-# Skipped for local test hosts: they sit behind NAT, see none of the internet
-# noise CrowdSec exists to catch, and each one would still consume a machine
-# registration and a bouncer key on the central LAPI. This one include is also
-# what keeps CrowdSec's iptables work off them: the unthrottled LOG rules in
-# ufw's before.rules and the bouncer's INPUT / DOCKER-USER chains are all
-# inside it.
+# [vps] and [vpn] only. LAN boxes sit behind NAT, see none of the internet noise
+# CrowdSec exists to catch, and each one would still consume a machine
+# registration and a bouncer key on the central LAPI.
+#
+# This one include is also what keeps CrowdSec's iptables work off them: the
+# unthrottled LOG rules in ufw's before.rules and before6.rules, and the
+# bouncer's INPUT and DOCKER-USER chains, are all inside it. There is no second
+# switch for the firewall rules because there is nowhere else for them to be.
 - name: Include CrowdSec tasks
   ansible.builtin.include_tasks:
     file: 70_crowdsec.yml
-  when: "'local' not in group_names"
+  when: crowdsec_manage | bool
   tags: [crowdsec]
+
+# Last, and see the note at the top of the file for why.
+- name: Include WireGuard tunnel tasks
+  ansible.builtin.include_tasks:
+    file: 80_wireguard.yml
+  when: wireguard_manage | bool
+  tags: [wireguard]

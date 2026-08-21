@@ -29,6 +29,28 @@ ufw_logging: low
 # every address the host holds, including the public one.
 ufw_allow_rules: []
 
+# Docker bridge networks allowed to reach services the *host* binds.
+#
+# A container talking to <host address>:<port> for something outside its own
+# compose network sends a packet that arrives on the bridge and traverses
+# INPUT, because the destination is a local address. Docker's rules are all in
+# FORWARD and never see it, so UFW's default-deny is what drops it - the
+# published-port trap in 40_docker.yml, running the other way round.
+#
+# Set for [local] in group_vars/local.yml and empty everywhere else: an entry
+# here opens every port on the host to anything on those subnets, which is a
+# reasonable trade on a LAN box and not on a public one. It is a variable of
+# its own rather than an entry in ufw_allow_rules above because a host_vars
+# ufw_allow_rules replaces a group_vars list wholesale, and losing this rule
+# silently is exactly the bug it exists to fix.
+#
+# 172.16.0.0/12 covers Docker's default address pool, 172.17.0.0/16 through
+# 172.31.0.0/16. A compose network pinned to a subnet outside that needs adding
+# here - but note the LAN is 192.168.0.0/16, so a blanket entry for Docker's
+# fallback pool would open the host to the whole LAN as well. Pin the subnet in
+# the compose file and name it exactly.
+docker_host_access_cidrs: []
+
 # --- Fail2ban ---
 # Deliberately duller than CrowdSec, which should ban first: its decisions go to
 # the central LAPI and apply across the whole fleet, while a fail2ban ban only

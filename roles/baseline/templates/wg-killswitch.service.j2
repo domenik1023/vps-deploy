@@ -1,0 +1,23 @@
+[Unit]
+Description=WireGuard kill switch ({{ wg_interface }})
+Documentation=file:///usr/local/sbin/wg-killswitch
+# Before the network is configured, so there is no window between boot and the
+# rules being in place where traffic can leave the public interface.
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+# DOCKER-USER is where container traffic is filtered, and it only exists once
+# dockerd has built its rules. The script creates the chain if it is missing so
+# that boot ordering cannot leave a gap, but running after Docker when Docker
+# is there keeps the rule out of Docker's way.
+After=docker.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wg-killswitch on
+ExecStop=/usr/local/sbin/wg-killswitch off
+
+[Install]
+WantedBy=multi-user.target

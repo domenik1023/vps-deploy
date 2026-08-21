@@ -116,10 +116,31 @@ target — a delegate absent from the inventory silently falls back to SSH
 defaults (port 22, no `ansible_user`). Configuring it would disable the very
 LAPI the fleet depends on.
 
-Within the hardening play, `when: "'local' not in group_names"` skips SSH
-hardening (to avoid self-lockout on LAN test boxes) and the entire CrowdSec
-include. Alloy is not skipped there — a LAN box reaches the default
-`ingest.net.d1023.de` without any override.
+**Every host is in exactly one of `[local]`, `[vps]` and `[vpn]`**, and that
+membership is the only thing deciding how much of the role it gets.
+`00_classify.yml` asserts it first thing, before any task changes anything,
+because both failure modes are quiet: a host in no class silently gets the
+least, and a host in two gets whichever `first` picks by list order rather than
+whichever anyone meant.
+
+`host_class` derives from those groups in `defaults/main/00_identity.yml`, and
+three switches derive from it — `ssh_hardening_manage`, `crowdsec_manage`,
+`wireguard_manage`. Nothing else in the role tests `group_names`. They are
+stated positively on purpose. The old spelling was
+`when: "'local' not in group_names"`, which was correct while there were
+exactly two classes and wrong the moment there was a third: anything not in
+`[local]` got full SSH hardening and a CrowdSec registration on the shared
+LAPI, whether or not that was intended. All three now default false for a host
+in no class, so the failure direction is *less*, not more.
+
+Gating CrowdSec is also what keeps its **iptables** work off LAN boxes. The
+unthrottled LOG rules in `before.rules` and `before6.rules` and the bouncer's
+`INPUT` / `DOCKER-USER` chains are all inside `70_crowdsec.yml`, so there is no
+second switch for them and nowhere else for them to live.
+
+Alloy is not skipped anywhere — a LAN box reaches the default
+`ingest.net.d1023.de` without any override, and so does a `[vpn]` host, over
+its tunnel.
 
 Hosts are named in `inventory`; addresses and per-host settings live in
 `host_vars/<name>.yml`. The name is not cosmetic — `crowdsec_lapi_login` and
@@ -150,6 +171,58 @@ for the bouncer key) and only generate a new secret when the existing one is
 missing, points elsewhere, or is rejected. Preserve that property when editing.
 `crowdsec_lapi_cscli` is the invocation prefix, which is how a LAPI running in
 a container is reached (`docker exec <container> cscli …`).
+
+### WireGuard on `[vpn]` hosts
+
+`80_wireguard.yml` is last in the role, and that is load-bearing: every apt
+install above it then happens over the direct connection, so a bootstrap run
+never depends on the tunnel or on the UDM routing peers to the internet.
+
+The hard part is not the tunnel, it is keeping SSH reachable on the public
+interface while the default route is `wg0`. `wg-quick` with `0.0.0.0/0` in
+`AllowedIPs` adds `not fwmark <t> table <t>` at priority 32765, so a reply to
+an inbound connection is routed into the tunnel and the session hangs. The kill
+switch marks connections arriving on the public interface (`mangle PREROUTING`),
+restores the mark on the way out (`mangle OUTPUT`) and adds an `ip rule` at
+priority 30000 sending those to the main table.
+
+**The mark is a single bit used as its own mask, and it is not wg-quick's
+fwmark.** wg-quick derives that from the first free routing table counting up
+from 51820, at run time, and overrides whatever `FwMark` the config asks for —
+so it is not a number this repo can know, and `wg.conf.j2` deliberately does
+not set one. The mask matters separately: wg-quick sets its fwmark on the
+encrypted packets it sends, and an unmasked `CONNMARK --restore-mark` clears
+it, routing the tunnel's own traffic back into the tunnel.
+
+**There is a second, dumber rule keeping SSH alive**: `tcp --sport <ssh_port>`
+returns before the final `DROP`, matching on port alone with no conntrack and
+no `ip rule` involved. It is what still holds if the mangle half is wrong, and
+`tests/render-check.yml` asserts both its presence and that every `RETURN`
+precedes the `DROP`. Losing that ordering is a trip to the provider's serial
+console.
+
+**Container traffic is filtered in `DOCKER-USER`, not in ufw.** Docker's
+`FORWARD` jumps run ahead of ufw's, so `ufw-before-forward` never sees it. The
+same reason the CrowdSec bouncer uses that chain.
+
+**`ufw reload` disarms the kill switch**, because its `iptables-restore`
+flushes the builtins the chains are jumped into from. `Reload UFW` notifies
+`Restart WireGuard kill switch`, defined after it — exactly as it already
+notifies the bouncer restart. This is the second reason `ufw_allow_rules` has
+to live in `roles/baseline`.
+
+**`[vpn]` hosts run loose reverse path filtering** (`sysctl_rp_filter: 2` in
+`group_vars/vpn.yml`). Strict mode drops inbound SSH on the public interface
+the moment the default route is the tunnel — the kernel finds the return path
+points down `wg0` and discards the packet before any firewall rule is
+consulted. The kernel takes `max(all, <iface>)` for this, which is why `all`
+and `default` move together.
+
+A rollback is armed with `systemd-run --on-active` before anything moves and
+cancelled only after the host has answered *and* the tunnel has handshaked. It
+retreats to the pre-tunnel state rather than just dropping rules, so a reboot
+cannot re-apply what locked us out. `docs/wireguard.md` has the UDM side and
+the recovery procedure.
 
 ### Alloy
 
@@ -250,6 +323,20 @@ exist in both families or the bouncer aborts at startup — and its `-t` config
 test runs the same initialisation, so systemd never starts it. IPv4-only chains
 like `DOCKER-USER` go in `crowdsec_bouncer_iptables_v4_chains`, which is probed
 before use.
+
+**Docker containers cannot reach the host by its own address unless told
+they may.** A container talking to `<host IP>:<port>` for something outside its
+compose network sends a packet that arrives on the bridge and traverses
+`INPUT`, because the destination is local — Docker's rules are all in `FORWARD`
+and never see it, so UFW's default-deny drops it. That is the published-port
+trap below, running the other way round.
+`docker_host_access_cidrs` opens it, set for `[local]` only. It is a variable
+of its own rather than an `ufw_allow_rules` entry because a host_vars
+`ufw_allow_rules` replaces a group_vars list wholesale, and losing this rule
+silently is the exact bug it exists to fix. Note that each entry opens *every*
+host port to that source, and that Docker's fallback address pool overlaps the
+LAN's `192.168.0.0/16` — pin an unusual compose subnet and name it exactly
+rather than widening the range.
 
 **UFW does not filter Docker-published ports.** Docker's `FORWARD` jump precedes
 UFW's, so `-p 8080:80` is reachable regardless of firewall rules. This is

@@ -1,3 +1,17 @@
+# --- Kernel hardening ---
+# Reverse path filtering: 1 is strict (drop anything whose reply would not go
+# back out the interface it arrived on), 2 is loose (drop only what has no
+# route back at all), 0 is off.
+#
+# Strict is right for a host with one route to the world, and wrong for a [vpn]
+# host: its default route is the tunnel, so an inbound SSH packet on the public
+# interface has no matching return path and is dropped by the kernel before any
+# firewall rule is consulted. group_vars/vpn.yml sets 2 for that reason.
+#
+# The kernel takes max(all, <interface>) for this, so `all` cannot loosen a
+# per-interface setting - which is why both `all` and `default` move together.
+sysctl_rp_filter: 1
+
 # --- Unattended upgrades ---
 # Security updates install daily, but anything touching the kernel or libc only
 # takes effect after a reboot. unattended-upgrades can only express a time of

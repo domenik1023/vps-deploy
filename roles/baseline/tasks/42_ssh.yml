@@ -1,6 +1,9 @@
-# --- SSH hardening (skipped for local test hosts to prevent lockout) ---
+# --- SSH hardening ([vps] and [vpn] only) ---
+# Skipped on LAN boxes to prevent a lockout you would have to walk to the
+# machine to fix. ssh_hardening_manage derives from the host's inventory group
+# - see defaults/main/00_identity.yml.
 - name: SSH hardening block
-  when: "'local' not in group_names"
+  when: ssh_hardening_manage | bool
   block:
     - name: Ensure sshd_config.d exists
       ansible.builtin.file:
@@ -67,11 +70,11 @@
       when: ssh_restarted is changed
 
 # Lock down the old SSH port now that sshd has moved to {{ ssh_port }}.
-# Skipped for local hosts because the hardening block above didn't move sshd,
-# so denying port 22 would lock us out.
+# Skipped wherever the block above did not move sshd, because denying port 22
+# would then lock us out.
 - name: Tighten UFW on old SSH port
   when:
-    - "'local' not in group_names"
+    - ssh_hardening_manage | bool
     - ssh_old_port != ssh_port
   block:
     # Remove the bootstrap allow before adding the deny — UFW evaluates

@@ -1,3 +1,32 @@
+# --- Host class ---
+# Which of the three inventory groups this host is in, and the three switches
+# derived from it. The groups are the single source of truth about what a host
+# is; nothing else in the role tests group_names.
+#
+# Derived rather than set per group so that the *absence* of a class is a
+# defined state and the safe one: a host in none of them gets no SSH port move,
+# no CrowdSec registration and no tunnel, instead of picking up whatever the
+# old `'local' not in group_names` test happened to let through. 00_classify.yml
+# then fails the run outright, so the fail-safe is a backstop and not the
+# behaviour anyone relies on.
+#
+# `first` is deliberate over anything that would tolerate two matches: a host in
+# both [vps] and [vpn] is a mistake with a real cost either way round, so it is
+# rejected rather than resolved.
+host_class: "{{ ['local', 'vps', 'vpn'] | intersect(group_names) | first | default('', true) }}"
+
+# Off-site hosts get the SSH port move; LAN boxes do not, because a lockout
+# there costs a walk to the machine rather than a support ticket.
+ssh_hardening_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Off-site hosts get the CrowdSec agent, the bouncer, and with them the
+# unthrottled iptables LOG rules in ufw's before.rules. All of that is inside
+# one include, so this one switch covers the lot.
+crowdsec_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Only [vpn] hosts build a tunnel and a kill switch.
+wireguard_manage: "{{ host_class == 'vpn' }}"
+
 # --- Host identity ---
 # The system hostname, set to whatever this host is called in the inventory.
 #

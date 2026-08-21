@@ -49,6 +49,23 @@
 #
 # Scope each rule as tightly as it will go. `to` and `port` in particular:
 # without them a rule opens the address on every port.
+# Lets a container reach a service on the host by its address, which UFW's
+# default-deny otherwise drops on the way into INPUT. See
+# docker_host_access_cidrs in defaults/main/20_firewall.yml for why it is not
+# an entry in ufw_allow_rules.
+#
+# proto: any, because the point is "the host is reachable from the bridge" -
+# a rule limited to tcp leaves DNS and anything else on udp still dropped, and
+# the symptom is the same confusing timeout.
+- name: Allow Docker bridge networks to reach host services
+  community.general.ufw:
+    rule: allow
+    src: "{{ item }}"
+    proto: any
+    comment: "Docker containers to host-bound services"
+  loop: "{{ docker_host_access_cidrs }}"
+  notify: Reload UFW
+
 - name: Apply host-specific UFW allow rules
   community.general.ufw:
     rule: allow

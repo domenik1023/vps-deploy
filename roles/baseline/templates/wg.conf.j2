@@ -1,0 +1,24 @@
+# Managed by Ansible - roles/baseline/templates/wg.conf.j2. Local edits are
+# overwritten on the next run.
+#
+# No FwMark here on purpose. wg-quick picks its own, at run time: with a /0 in
+# AllowedIPs it takes the first free routing table from 51820 up and sets the
+# interface fwmark to match, overriding whatever this file asked for. The kill
+# switch therefore uses a mark of its own, on a bit wg-quick does not touch -
+# see wg_killswitch_mark in defaults/main/60_wireguard.yml.
+[Interface]
+Address = {{ wg_address }}
+PrivateKey = {{ wg_private_key }}
+MTU = {{ wg_mtu }}
+{% if wg_dns | default([]) | length > 0 %}
+DNS = {{ wg_dns | join(', ') }}
+{% endif %}
+
+[Peer]
+PublicKey = {{ wg_peer_public_key }}
+{% if wg_preshared_key | default('') | length > 0 %}
+PresharedKey = {{ wg_preshared_key }}
+{% endif %}
+Endpoint = {{ wg_peer_endpoint }}
+AllowedIPs = {{ wg_allowed_ips | join(', ') }}
+PersistentKeepalive = {{ wg_persistent_keepalive }}

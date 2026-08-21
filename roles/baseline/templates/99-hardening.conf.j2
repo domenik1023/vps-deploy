@@ -1,6 +1,6 @@
 # --- Network: spoofing / source routing protection ---
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.rp_filter = {{ sysctl_rp_filter }}
+net.ipv4.conf.default.rp_filter = {{ sysctl_rp_filter }}
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 
