@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly reboot window for pending upgrades
+
+[Timer]
+OnCalendar={{ unattended_reboot_oncalendar }}
+# A missed window waits for the next one rather than rebooting at boot.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

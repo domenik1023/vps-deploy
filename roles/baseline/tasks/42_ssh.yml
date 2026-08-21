@@ -1,0 +1,98 @@
+# --- SSH hardening (skipped for local test hosts to prevent lockout) ---
+- name: SSH hardening block
+  when: "'local' not in group_names"
+  block:
+    - name: Ensure sshd_config.d exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        mode: "0755"
+
+    - name: Set SSH port via drop-in
+      ansible.builtin.template:
+        src: sshd-port.conf.j2
+        dest: /etc/ssh/sshd_config.d/10-port.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: ssh_port_conf
+
+    - name: Hardening options via drop-in
+      ansible.builtin.template:
+        src: sshd-hardening.conf.j2
+        dest: /etc/ssh/sshd_config.d/20-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: ssh_hardening_conf
+
+    # Kill socket activation so sshd binds the port itself
+    - name: Disable and mask ssh.socket
+      ansible.builtin.systemd:
+        name: ssh.socket
+        state: stopped
+        enabled: false
+        masked: true
+        daemon_reload: true
+      failed_when: false  # ok if the unit doesn't exist
+
+    - name: Validate sshd config
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Ensure ssh service is enabled and running
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Restart ssh if config changed
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_conf.changed or ssh_hardening_conf.changed
+      register: ssh_restarted
+
+    # After sshd moves to the new port, subsequent tasks must reconnect there.
+    - name: Switch ansible_port to the new SSH port for the rest of the play
+      ansible.builtin.set_fact:
+        ansible_port: "{{ ssh_port }}"
+      when: ssh_restarted is changed
+
+    - name: Wait for sshd on the new port
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 30
+      when: ssh_restarted is changed
+
+# Lock down the old SSH port now that sshd has moved to {{ ssh_port }}.
+# Skipped for local hosts because the hardening block above didn't move sshd,
+# so denying port 22 would lock us out.
+- name: Tighten UFW on old SSH port
+  when:
+    - "'local' not in group_names"
+    - ssh_old_port != ssh_port
+  block:
+    # Remove the bootstrap allow before adding the deny — UFW evaluates
+    # rules in order and "first match wins", so a leftover allow would
+    # shadow the deny.
+    - name: Remove bootstrap allow rule for old SSH port
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_old_port }}"
+        proto: tcp
+        delete: true
+
+    - name: Deny standard SSH port (port 22)
+      community.general.ufw:
+        rule: deny
+        port: "{{ ssh_old_port }}"
+        proto: tcp
+
+# --- Root lockdown (keep last; ensure admin user has sudo before this runs) ---
+- name: Lock the root account (no password, no login)
+  ansible.builtin.user:
+    name: root
+    password: "!"
+    shell: /usr/sbin/nologin

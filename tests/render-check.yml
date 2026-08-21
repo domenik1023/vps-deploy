@@ -9,14 +9,22 @@
 #
 #   ansible-playbook tests/render-check.yml
 #
-# It deliberately reads roles/config/defaults/main.yml rather than restating the
-# expressions, so it tests the real definitions.
+# It deliberately reads the roles' own defaults rather than restating the
+# expressions, so it tests the real definitions. vars_files cannot take a
+# directory, so roles/baseline/defaults/main/ has to be listed file by file -
+# and the first assertion below is what stops a seventh file being added
+# without anyone wiring it up here.
 - name: Check that the role's derived variables render to the right shapes
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
-    - ../roles/config/defaults/main.yml
+    - ../roles/baseline/defaults/main/00_identity.yml
+    - ../roles/baseline/defaults/main/10_ssh.yml
+    - ../roles/baseline/defaults/main/20_firewall.yml
+    - ../roles/baseline/defaults/main/30_system.yml
+    - ../roles/baseline/defaults/main/40_docker.yml
+    - ../roles/baseline/defaults/main/50_crowdsec.yml
     - ../roles/alloy/defaults/main.yml
   vars:
     # Only present so defaults referencing it can be loaded; never used.
@@ -26,6 +34,31 @@
     alloy_template: ../roles/alloy/templates/config.alloy.j2
 
   tasks:
+    # Every assertion below reads a variable that came from one of the files in
+    # vars_files. Splitting the defaults into a directory made it possible to
+    # add a seventh file and have nothing here notice - the assertions would go
+    # on passing, testing the six that are loaded. Compare the two lists.
+    - name: Every baseline defaults file must be loaded by this play
+      ansible.builtin.assert:
+        that:
+          - defaults_on_disk | difference(defaults_loaded) | length == 0
+        fail_msg: >-
+          {{ defaults_on_disk | difference(defaults_loaded) | join(', ') }}
+          exists in roles/baseline/defaults/main/ but is not in this play's
+          vars_files, so nothing here asserts anything about it. Add it to both.
+        success_msg: "{{ defaults_loaded | length }} baseline defaults files loaded"
+      vars:
+        defaults_on_disk: >-
+          {{ query('ansible.builtin.fileglob', '../roles/baseline/defaults/main/*.yml')
+             | map('basename') | sort }}
+        defaults_loaded:
+          - 00_identity.yml
+          - 10_ssh.yml
+          - 20_firewall.yml
+          - 30_system.yml
+          - 40_docker.yml
+          - 50_crowdsec.yml
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with

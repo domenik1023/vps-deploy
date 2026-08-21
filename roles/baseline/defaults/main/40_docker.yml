@@ -1,0 +1,26 @@
+# --- Docker ---
+# Convention for where persistent volume data is bind-mounted from; the
+# playbook only creates the directory. Docker's own data root is left at
+# /var/lib/docker.
+docker_data_dir: /mnt/docker
+
+# Written to /etc/docker/daemon.json.
+docker_daemon_options:
+  live-restore: true
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: "3"
+  no-new-privileges: true
+
+# User namespace remapping maps container root to an unprivileged host UID,
+# which is good isolation but breaks any container that bind-mounts
+# /var/run/docker.sock - the socket is root:docker, and remapped root is
+# neither. Container managers run that way (Komodo Periphery, Portainer,
+# Watchtower, a Traefik docker provider), so it is off by default.
+#
+# It also moves the data root to /var/lib/docker/<subuid>.<subgid>/, so
+# toggling it hides every container, image and volume created under the other
+# setting. Set to "default" only on hosts that run no such container, and
+# expect to migrate their data.
+docker_userns_remap: ""

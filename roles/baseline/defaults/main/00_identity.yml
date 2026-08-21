@@ -1,0 +1,32 @@
+# --- Host identity ---
+# The system hostname, set to whatever this host is called in the inventory.
+#
+# It is not cosmetic. Grafana Alloy labels every metric, log line and profile
+# with `instance`, and takes that from the system hostname rather than from
+# anything Ansible knows - so a box called `pangolin` locally but
+# `vps-pangolin` in the inventory ships telemetry no dashboard filtering on the
+# inventory name will ever match. CrowdSec avoids the same trap only because it
+# derives its machine and bouncer names from inventory_hostname explicitly.
+#
+# Override per host for a name that is not the inventory name (an FQDN, say);
+# set system_hostname_manage to false to leave the host's own name untouched.
+#
+# Renaming a host that is already reporting splits its history: existing
+# Prometheus series and Loki streams stay under the old instance label and new
+# ones arrive under the new one, so queries spanning the change need both.
+system_hostname: "{{ inventory_hostname }}"
+system_hostname_manage: true
+
+# RFC 1123: letters, digits and hyphens, each label starting and ending
+# alphanumeric, 63 characters at most. Underscores are the trap worth naming -
+# legal in an inventory name, illegal in a hostname, and systemd rejects the
+# value outright rather than mangling it into something that works.
+# tests/render-check.yml exercises this against names that must and must not
+# pass; hostname.yml asserts the resolved name against it before writing.
+system_hostname_pattern: '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+
+# --- User ---
+admin_user: domenik1023
+# admin_password must be defined in group_vars/all/vault.yml (ansible-vault encrypted)
+# Set it as: vault_admin_password: "<sha512-crypt hash>"
+admin_password: "{{ vault_admin_password }}"

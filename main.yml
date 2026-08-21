@@ -6,7 +6,7 @@
   tasks:
     - name: Include Role
       ansible.builtin.include_role:
-        name: config
+        name: baseline
 
 # A second play rather than another include in the one above, so the hardening
 # role's load-bearing task order stays a statement about itself.

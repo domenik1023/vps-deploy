@@ -1,6 +1,6 @@
 # Caddy Proxy Manager on the LAN. It is in the [local] group, so SSH hardening
 # is skipped to avoid locking yourself out, and CrowdSec is not installed at
-# all - see roles/config/tasks/main.yml.
+# all - see roles/baseline/tasks/main.yml.
 ansible_host: 192.168.4.6
 ansible_port: 22
 
@@ -15,7 +15,7 @@ ansible_port: 22
 # SSH ports are allowed. That is fine for a reverse proxy whose 80/443 are
 # Docker-published, because Docker's FORWARD jump precedes UFW's and the
 # published ports stay reachable regardless - the same trap documented in
-# roles/config/defaults/main.yml, working in our favour here. It is NOT fine
+# roles/baseline/defaults/main/40_docker.yml, working in our favour here. It is NOT fine
 # for a Caddy running natively on the host: the first run would take the proxy
 # off the network. Confirm which one this is before deploying.
 

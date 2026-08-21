@@ -1,0 +1,6 @@
+# --- Unattended upgrades ---
+# Security updates install daily, but anything touching the kernel or libc only
+# takes effect after a reboot. unattended-upgrades can only express a time of
+# day for that reboot, never a weekday, so it is driven by a systemd timer.
+unattended_reboot_enabled: true
+unattended_reboot_oncalendar: "Sat *-*-* 05:00:00"

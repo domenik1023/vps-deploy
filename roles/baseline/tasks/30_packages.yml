@@ -1,0 +1,42 @@
+# --- Packages ---
+# First task file to touch apt, and everything after it depends on that.
+#
+# python3-debian is the load-bearing entry: deb822_repository parses and writes
+# .sources files through it, a stock Ubuntu image lacks it, and both
+# 62_docker.yml and 70_crowdsec.yml add a repository that way. Keep this file
+# ahead of either.
+
+- name: Update all packages
+  ansible.builtin.apt:
+    upgrade: dist
+    update_cache: true
+
+- name: Ensure base packages are installed
+  ansible.builtin.apt:
+    name:
+      - openssh-server
+      - ufw
+      - fail2ban
+      # deb822_repository parses and writes .sources files through python-debian;
+      # it is not part of a stock Ubuntu image, and the Docker and CrowdSec
+      # repository tasks later in the play both need it.
+      - python3-debian
+    state: present
+
+- name: Install essential software and maintenance tools
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - git
+      - jq
+      - net-tools
+      - nano
+      - unattended-upgrades  # Enables automated security updates
+      - apt-listchanges      # Logs changes for automated updates
+      - chrony               # NTP time synchronisation
+    state: present
+    update_cache: true

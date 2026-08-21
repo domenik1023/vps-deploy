@@ -54,30 +54,59 @@ trusting it: `alloy fmt <file>` and `alloy validate <file>`, from the binary in
 the release matching `alloy_agent_version`.
 
 For anything the render check still cannot reach, write a throwaway play that
-loads the role's `defaults/main.yml` via `vars_files`, renders the expression to
-a file, and parse it back with Python to confirm the shape.
+loads the role's defaults via `vars_files`, renders the expression to a file,
+and parse it back with Python to confirm the shape. `roles/baseline/defaults/`
+is a `main/` **directory**, which Ansible loads whole but `vars_files` cannot
+take — so list its files individually, as `tests/render-check.yml` does. The
+first assertion in that file compares the list it loaded against a glob of the
+directory, because a seventh defaults file nobody wired up would otherwise be
+untested and silent about it.
 
 ## Architecture
 
-Two roles and two plays in `main.yml`, in this order: `config` (hardening) then
-`alloy` (telemetry). The split is a play boundary rather than a second
-`include_role` so the hardening role's task order stays a statement about
-itself; `hardening.yml` records the switched SSH port with `set_fact`, and host
-facts persist across plays within a run, so the second play still connects.
+Two roles and two plays in `main.yml`, in this order: `baseline` (everything
+every managed host gets) then `alloy` (telemetry). The split is a play boundary
+rather than a second `include_role` so the baseline role's task order stays a
+statement about itself; `42_ssh.yml` records the switched SSH port with
+`set_fact`, and host facts persist across plays within a run, so the second play
+still connects.
 
-`config/tasks/main.yml` includes six files **and the order is load-bearing**:
+`baseline/tasks/main.yml` includes its files **in a load-bearing order**, and
+they are numbered so that order is visible in `ls` rather than only in a
+comment. A new file gets a number that places it, not the next one free:
 
-`hostname.yml` → `user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` →
-`crowdsec.yml`
+`10_hostname` → `20_user` → `30_packages` → `40_firewall` → `41_fail2ban` →
+`42_ssh` → `50_sysctl` → `60_updates` → `61_time` → `62_docker` →
+`70_crowdsec`
 
-- `hostname.yml` is first because the host's own name is what everything after
-  it records itself as, and the Alloy play labels all its telemetry with it.
-- `hardening.yml` installs `python3-debian`, which `deb822_repository` in
-  `software.yml` and `crowdsec.yml` needs and a stock Ubuntu image lacks.
-- `software.yml` starts Docker before `crowdsec.yml` probes for `DOCKER-USER`.
+- `10_hostname.yml` is first because the host's own name is what everything
+  after it records itself as, and the Alloy play labels all its telemetry with
+  it.
+- `20_user.yml` before `42_ssh.yml`, which locks the root account last.
+- `30_packages.yml` installs `python3-debian`, which `deb822_repository` in
+  `62_docker.yml` and `70_crowdsec.yml` needs and a stock Ubuntu image lacks.
+- `40_firewall.yml` strictly before `42_ssh.yml`: the bootstrap allow on the
+  live session's port and the `limit` on the port sshd is about to move to must
+  both exist before it moves. The matching deny on the old port lives in
+  `42_ssh.yml` instead, next to the move that justifies it.
+- `62_docker.yml` starts Docker before `70_crowdsec.yml` probes for
+  `DOCKER-USER`.
 
 The `alloy` play must stay after it: cAdvisor and the Docker log discovery both
-expect the socket `software.yml` creates.
+expect the socket `62_docker.yml` creates.
+
+Each include carries a **tag** named after its concern, so one can be re-run on
+its own (`--tags docker`, `--tags crowdsec`). They are for a converged host, not
+for bootstrapping: `--tags crowdsec` on a fresh box skips `42_ssh.yml`, so the
+`set_fact` that moves `ansible_port` never runs and every task after it tries
+the wrong port.
+
+**Free-form file bodies live in `templates/`; data structures stay in the
+task.** `daemon.json` and the CrowdSec bouncer overlay are built as mappings and
+written with `to_nice_json` / `to_nice_yaml`, where the round trip through the
+filter is itself the check that the shape is right — those stay inline. An sshd
+drop-in, a fail2ban jail, a systemd unit or the sysctl file is text with holes
+in it, and belongs in `templates/`.
 
 ### Host targeting
 
@@ -99,7 +128,7 @@ orphans its machine and bouncer registration on the LAPI.
 
 ### The mid-play SSH port switch
 
-`hardening.yml` moves sshd off port 22 while Ansible is connected over it:
+`42_ssh.yml` moves sshd off port 22 while Ansible is connected over it:
 allow the current port in UFW *before* `ufw enable`, `limit` the new port,
 restart sshd, `set_fact ansible_port`, `wait_for_connection`, then deny port 22.
 Reordering any of this locks you out. `ansible.cfg` sets `pipelining` and
@@ -113,7 +142,7 @@ alerts go to the central LAPI, so bans propagate fleet-wide. See
 `docs/crowdsec.md` for the operational side (adding log sources, verification,
 troubleshooting).
 
-`crowdsec_credentials.yml` mints machine credentials and the bouncer API key by
+`71_crowdsec_credentials.yml` mints machine credentials and the bouncer API key by
 running `cscli` on the LAPI host over delegation; nothing is stored in the
 vault. It is idempotent by **verify-then-mint**: check what the agent already
 has (`cscli lapi status` for the machine, an authenticated `GET /v1/decisions`
@@ -236,7 +265,7 @@ also caps prefixes at 29 characters, and the prefix must contain neither
 exclusions, and matching either makes the parser silently discard every line it
 exists to read. Note also that `ufw_logging` is for reading by hand only —
 ufw rate-limits its own LOG rules at every level below `high`, so the rule
-CrowdSec actually reads is a separate, unlimited one installed by `crowdsec.yml`.
+CrowdSec actually reads is a separate, unlimited one installed by `70_crowdsec.yml`.
 
 **Fail2ban is deliberately duller than CrowdSec** so CrowdSec bans first and the
 decision reaches the whole fleet. The two are not independent — whichever bans
@@ -251,11 +280,11 @@ existing containers and volumes.
 `constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
-`hostname.yml` closes that by setting the system hostname to
+`10_hostname.yml` closes that by setting the system hostname to
 `inventory_hostname`, which is why it fixes all six at once and no relabelling
 is needed. Alloy reads the hostname once at startup and its config carries no
 literal copy, so a rename does not change the config and upstream's handler
-never fires — `roles/alloy` restarts it explicitly on the fact `hostname.yml`
+never fires — `roles/alloy` restarts it explicitly on the fact `10_hostname.yml`
 sets. Facts persist across plays, which is what makes that work.
 
 **The Alloy config is templated twice.** `grafana.grafana.alloy` writes
@@ -271,9 +300,9 @@ credential checking to enable. No UFW rule is added for any of them by default,
 and that is deliberate twice over: nothing needs to reach them, and any `ufw`
 rule change reloads UFW, which deletes every non-builtin chain and takes the
 CrowdSec bouncer's rules with it. The `Reload UFW` handler notifies a bouncer
-restart for that reason, and it is scoped to `roles/config` — a rule added from
+restart for that reason, and it is scoped to `roles/baseline` — a rule added from
 `roles/alloy` could not reach it, which is why `ufw_allow_rules` lives in
-`roles/config` even though its only current caller is Alloy.
+`roles/baseline` even though its only current caller is Alloy.
 
 Widening `alloy_ui_bind` costs more than the bind address. `alloy_custom_args`
 emits `--server.http.listen-addr` only when the bind differs from Alloy's own
@@ -295,7 +324,7 @@ drops it, and Docker's own rules are in `FORWARD` and never see it.
 range, so `0.0.0.0` cannot be set by accident.
 
 **`tests/render-check.yml` must assert against rendered host_vars, not just
-defaults.** It loads both roles' `defaults/main.yml` with `vars_files`, so any
+defaults.** It loads both roles' defaults with `vars_files`, so any
 assertion naming one of those variables is checking the *default* — a host_vars
 file overriding it is invisible. That gap shipped a `prometheus.scrape
 "instance/traefik"` past green CI, which Alloy rejects outright. The per-host
@@ -308,6 +337,6 @@ interactive OIDC. Do not add credentials to the agent config expecting the
 server to check them; nothing does.
 
 `group_vars/all/vault.yml` holds only `vault_admin_password`, which must be a
-crypt hash — `user.yml` asserts this, because the `user` module writes the value
+crypt hash — `20_user.yml` asserts this, because the `user` module writes the value
 into `/etc/shadow` verbatim and a plaintext value leaves the account with no
 usable password.

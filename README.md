@@ -43,20 +43,31 @@ vps-deploy/
 │   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
-    ├── config/
-    │   ├── defaults/
-    │   │   └── main.yml              # All configurable variables
+    ├── baseline/                     # Everything every managed host gets
+    │   ├── defaults/main/            # Configurable variables, split by domain
+    │   │   ├── 00_identity.yml       # Hostname, admin user
+    │   │   ├── 10_ssh.yml
+    │   │   ├── 20_firewall.yml       # UFW, fail2ban
+    │   │   ├── 30_system.yml         # Unattended upgrades
+    │   │   ├── 40_docker.yml
+    │   │   └── 50_crowdsec.yml
     │   ├── handlers/
     │   │   └── main.yml              # Service restart handlers
+    │   ├── templates/                # Free-form file bodies (sshd, systemd, sysctl)
     │   └── tasks/
     │       ├── main.yml              # Task orchestration
-    │       ├── hostname.yml          # System hostname = inventory name
-    │       ├── user.yml              # Admin user + sudo setup
-    │       ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
-    │       ├── sysctl.yml            # Kernel parameter hardening
-    │       ├── software.yml          # Docker, NTP, auto-updates
-    │       ├── crowdsec.yml          # CrowdSec agent + firewall bouncer
-    │       └── crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
+    │       ├── 10_hostname.yml       # System hostname = inventory name
+    │       ├── 20_user.yml           # Admin user + sudo setup
+    │       ├── 30_packages.yml       # apt upgrade + base packages
+    │       ├── 40_firewall.yml       # UFW enable and allow rules
+    │       ├── 41_fail2ban.yml       # sshd jail
+    │       ├── 42_ssh.yml            # SSH hardening, port move, root lockdown
+    │       ├── 50_sysctl.yml         # Kernel parameter hardening
+    │       ├── 60_updates.yml        # Unattended upgrades + reboot window
+    │       ├── 61_time.yml           # Chrony NTP
+    │       ├── 62_docker.yml         # Docker engine and daemon config
+    │       ├── 70_crowdsec.yml       # CrowdSec agent + firewall bouncer
+    │       └── 71_crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
     └── alloy/
         ├── defaults/
         │   └── main.yml              # Pipelines, endpoints, bind addresses, version pin
@@ -270,7 +281,7 @@ new name; delete the leftovers on the master with `cscli machines delete` and
 
 ## Configuration
 
-Hardening, Docker and CrowdSec values live in `roles/config/defaults/main.yml`;
+Hardening, Docker and CrowdSec values live in `roles/baseline/defaults/main/`;
 Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 [below](#grafana-alloy-1).
 

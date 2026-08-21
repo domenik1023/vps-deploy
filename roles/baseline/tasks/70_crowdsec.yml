@@ -4,7 +4,7 @@
 # its ban decisions from there, so bans propagate across all machines.
 #
 # Credentials for that LAPI are minted on the LAPI server itself, by running
-# cscli there over delegation; see crowdsec_credentials.yml.
+# cscli there over delegation; see 71_crowdsec_credentials.yml.
 #
 # Uses the official CrowdSec packagecloud repository (distro packages are
 # outdated) with the signed-by keyring pattern, same as the Docker repo.
@@ -82,7 +82,7 @@
 
 - name: Provision LAPI credentials on the central LAPI server
   ansible.builtin.include_tasks:
-    file: crowdsec_credentials.yml
+    file: 71_crowdsec_credentials.yml
 
 - name: Point agent at the central LAPI server
   ansible.builtin.copy:

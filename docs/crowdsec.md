@@ -61,7 +61,7 @@ cannot serve that purpose, for two independent reasons:
   rule gets you a log line on a different path, with its own 3/min limit
   hardcoded in UFW's source and unaffected by loglevel.
 
-So `crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
+So `70_crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
 both `/etc/ufw/before.rules` and `/etc/ufw/before6.rules`:
 
 ```

@@ -103,7 +103,7 @@ head -3 /etc/alloy/config.alloy
 The toggles are not cosmetic. A host without Docker that still has the container
 blocks compiled in logs socket errors continuously and leaves both components
 permanently unhealthy — it does not fail loudly once. Every host this playbook
-manages gets Docker from `roles/config/tasks/software.yml`, so the default is on.
+manages gets Docker from `roles/baseline/tasks/62_docker.yml`, so the default is on.
 
 The `compose_service` label is deliberate: Tempo's `tracesToLogsV2` maps a span's
 `service.name` onto it, which is what makes the jump from a trace to that
@@ -344,7 +344,7 @@ alloy_otlp_extra_receivers:
 **2. UFW has to let that traffic in.** Container-to-gateway packets arrive on
 the bridge interface and traverse the host's `INPUT` chain — Docker's own rules
 live in `FORWARD` and never see them — so UFW's default-deny drops them. The
-rule belongs in `roles/config`, because `ufw reload` flushes the CrowdSec
+rule belongs in `roles/baseline`, because `ufw reload` flushes the CrowdSec
 bouncer's chains and only that role's handler puts them back:
 
 ```yaml
@@ -512,7 +512,7 @@ on. **No UFW rule is added by default**, which is a decision rather than an
 omission: nothing needs to reach them from outside, and touching UFW is not
 free. Adding a rule reloads UFW, `ufw reload` is a stop/start that deletes every
 non-builtin chain, and that takes the CrowdSec firewall bouncer's rules with it.
-The `Reload UFW` handler in `roles/config` notifies a bouncer restart for
+The `Reload UFW` handler in `roles/baseline` notifies a bouncer restart for
 exactly this reason — which is also why `ufw_allow_rules` lives in that role and
 not in `roles/alloy`, since handlers are only reachable from the role that
 defines them.
@@ -652,7 +652,7 @@ every 30 seconds, so it needs no restart.
 | `alloy` will not start | `journalctl -u alloy -n 100 --no-pager`. A config it cannot parse names the line; `/etc/alloy/config.alloy` is the rendered file, but fix `roles/alloy/templates/config.alloy.j2` and re-run rather than editing it in place. |
 | Config on disk is missing a whole pipeline | The block reached upstream's second templating pass holding a Jinja delimiter and was evaluated away. `tests/render-check.yml` asserts against this; run it. |
 | Config task reports `changed` on every run | The template output is not byte-stable. Look for an iterated mapping or anything time-derived; `alloy_extra_log_paths` is a list for this reason. |
-| A host's data is missing under `instance="<inventory name>"` | Its system hostname does not match. `instance` comes from the host's own name in all six pipelines, not from the inventory. Run `hostname` on the box and query without the filter — `{job="integrations/journal"}` — to see what label it is actually using. `hostname.yml` sets this; a host predating it, or with `system_hostname_manage: false`, keeps the old name. |
+| A host's data is missing under `instance="<inventory name>"` | Its system hostname does not match. `instance` comes from the host's own name in all six pipelines, not from the inventory. Run `hostname` on the box and query without the filter — `{job="integrations/journal"}` — to see what label it is actually using. `10_hostname.yml` sets this; a host predating it, or with `system_hostname_manage: false`, keeps the old name. |
 | Renamed a host and its graphs went flat | Expected: old series and log streams keep the previous `instance`, new ones arrive under the new name. Queries spanning the change need both. |
 | No metrics at all from a host, agent healthy | Endpoint resolution. `head -3 /etc/alloy/config.alloy` — an off-site host pointed at `ingest.net.d1023.de` cannot route there. Check the host is in the `vps` group. |
 | Container metrics missing, everything else fine | cAdvisor's cgroup access. `systemctl show alloy -p User` should say `root`; a host on the unprivileged path will not have it. |

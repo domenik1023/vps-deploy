@@ -18,7 +18,7 @@
 # Docker socket, so set this false on a host without Docker: the components
 # stay permanently unhealthy and Alloy logs socket errors continuously rather
 # than failing loudly once. Every host this playbook manages gets Docker from
-# roles/config/tasks/software.yml, so true is right by default here.
+# roles/baseline/tasks/software.yml, so true is right by default here.
 alloy_enable_docker: true
 
 # systemd journal. False on non-systemd hosts (Alpine, most NAS firmware).
@@ -183,7 +183,7 @@ alloy_access_log_formats:
 # A target on a Docker-published port must be published to loopback
 # ("127.0.0.1:8082:8082", not "8082:8082"). Docker's FORWARD jump precedes
 # UFW's, so a plainly published port is reachable from the internet whatever
-# the firewall says - see the same trap in roles/config/defaults/main.yml.
+# the firewall says - see the same trap in roles/baseline/defaults/main.yml.
 alloy_extra_scrape_targets: []
 
 # --- Tuning ---
@@ -229,7 +229,7 @@ alloy_profiles_bind: "127.0.0.1"
 #
 #   - a UFW rule. Traffic from a container to the bridge gateway arrives on the
 #     bridge interface and traverses the host's INPUT chain, where UFW's
-#     default-deny drops it. ufw_allow_rules in roles/config exists for this;
+#     default-deny drops it. ufw_allow_rules in roles/baseline exists for this;
 #     the rule has to live there rather than here, because `ufw reload` flushes
 #     the CrowdSec bouncer's chains and only that role's handler puts them back
 #   - a pinned subnet. A compose network's subnet is allocated dynamically, so

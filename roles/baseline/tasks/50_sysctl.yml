@@ -1,0 +1,16 @@
+# Kernel hardening via sysctl.
+# Parameters are written to a drop-in file and applied with sysctl --system.
+
+- name: Write kernel hardening sysctl config
+  ansible.builtin.template:
+    src: 99-hardening.conf.j2
+    dest: /etc/sysctl.d/99-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: sysctl_conf
+
+- name: Apply sysctl settings
+  ansible.builtin.command: sysctl --system
+  when: sysctl_conf.changed
+  changed_when: true
