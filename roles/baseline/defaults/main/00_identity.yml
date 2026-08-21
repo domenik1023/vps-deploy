@@ -59,3 +59,26 @@ admin_user: domenik1023
 # admin_password must be defined in group_vars/all/vault.yml (ansible-vault encrypted)
 # Set it as: vault_admin_password: "<sha512-crypt hash>"
 admin_password: "{{ vault_admin_password }}"
+
+# Public keys installed for the admin user, one string per key.
+#
+# This is not a convenience. 42_ssh.yml sets PasswordAuthentication no, limits
+# AllowUsers to this account and locks root - so a host where this account has
+# no authorized key is unreachable the moment that runs, and the only way back
+# is the provider's serial console. 20_user.yml therefore installs these before
+# any of that happens, and refuses to continue if the account would be left
+# with no key at all.
+#
+# Public keys only. They are not secrets and belong in the repository, where
+# adding a machine is one line rather than a manual copy onto every host.
+admin_ssh_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMQ7AbgzffGjNjVwfizz0RbZ8+/uR78cxQ+AihEVi0Y6 domenik1023@(^_^)"
+
+# Whether the keys above are the *only* ones the admin user may log in with.
+#
+# False by default, and deliberately: a provider image sometimes seeds the
+# account from cloud-init, and removing that key on the same run that disables
+# password authentication removes the way back in if the list here turns out to
+# be wrong. Turn it on once a host is known good, to make the list declarative
+# and revoke anything that arrived some other way.
+admin_ssh_keys_exclusive: false

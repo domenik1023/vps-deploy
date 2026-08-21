@@ -81,7 +81,7 @@ need these four, whatever the UDM called them:
 | the DNS server for the tunnel | `wg_dns` (a list) |
 | the **server's** public key | `wg_peer_public_key` |
 | the server's host:port | `wg_peer_endpoint` |
-| the preshared key, if there is one | `wg_preshared_key` (vault) |
+| the preshared key, if there is one | `wg_preshared_key` |
 
 `wg_peer_public_key` is the trap worth naming: it is the *server's* key, not
 this host's. Putting the host's own public key there produces a tunnel that
@@ -93,7 +93,8 @@ Add it as `wg_private_key`, from the client config's `[Interface] PrivateKey`.
 
 #### B: the UDM wants a public key from you
 
-You have a server public key and a preshared key and nothing else. Set:
+You have the server's public key, possibly a preshared key, and nothing else.
+Set:
 
 ```yaml
 wg_generate_key: true
@@ -123,16 +124,44 @@ makes the kill switch a lie — traffic outside the range would have no tunnel t
 take and would be dropped rather than routed, which looks exactly like a broken
 tunnel.
 
-Encrypt whichever secrets you have in place, rather than putting them in
-`group_vars/all/vault.yml`, so each host carries its own:
+#### The preshared key
+
+Optional to *this playbook*: leave `wg_preshared_key` out and the `PresharedKey`
+line is simply not rendered. It is **not** optional to the server — if the UDM
+issued one for this client, the tunnel comes up and never handshakes without
+it. Either supply it here or remove it on the UDM side; there is no third
+option that works.
+
+Under flow B that is the only secret in the file, since the private key is
+generated on the host and never leaves it.
+
+#### Vaulting, or not
+
+Encrypting a secret in place keeps it out of the repository in readable form:
 
 ```bash
 ansible-vault encrypt_string --name wg_preshared_key 'w1Rr…'
 ansible-vault encrypt_string --name wg_private_key   'qK5m…'   # flow A only
 ```
 
-and paste what each prints into the host_vars file. Under flow B there is no
-private key to encrypt: it is generated on the host and never leaves it.
+and paste what each prints into the host_vars file. Prefer per-host
+`encrypt_string` over `group_vars/all/vault.yml`, so each host carries its own.
+
+Writing them in plain text works and is a legitimate call for a private
+repository — but it is worth being clear about what it costs, because the
+tradeoff is not "safe versus convenient":
+
+- A secret committed in plain text is in the git history permanently. Removing
+  it later means rewriting history, and any copy already pushed elsewhere
+  (a fork, a mirror, a CI cache, GitHub's own unreachable-object store) keeps
+  it regardless.
+- Migrating the repository to a self-hosted forge moves the *future*, not the
+  past. The old remote keeps what it already has.
+- Rotating a leaked preshared key means editing the client on the UDM and
+  re-running; rotating a leaked private key means re-registering the peer.
+
+So it is a reasonable choice for a key you are willing to rotate, and a poor
+one for a key you are not. Nothing in the playbook enforces either way.
 
 Prefer a bare IP address in `wg_peer_endpoint` if the home connection has a
 static one. A DNS name has to be resolved before the tunnel can come up, which

@@ -324,6 +324,34 @@
           privsep: "{{ ssh_tasks.index(n_privsep) if n_privsep in ssh_tasks else -1 }}"
           validate: "{{ ssh_tasks.index(n_validate) if n_validate in ssh_tasks else -1 }}"
 
+    # These are installed for the account that 42_ssh.yml then makes the only
+    # one allowed to log in, with passwords off and root locked. An entry that
+    # is not a usable public key is not a typo, it is a host reachable only
+    # from the provider's serial console.
+    #
+    # The private-key check is the one worth having: pasting the wrong half of
+    # a keypair here publishes it to every host in the fleet and to the
+    # repository, and the file would still look plausible at a glance.
+    - name: Admin SSH keys must be public keys, and nothing else
+      ansible.builtin.assert:
+        that:
+          - admin_ssh_keys is sequence
+          - admin_ssh_keys is not string
+          - admin_ssh_keys is not mapping
+          - admin_ssh_keys | reject('match', pubkey_form) | list | length == 0
+          - admin_ssh_keys | select('search', 'PRIVATE KEY') | list | length == 0
+          - admin_ssh_keys_exclusive is boolean
+        fail_msg: >-
+          admin_ssh_keys must hold OpenSSH public keys - "<type> <base64>
+          [comment]".
+          {{ admin_ssh_keys | reject('match', pubkey_form) | list | join(', ')
+             | default('An entry looks like a PRIVATE key.', true) }}
+        success_msg: >-
+          {{ admin_ssh_keys | length }} admin public key(s),
+          exclusive={{ admin_ssh_keys_exclusive }}
+      vars:
+        pubkey_form: '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( .*)?$'
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with

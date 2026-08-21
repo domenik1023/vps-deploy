@@ -38,8 +38,10 @@ wg_peer_endpoint: "vpn.example.com:51820"
 #
 #   ansible-vault encrypt_string --name wg_preshared_key '<PresharedKey>'
 #
-# and paste what it prints. wg_preshared_key can be left out if the server does
-# not use one.
+# and paste what it prints. Leave wg_preshared_key out if the server does not
+# use one - but if it does, omitting it gives a tunnel that comes up and never
+# handshakes. Plain text here works too; see "Vaulting, or not" in
+# docs/wireguard.md for what that costs.
 #
 # wg_preshared_key: !vault |
 #           $ANSIBLE_VAULT;1.1;AES256

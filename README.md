@@ -90,8 +90,8 @@ vps-deploy/
 
 1. Target host is running Ubuntu (tested on 22.04/24.04/26.04)
 2. SSH access as root (or a user with sudo) is available on port 22 for the initial run
-3. Your public key is present in `~/.ssh/domenik1023.pub` (or adjust the private key path below), **and is already in `~/.ssh/authorized_keys` for the admin user on the target** — the playbook does not install it. See the warning under [Usage](#usage).
-   A host that needs a different key for its first run sets `ansible_ssh_private_key_file` in its host_vars; see [Inventory and Host Variables](#inventory-and-host-variables).
+3. Your public key is listed in `admin_ssh_keys` (`roles/baseline/defaults/main/00_identity.yml`). The playbook installs it for the admin user before it hardens SSH, and refuses to continue if that would leave the account with no key at all.
+   A host that needs a *different* key for its first run sets `ansible_ssh_private_key_file` in its host_vars; see [Inventory and Host Variables](#inventory-and-host-variables).
 4. Python 3 is installed on the target host
 5. Ansible collections installed locally:
    ```bash
@@ -341,6 +341,8 @@ Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 | `ssh_hardening_manage` | `vps` and `vpn` | Whether sshd moves to `ssh_port` and port 22 is denied |
 | `crowdsec_manage` | `vps` and `vpn` | Whether the CrowdSec agent, bouncer and their iptables LOG rules are installed |
 | `wireguard_manage` | `vpn` only | Whether the tunnel and kill switch are built |
+| `admin_ssh_keys` | one key | Public keys installed for the admin user, before `42_ssh.yml` disables password authentication. `20_user.yml` refuses to continue if this is empty and the account has no `authorized_keys` |
+| `admin_ssh_keys_exclusive` | `false` | Whether those are the *only* keys the admin user may use. Off so a cloud-init-seeded key is not removed on the same run that turns off passwords |
 | `system_hostname` | `{{ inventory_hostname }}` | System hostname to set. Alloy's `instance` label comes from it, so a mismatch with the inventory name hides that host's telemetry |
 | `system_hostname_manage` | `true` | Set `false` to leave the host's own name alone |
 | `system_hostname_pattern` | RFC 1123 regex | Validates the name before it is written; underscores are legal in an inventory name but not in a hostname |
@@ -413,12 +415,12 @@ each pipeline actually collects.
 
 ## Usage
 
-> **The playbook does not install your public key.** `42_ssh.yml` sets
-> `PasswordAuthentication no` and `AllowUsers <admin_user>`, then locks the root
-> account — so if `~<admin_user>/.ssh/authorized_keys` is not already in place
-> when that runs, the host becomes unreachable and the fix is the provider's
-> serial console. Put the key there first, by hand or through cloud-init, and
-> confirm you can `ssh <admin_user>@<host>` before the first run.
+> `42_ssh.yml` sets `PasswordAuthentication no` and `AllowUsers <admin_user>`,
+> then locks the root account. `20_user.yml` installs `admin_ssh_keys` for that
+> account first, and asserts the account will not be left without a key — so a
+> host whose key list is empty *and* whose `authorized_keys` is missing fails
+> the run there rather than becoming a serial-console job. Keep your key in
+> that list.
 
 ### Initial run (port 22, root or sudo user)
 

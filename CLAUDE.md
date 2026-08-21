@@ -434,6 +434,18 @@ host-settable variables belong there.
 interactive OIDC. Do not add credentials to the agent config expecting the
 server to check them; nothing does.
 
+**The admin user's public keys are installed by `20_user.yml`, before
+`42_ssh.yml` can lock the door.** `admin_ssh_keys` is a list of public keys in
+`defaults/main/00_identity.yml` — public, so they live in the repository rather
+than being copied onto each host by hand. The task after it asserts the account
+will not be left without a key, because `42_ssh.yml` turns off password
+authentication, restricts `AllowUsers` to that account and locks root: a host
+that reaches it with an empty `authorized_keys` is a serial-console job. The
+assert is written as "keys to install, or keys already there" so that `--check`
+against a fresh host does not fail on a key the run would have installed.
+`admin_ssh_keys_exclusive` is off so a cloud-init-seeded key is not revoked on
+the same run that disables passwords.
+
 `group_vars/all/vault.yml` holds only `vault_admin_password`, which must be a
 crypt hash — `20_user.yml` asserts this, because the `user` module writes the value
 into `/etc/shadow` verbatim and a plaintext value leaves the account with no
