@@ -290,6 +290,18 @@ sudo wg-quick up wg0
 That last sequence is worth doing once on a new host. Fail-closed that has
 never been tested is a hope, not a property.
 
+Most of it can be checked without a host at all:
+
+```bash
+tests/killswitch-netns.sh
+```
+
+builds a public interface, a stand-in tunnel and the two `ip rule` entries
+wg-quick installs, runs the real rendered script against them, and asks the
+kernel where a marked reply and an unmarked packet would each go. It runs
+entirely inside `unshare -rn`, so it cannot touch your own routing, and it
+skips itself where namespaces are unavailable.
+
 ## If it goes wrong
 
 The play arms a rollback before it moves anything and cancels it only after the

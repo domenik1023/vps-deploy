@@ -79,6 +79,22 @@ has_chain() {
     "$1" -t "$2" -L "$3" -n >/dev/null 2>&1
 }
 
+# Whether this address family can be configured at all.
+#
+# A host with IPv6 turned off has no ip6tables tables and no `ip -6 rule`, and
+# every v6 command below fails. Without this check the first of them aborts the
+# script under `set -e` - half way through, after the v4 rules are in but
+# before the v6 filter chain exists - and the unit lands in `failed` with the
+# host protected on one family and not the other. Check once, and skip the
+# family cleanly instead.
+family_usable() {
+    local ipt=$1 fam=$2
+    [ "$fam" = 4 ] && return 0
+    [ -e /proc/net/if_inet6 ] || return 1
+    "$ipt" -t mangle -L -n >/dev/null 2>&1 || return 1
+    ip -6 rule show >/dev/null 2>&1 || return 1
+}
+
 build() {
     local ipt=$1 fam=$2
 
@@ -180,14 +196,24 @@ teardown() {
     while ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null; do :; done
 }
 
+# Within build() the final DROP is the last rule added, so a build that dies
+# part way leaves a chain that has not started dropping anything yet. That is
+# the right direction to fail in for the run that installs it: an incomplete
+# kill switch leaks, a half-built one that dropped first would take SSH with it.
 case "${1:-}" in
     on)
         build iptables 4
-        build ip6tables 6
+        if family_usable ip6tables 6; then
+            build ip6tables 6
+        else
+            echo "wg-killswitch: IPv6 unavailable on this host, skipping v6 rules" >&2
+        fi
         ;;
     off)
         teardown iptables 4
-        teardown ip6tables 6
+        if family_usable ip6tables 6; then
+            teardown ip6tables 6
+        fi
         ;;
     *)
         echo "usage: $(basename "$0") on|off" >&2

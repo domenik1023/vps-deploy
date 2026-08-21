@@ -17,6 +17,7 @@ ansible-galaxy collection install -r requirements.yml   # community.general, ans
 ansible-playbook main.yml -i inventory --syntax-check
 ansible-lint
 ansible-playbook tests/render-check.yml   # variable shapes + design invariants
+tests/killswitch-netns.sh                # the WireGuard kill switch, against a real kernel
 
 ansible-playbook main.yml -i inventory --list-hosts      # confirm targeting after inventory/group changes
 ansible-inventory -i inventory --host <name>             # resolved vars for one host
