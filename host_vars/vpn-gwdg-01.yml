@@ -17,7 +17,7 @@
 # - and keep using the public address, not the tunnel address: the tunnel is
 # built by the run, so on a bootstrap run it does not exist yet.
 ansible_host: 141.5.110.173
-ansible_port: 22
+ansible_port: 22822
 ansible_user: cloud
 
 # --- The tunnel ---
@@ -32,7 +32,7 @@ wg_dns:
 # From the [Peer] block. wg_peer_endpoint is host:port; prefer a bare IP if the
 # home connection has a static one, because a DNS name has to be resolved
 # before the tunnel can come up - see wg_killswitch_allow_dns.
-wg_peer_public_key: "I66qViXn+tEYFZRA6CH5J9J14o7cB16NyUGacUFIyHE="
+wg_peer_public_key: "0m52/pe7dvjc7FDkiabx6sEnQp9assLdZxWO1gRGcWI="
 wg_peer_endpoint: "vpn6u.d1023.de:51820"
 
 # Secrets. Never in plain text here - encrypt each one in place:
