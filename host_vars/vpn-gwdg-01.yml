@@ -1,0 +1,55 @@
+# Template for a [vpn] host. Copy to host_vars/<name>.yml, fill in from the
+# client config the UniFi WireGuard server generated, and add <name> to [vpn]
+# in the inventory. See docs/wireguard.md for the UDM side and for what to
+# check before the first run.
+#
+# The .example suffix keeps this file out of both Ansible's host_vars loading
+# and the per-host loop in tests/render-check.yml.
+
+# The key this host accepts. Only needed when it differs from the one the rest
+# of the fleet uses - a provider that injects its own key for the first boot,
+# say. It overrides --private-key on the command line, so the usual invocation
+# keeps working for every other host.
+# ansible_ssh_private_key_file: ~/.ssh/provider-bootstrap
+
+# Reach it on the public address for the first run. The hardening tasks move
+# sshd to ssh_port and then deny ssh_old_port, so set this to 22822 afterwards
+# - and keep using the public address, not the tunnel address: the tunnel is
+# built by the run, so on a bootstrap run it does not exist yet.
+ansible_host: 
+ansible_port: 22
+
+# --- The tunnel ---
+# Straight out of the [Interface] block of the generated client config.
+wg_address: 192.168.9.20/32
+
+# The LAN resolver, so that ingest.net.d1023.de (see group_vars/vpn.yml) and
+# anything else internal resolves once the tunnel is up.
+wg_dns:
+  - 192.168.2.5
+
+# From the [Peer] block. wg_peer_endpoint is host:port; prefer a bare IP if the
+# home connection has a static one, because a DNS name has to be resolved
+# before the tunnel can come up - see wg_killswitch_allow_dns.
+wg_peer_public_key: "I66qViXn+tEYFZRA6CH5J9J14o7cB16NyUGacUFIyHE="
+wg_peer_endpoint: "vpn6u.d1023.de:51820"
+
+# Secrets. Never in plain text here - encrypt each one in place:
+#
+#   ansible-vault encrypt_string --name wg_private_key '<PrivateKey>'
+#   ansible-vault encrypt_string --name wg_preshared_key '<PresharedKey>'
+#
+# and paste what it prints. Both come from the generated client config;
+# wg_preshared_key can be left out if the server does not use one.
+#
+# wg_private_key: !vault |
+#           $ANSIBLE_VAULT;1.1;AES256
+#           ...
+# wg_preshared_key: !vault |
+#           $ANSIBLE_VAULT;1.1;AES256
+#           ...
+
+# Only if the VPS reaches the internet through provider NAT, so its public
+# address is not on any local interface and cannot be matched against
+# ansible_host. `ip -4 addr` on the host names the right one.
+# wg_wan_interface: ens3
