@@ -287,6 +287,43 @@
           {{ baseline_handlers | selectattr('name', 'in', ufw_notifies)
              | rejectattr('when', 'defined') | map(attribute='name') | list }}
 
+    # Three tasks in 42_ssh.yml's hardening block have to stay in this order,
+    # and the failure is the same each time: the run stops half way through
+    # hardening, with the drop-ins written and sshd not restarted.
+    #
+    #   mask the socket   so sshd binds the port itself rather than being
+    #                     spawned per connection
+    #   create /run/sshd  because masking the socket lets systemd remove the
+    #                     RuntimeDirectory, and `sshd -t` will not run without
+    #                     it - "Missing privilege separation directory"
+    #   validate          before anything restarts sshd on the new config
+    - name: Sshd validation must follow its privsep directory and the socket mask
+      ansible.builtin.assert:
+        that:
+          - at.socket >= 0
+          - at.privsep > at.socket
+          - at.validate > at.privsep
+        fail_msg: >-
+          42_ssh.yml runs these in the order socket={{ at.socket }},
+          privsep={{ at.privsep }}, validate={{ at.validate }} (-1 is missing).
+          `sshd -t` needs /run/sshd, and masking ssh.socket is what lets systemd
+          take that directory away - so the three have to run in that order, or
+          the run stops with the drop-ins written and sshd never restarted.
+        success_msg: "42_ssh.yml masks the socket, creates /run/sshd, then validates"
+      vars:
+        ssh_tasks: >-
+          {{ (lookup('ansible.builtin.file', ssh_file)
+              | from_yaml | selectattr('block', 'defined') | first).block
+             | map(attribute='name') | list }}
+        ssh_file: ../roles/baseline/tasks/42_ssh.yml
+        n_socket: Disable and mask ssh.socket
+        n_privsep: Ensure the sshd privilege separation directory exists
+        n_validate: Validate sshd config
+        at:
+          socket: "{{ ssh_tasks.index(n_socket) if n_socket in ssh_tasks else -1 }}"
+          privsep: "{{ ssh_tasks.index(n_privsep) if n_privsep in ssh_tasks else -1 }}"
+          validate: "{{ ssh_tasks.index(n_validate) if n_validate in ssh_tasks else -1 }}"
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with

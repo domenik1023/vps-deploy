@@ -39,6 +39,28 @@
         daemon_reload: true
       failed_when: false  # ok if the unit doesn't exist
 
+    # `sshd -t` refuses to run without its privilege separation directory, and
+    # that directory is a systemd RuntimeDirectory: it lives on tmpfs, systemd
+    # creates it when the unit starts and removes it when the unit stops.
+    #
+    # On a host using socket activation - Ubuntu's default since 22.10 - the
+    # running sshd is a per-connection `ssh@N.service` instance and
+    # `ssh.service` itself may never have started. The task above has just
+    # stopped and masked the socket that was standing in for it, so nothing
+    # holds /run/sshd any more and the validation fails with "Missing privilege
+    # separation directory: /run/sshd" on a config that is perfectly valid.
+    #
+    # Creating it by hand costs nothing: systemd recreates and reclaims it on
+    # the next start. It has to happen after the socket is masked, or the
+    # instance shutting down takes the directory with it again.
+    - name: Ensure the sshd privilege separation directory exists
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
     - name: Validate sshd config
       ansible.builtin.command: sshd -t
       changed_when: false
