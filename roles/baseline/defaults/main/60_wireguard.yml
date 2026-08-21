@@ -5,9 +5,10 @@
 # host's internet with it rather than quietly falling back to the VPS's own
 # public address.
 #
-# The per-host half - address, keys, endpoint - comes out of the client config
-# the UniFi WireGuard server generates. See docs/wireguard.md; there is no API
-# to automate that side.
+# The per-host half - address, keys, endpoint - comes from the client you create
+# on the WireGuard server. See docs/wireguard.md; there is no API to automate
+# that side, and which half of the keypair you have to move depends on the
+# server's version - see wg_generate_key below.
 
 wg_interface: wg0
 
@@ -38,10 +39,19 @@ wg_mtu: 1420
 # through provider NAT, where the public address is not on any local interface.
 wg_wan_interface: ""
 
-# Generate the private key on the host instead of taking wg_private_key from
-# the vault, and print the public key to paste into the server. Only useful if
-# your UniFi version lets you enter a client public key; the versions that
-# generate the keypair for you leave nothing for this to do.
+# Generate the keypair on the host instead of taking wg_private_key from the
+# vault, and print the public half to register on the server.
+#
+# Which one you want depends on the server, and UniFi versions differ: some
+# generate the client keypair and hand back a finished config, others give you
+# only the server's public key and a preshared key and expect a client public
+# key back. This is for the second, and it is the better shape - the private
+# key is generated on the host that uses it and never travels.
+#
+# The run that mints the key stops right after printing it, because the server
+# cannot know it yet and everything below would fail at the handshake check
+# after moving the default route. Register the key, run again, and the second
+# pass continues with the same key - `wg genkey` is guarded by `creates:`.
 wg_generate_key: false
 
 # --- Kill switch ---

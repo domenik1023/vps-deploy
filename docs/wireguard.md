@@ -25,10 +25,21 @@ and refuses to finish until the tunnel has actually handshaked.
 It does **not** create the peer on the UniFi side. UniFi Network's WireGuard
 VPN server has no supported API for client management — only the controller's
 private REST endpoints, which need a local account, CSRF handling, and change
-shape between Network releases. It also generates the client keypair itself and
-hands back a finished config, so there is nothing for the host to publish
-upward even if there were an API to publish it to. Create the client in the UDM
-UI and transcribe its config; the steps below are that transcription.
+shape between Network releases. Create the client in the UDM UI; the steps
+below carry its details into the inventory.
+
+**Which half of the keypair you have to move depends on your UniFi version**,
+and they differ:
+
+- Some hand you a **finished client config**, private key included. Transcribe
+  it — [flow A](#a-the-udm-gave-you-a-private-key).
+- Others give you only the **server's public key and a preshared key**, and
+  expect a client public key back. Then the host generates its own keypair and
+  you paste the public half into the UDM —
+  [flow B](#b-the-udm-wants-a-public-key-from-you).
+
+Flow B is the ordinary WireGuard model and the better one: the private key is
+generated on the host that uses it and never travels.
 
 ## Setting one up
 
@@ -61,17 +72,50 @@ like a broken tunnel rather than a misconfigured one:
 
 ### 2. Write the host_vars file
 
-Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml` and fill it
-in from the config above. The mapping is direct:
+Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`. Both flows
+need these four, whatever the UDM called them:
 
-| client config | host_vars |
+| what the UDM shows | host_vars |
 | --- | --- |
-| `[Interface] Address` | `wg_address` |
-| `[Interface] PrivateKey` | `wg_private_key` (vault) |
-| `[Interface] DNS` | `wg_dns` (a list) |
-| `[Peer] PublicKey` | `wg_peer_public_key` |
-| `[Peer] PresharedKey` | `wg_preshared_key` (vault) |
-| `[Peer] Endpoint` | `wg_peer_endpoint` |
+| the client's tunnel address | `wg_address` |
+| the DNS server for the tunnel | `wg_dns` (a list) |
+| the **server's** public key | `wg_peer_public_key` |
+| the server's host:port | `wg_peer_endpoint` |
+| the preshared key, if there is one | `wg_preshared_key` (vault) |
+
+`wg_peer_public_key` is the trap worth naming: it is the *server's* key, not
+this host's. Putting the host's own public key there produces a tunnel that
+comes up and never handshakes.
+
+#### A: the UDM gave you a private key
+
+Add it as `wg_private_key`, from the client config's `[Interface] PrivateKey`.
+
+#### B: the UDM wants a public key from you
+
+You have a server public key and a preshared key and nothing else. Set:
+
+```yaml
+wg_generate_key: true
+```
+
+and leave `wg_private_key` out. The first run generates a keypair on the host,
+prints the public half, and **stops before touching routing**:
+
+```
+TASK [Stop so the new public key can be registered on the server]
+fatal: [vpn-gwdg-01]: FAILED! => Generated a new WireGuard key for
+vpn-gwdg-01. Add it to the WireGuard server as a client, with public key
+kR9v… and allowed address 192.168.9.20/32, then run this play again.
+```
+
+Paste that public key into the UDM as the client, with this host's tunnel
+address as its allowed address, then run again. The second run finds the key
+already there — `wg genkey` is guarded by `creates:`, so re-running never
+rotates a key the server has learned — and carries on to build the tunnel.
+
+Nothing but the key file is written on that first pass. The tunnel is not
+brought up, the default route does not move, and no rollback is armed.
 
 `AllowedIPs` is not transcribed: it comes from `wg_allowed_ips`, which is
 `0.0.0.0/0` for every `[vpn]` host and should stay that way. Anything narrower
@@ -79,15 +123,16 @@ makes the kill switch a lie — traffic outside the range would have no tunnel t
 take and would be dropped rather than routed, which looks exactly like a broken
 tunnel.
 
-Encrypt the two secrets in place rather than putting them in
+Encrypt whichever secrets you have in place, rather than putting them in
 `group_vars/all/vault.yml`, so each host carries its own:
 
 ```bash
-ansible-vault encrypt_string --name wg_private_key   'qK5m…'
 ansible-vault encrypt_string --name wg_preshared_key 'w1Rr…'
+ansible-vault encrypt_string --name wg_private_key   'qK5m…'   # flow A only
 ```
 
-and paste what each prints into the host_vars file.
+and paste what each prints into the host_vars file. Under flow B there is no
+private key to encrypt: it is generated on the host and never leaves it.
 
 Prefer a bare IP address in `wg_peer_endpoint` if the home connection has a
 static one. A DNS name has to be resolved before the tunnel can come up, which

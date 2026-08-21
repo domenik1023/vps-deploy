@@ -90,13 +90,18 @@
     group: root
     mode: "0700"
 
-# Only for a server that accepts a client public key. The UniFi WireGuard
-# server generates the keypair itself and hands back a finished config, which
-# leaves this with nothing to do - hence off by default.
+# The keypair never leaves the host. Which half of the exchange you are on
+# depends on the server: some UniFi versions generate the client keypair and
+# hand back a finished config, in which case wg_private_key comes from that and
+# this does nothing; others give you only the server's public key and a
+# preshared key, and expect a client public key back - which is what this is
+# for. `creates:` makes it a one-off, so re-running never rotates a key that
+# the server already knows.
 - name: Generate a private key on the host
   ansible.builtin.shell:
     cmd: umask 077 && wg genkey > /etc/wireguard/privatekey
     creates: /etc/wireguard/privatekey
+  register: wg_key_generated
   when: wg_key_on_host
 
 - name: Read the generated private key back
@@ -129,9 +134,30 @@
   ansible.builtin.debug:
     msg: >-
       {{ inventory_hostname }}'s WireGuard public key is {{ wg_pubkey.stdout }}
-      - register it on the server as a client, or the handshake check below
-      will fail.
   when: wg_key_on_host
+
+# Stop on the run that minted the key, before anything touches routing.
+#
+# The key is new, so the server cannot know it yet, and every task below would
+# run to the handshake check and fail there - after moving the default route
+# and arming a rollback, for a reason that has nothing to do with either. Fail
+# here instead, where the only thing that has happened is a key file being
+# written, and say what to do with it.
+#
+# Only on the run that generated it: `creates:` means the next run reports no
+# change and carries straight on.
+- name: Stop so the new public key can be registered on the server
+  ansible.builtin.fail:
+    msg: >-
+      Generated a new WireGuard key for {{ inventory_hostname }}. Add it to the
+      WireGuard server as a client, with public key
+      {{ wg_pubkey.stdout }}
+      and allowed address {{ wg_address }}, then run this play again. Nothing
+      has been changed on the host beyond writing the key, and the tunnel has
+      not been brought up - a re-run picks up the same key and continues.
+  when:
+    - wg_key_on_host
+    - wg_key_generated.changed | default(false)
 
 - name: Write the WireGuard interface configuration
   ansible.builtin.template:

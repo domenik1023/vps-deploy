@@ -54,3 +54,9 @@ wg_peer_endpoint: "vpn6u.d1023.de:51820"
 # address is not on any local interface and cannot be matched against
 # ansible_host. `ip -4 addr` on the host names the right one.
 # wg_wan_interface: ens3
+
+# The UDM gave a server public key and a preshared key, and no client private
+# key - so this host makes its own. The first run prints the public half and
+# stops before touching routing; register that on the UDM as this client, with
+# allowed address 192.168.9.20/32, and run again. See docs/wireguard.md.
+wg_generate_key: true
