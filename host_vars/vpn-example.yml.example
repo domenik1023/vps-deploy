@@ -6,6 +6,12 @@
 # The .example suffix keeps this file out of both Ansible's host_vars loading
 # and the per-host loop in tests/render-check.yml.
 
+# The key this host accepts. Only needed when it differs from the one the rest
+# of the fleet uses - a provider that injects its own key for the first boot,
+# say. It overrides --private-key on the command line, so the usual invocation
+# keeps working for every other host.
+# ansible_ssh_private_key_file: ~/.ssh/provider-bootstrap
+
 # Reach it on the public address for the first run. The hardening tasks move
 # sshd to ssh_port and then deny ssh_old_port, so set this to 22822 afterwards
 # - and keep using the public address, not the tunnel address: the tunnel is

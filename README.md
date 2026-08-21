@@ -90,7 +90,8 @@ vps-deploy/
 
 1. Target host is running Ubuntu (tested on 22.04/24.04/26.04)
 2. SSH access as root (or a user with sudo) is available on port 22 for the initial run
-3. Your public key is present in `~/.ssh/domenik1023.pub` (or adjust the private key path below)
+3. Your public key is present in `~/.ssh/domenik1023.pub` (or adjust the private key path below), **and is already in `~/.ssh/authorized_keys` for the admin user on the target** — the playbook does not install it. See the warning under [Usage](#usage).
+   A host that needs a different key for its first run sets `ansible_ssh_private_key_file` in its host_vars; see [Inventory and Host Variables](#inventory-and-host-variables).
 4. Python 3 is installed on the target host
 5. Ansible collections installed locally:
    ```bash
@@ -296,6 +297,25 @@ ansible_host: 203.0.113.10
 ansible_port: 22          # 22822 once hardening has run
 ```
 
+### A different SSH key for one host
+
+Some providers hand you a box that only accepts a key of their choosing, so the
+key for the first run is not the one every other host uses. Put it in that
+host's host_vars rather than reaching for `ssh-agent` or a second command line:
+
+```yaml
+# host_vars/<name>.yml
+ansible_ssh_private_key_file: ~/.ssh/hetzner-bootstrap
+```
+
+This **overrides** `--private-key` on the command line, so the usual invocation
+keeps working unchanged for every other host — verified with `-vvv`, which
+prints the `IdentityFile` each connection actually offers.
+
+It sits next to `ansible_port` for the same reason and behaves the same way:
+both describe how to reach this host *right now*, and both are edited once the
+first run has changed it.
+
 Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
 derive from `inventory_hostname`, so the name is what the host registers as on
 the central LAPI — `vps-docker` and `vps-docker-firewall-bouncer` rather than
@@ -393,6 +413,13 @@ each pipeline actually collects.
 
 ## Usage
 
+> **The playbook does not install your public key.** `42_ssh.yml` sets
+> `PasswordAuthentication no` and `AllowUsers <admin_user>`, then locks the root
+> account — so if `~<admin_user>/.ssh/authorized_keys` is not already in place
+> when that runs, the host becomes unreachable and the fix is the provider's
+> serial console. Put the key there first, by hand or through cloud-init, and
+> confirm you can `ssh <admin_user>@<host>` before the first run.
+
 ### Initial run (port 22, root or sudo user)
 
 ```bash
@@ -401,6 +428,10 @@ ansible-playbook main.yml -i inventory \
   --ask-vault-pass \
   -u root
 ```
+
+Drop `--private-key` for a host that sets `ansible_ssh_private_key_file` in its
+host_vars — that setting wins either way, but leaving both in place makes it
+look as though the command line is what decides.
 
 ### Subsequent runs (custom port, admin user)
 
