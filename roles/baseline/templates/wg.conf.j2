@@ -8,7 +8,7 @@
 # see wg_killswitch_mark in defaults/main/60_wireguard.yml.
 [Interface]
 Address = {{ wg_address }}
-PrivateKey = {{ wg_private_key }}
+PrivateKey = {{ wg_private_key_resolved }}
 MTU = {{ wg_mtu }}
 {% if wg_dns | default([]) | length > 0 %}
 DNS = {{ wg_dns | join(', ') }}

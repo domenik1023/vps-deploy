@@ -436,6 +436,44 @@
         # for task.ansible.builtin.command, find nothing, and pass.
         route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
 
+    # wg.conf.j2 must read the private key from wg_private_key_resolved, the
+    # fact 80_wireguard.yml settles on - never from wg_private_key, which is
+    # the *input* and is simply absent whenever the host generates its own key.
+    #
+    # That is not hypothetical: the template kept saying wg_private_key after
+    # the fact was introduced, and the run died at "'wg_private_key' is
+    # undefined" - with the message censored, because the task carries
+    # no_log for the obvious reason.
+    #
+    # Rendering with only the generated-key variables is the test. A template
+    # that reaches for wg_private_key raises here, exactly as it did on the
+    # host, rather than being read for and found in a comment.
+    - name: The tunnel config must take its key from the resolved fact
+      ansible.builtin.assert:
+        that:
+          - rendered is search('PrivateKey = ' ~ probe_key)
+          - rendered is search('Address = 10.0.2.11/32')
+          - rendered is search('PublicKey = SERVERKEY=')
+          # No preshared key given, so the line must not appear at all - an
+          # empty PresharedKey is a config wg-quick refuses to load.
+          - rendered is not search('PresharedKey')
+        fail_msg: "wg.conf.j2 rendered:\n{{ rendered }}"
+        success_msg: "wg.conf.j2 renders from wg_private_key_resolved alone"
+      vars:
+        probe_key: GENERATEDONHOST=
+        # Deliberately no wg_private_key: this is what a host that generated
+        # its own key actually has.
+        wg_conf_vars:
+          wg_private_key_resolved: GENERATEDONHOST=
+          wg_address: 10.0.2.11/32
+          wg_peer_public_key: SERVERKEY=
+          wg_peer_endpoint: vpn.example.com:51820
+          wg_dns: []
+        rendered: >-
+          {{ lookup('ansible.builtin.template',
+                    '../roles/baseline/templates/wg.conf.j2',
+                    template_vars=wg_conf_vars) }}
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with
