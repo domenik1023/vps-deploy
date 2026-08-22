@@ -32,7 +32,7 @@ wg_dns:
 # From the [Peer] block. wg_peer_endpoint is host:port; prefer a bare IP if the
 # home connection has a static one, because a DNS name has to be resolved
 # before the tunnel can come up - see wg_killswitch_allow_dns.
-wg_peer_public_key: "0m52/pe7dvjc7FDkiabx6sEnQp9assLdZxWO1gRGcWI="
+wg_peer_public_key: "/3GNmKDErrDabpvSzk+j2w7LcZFHWQ2XbOVrp+Dv8jg="
 wg_peer_endpoint: "vpn6u.d1023.de:51820"
 
 # Secrets. Never in plain text here - encrypt each one in place:
