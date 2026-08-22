@@ -17,7 +17,7 @@
 # - and keep using the public address, not the tunnel address: the tunnel is
 # built by the run, so on a bootstrap run it does not exist yet.
 ansible_host: 141.5.110.173
-ansible_port: 22822
+ansible_port: 22
 ansible_user: cloud
 
 # --- The tunnel ---
