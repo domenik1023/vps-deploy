@@ -90,6 +90,17 @@ crowdsec_firewall_bouncer_mode: "{{ 'nftables' if 'nftables' in crowdsec_firewal
 # decided that is what you want.
 crowdsec_apt_suite: ""
 
+# Whether the repository actually carries a suite for this host. 70_crowdsec.yml
+# replaces this with what it found; the default is what every other host uses,
+# including one running with --tags where that file never ran.
+#
+# It defaults true rather than false because the handler that reads it restarts
+# the CrowdSec bouncer after a ufw reload, and a false default would silently
+# stop doing that on a converged host whose run did not reach 70_crowdsec.yml -
+# leaving the bouncer's chains flushed and the host unprotected, which is worse
+# than the failed handler this guards against.
+crowdsec_suite_available: true
+
 # Central LAPI server this agent reports to.
 crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"
