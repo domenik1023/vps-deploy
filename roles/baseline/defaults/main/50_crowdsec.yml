@@ -75,6 +75,30 @@ crowdsec_firewall_bouncer_service: crowdsec-firewall-bouncer
 # the base file happens to contain.
 crowdsec_firewall_bouncer_mode: "{{ 'nftables' if 'nftables' in crowdsec_firewall_bouncer_package else 'iptables' }}"
 
+# Which Ubuntu suite to take CrowdSec packages from.
+#
+# Empty means "work it out": try this host's own release first, then the
+# fallbacks below, and use the first one the repository actually carries.
+#
+# It needs working out because packagecloud lags Ubuntu. At the time of writing
+# the CrowdSec repository has nothing newer than oracular (24.10) - no plucky,
+# no questing, no resolute - so a host on 26.04 asking for its own release gets
+# an apt failure that names neither CrowdSec nor the release:
+#
+#   The repository '.../ubuntu resolute Release' does not have a Release file.
+#
+# Set this to pin a suite explicitly and skip the probe.
+crowdsec_apt_suite: ""
+
+# Tried in order when the host's own release is not carried. Newest first, and
+# LTS only: those are the ones third-party repositories keep longest. CrowdSec
+# ships Go binaries with few library dependencies, which is why taking the
+# previous LTS build works rather than being a bodge - but it is a fallback,
+# and 70_crowdsec.yml says out loud when it uses one.
+crowdsec_apt_suite_fallbacks:
+  - noble
+  - jammy
+
 # Central LAPI server this agent reports to.
 crowdsec_lapi_url: "https://crowdsec.d1023.de"
 crowdsec_lapi_login: "{{ inventory_hostname }}"

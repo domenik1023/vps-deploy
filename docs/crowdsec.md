@@ -95,6 +95,34 @@ the firewall bouncer's rules with it. The `Reload UFW` handler notifies
 Application traffic is **not** covered by either. CrowdSec parses only what it
 is pointed at, so a host serving HTTP needs its own source — see below.
 
+## Where the packages come from
+
+packagecloud does not keep up with Ubuntu. At the time of writing the CrowdSec
+repository has nothing newer than `oracular` (24.10), so a host on 25.04 or
+26.04 asking for its own release gets:
+
+```
+E: The repository '.../ubuntu resolute Release' does not have a Release file.
+```
+
+after five apt retries, naming neither CrowdSec nor the release as the cause.
+
+`70_crowdsec.yml` therefore asks the repository what it has: this host's
+release first, then `crowdsec_apt_suite_fallbacks` (`noble`, then `jammy`),
+using the first that answers. It prints a line when it falls back, because
+taking the previous LTS build is worth knowing about a host. CrowdSec ships Go
+binaries with few library dependencies, which is what makes that safe rather
+than a bodge.
+
+To pin it and skip the probe:
+
+```yaml
+crowdsec_apt_suite: noble
+```
+
+Check what is actually published under
+<https://packagecloud.io/crowdsec/crowdsec/ubuntu/dists/>.
+
 ## Collections
 
 `crowdsec_collections` in the role defaults is the floor every agent gets.

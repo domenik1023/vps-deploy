@@ -33,12 +33,65 @@
     path: /etc/apt/sources.list.d/crowdsec.list
     state: absent
 
+# packagecloud lags Ubuntu, and asking it for a suite it does not carry fails
+# at `apt update` with an error that names neither CrowdSec nor the release -
+# just "does not have a Release file", after five retries. Ask the repository
+# what it has instead. See crowdsec_apt_suite in defaults/main/50_crowdsec.yml.
+#
+# Runs on the target, not the controller: the target is what has to reach the
+# repository, and on a [vpn] host it still does so directly here - 80_wireguard
+# has not moved the default route yet.
+- name: Find a suite the CrowdSec repository carries
+  ansible.builtin.uri:
+    url: "https://packagecloud.io/crowdsec/crowdsec/ubuntu/dists/{{ item }}/InRelease"
+    method: HEAD
+    follow_redirects: none
+    status_code: [200, 302]
+  loop: "{{ ([ansible_facts['distribution_release']] + crowdsec_apt_suite_fallbacks) | unique }}"
+  register: crowdsec_suite_probe
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: crowdsec_apt_suite | length == 0
+
+- name: Settle on the CrowdSec repository suite
+  ansible.builtin.set_fact:
+    crowdsec_apt_suite_resolved: >-
+      {{ crowdsec_apt_suite if crowdsec_apt_suite | length > 0
+         else (crowdsec_suite_probe.results | default([])
+               | selectattr('status', 'defined')
+               | selectattr('status', 'in', [200, 302])
+               | map(attribute='item') | first | default('', true)) }}
+
+- name: The CrowdSec repository must carry a suite this host can use
+  ansible.builtin.assert:
+    that:
+      - crowdsec_apt_suite_resolved | length > 0
+    fail_msg: >-
+      The CrowdSec repository carries none of
+      {{ ([ansible_facts['distribution_release']] + crowdsec_apt_suite_fallbacks) | unique | join(', ') }}.
+      Check what it does have under
+      https://packagecloud.io/crowdsec/crowdsec/ubuntu/dists/ and either add it
+      to crowdsec_apt_suite_fallbacks or pin crowdsec_apt_suite directly.
+
+# Louder than a comment, because installing the previous LTS build of a package
+# on a newer release is a real thing to know about a host, and the reason for
+# it - the repository, not this host - is not visible from anywhere else.
+- name: Note that CrowdSec is coming from an older suite than this release
+  ansible.builtin.debug:
+    msg: >-
+      The CrowdSec repository has nothing for
+      {{ ansible_facts['distribution_release'] }}, so packages are taken from
+      {{ crowdsec_apt_suite_resolved }}. Pin crowdsec_apt_suite to silence this
+      once you have decided that is what you want.
+  when: crowdsec_apt_suite_resolved != ansible_facts['distribution_release']
+
 - name: Add CrowdSec APT repository
   ansible.builtin.deb822_repository:
     name: crowdsec
     types: [deb]
     uris: ["https://packagecloud.io/crowdsec/crowdsec/ubuntu"]
-    suites: ["{{ ansible_facts['distribution_release'] }}"]
+    suites: ["{{ crowdsec_apt_suite_resolved }}"]
     components: [main]
     signed_by: /etc/apt/keyrings/crowdsec.asc
     state: present

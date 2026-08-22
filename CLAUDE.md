@@ -173,6 +173,16 @@ missing, points elsewhere, or is rejected. Preserve that property when editing.
 `crowdsec_lapi_cscli` is the invocation prefix, which is how a LAPI running in
 a container is reached (`docker exec <container> cscli …`).
 
+**The CrowdSec APT suite is probed, not assumed.** packagecloud lags Ubuntu —
+today it carries nothing newer than `oracular`, so a 26.04 host asking for
+`resolute` fails at `apt update` with an error naming neither CrowdSec nor the
+release. `70_crowdsec.yml` asks the repository which of the host's release and
+`crowdsec_apt_suite_fallbacks` it actually has, says out loud when it falls
+back, and fails with something actionable when none match.
+`crowdsec_apt_suite` pins it and skips the probe. The Docker repository does
+carry every release today, so `62_docker.yml` still uses the host's own — the
+same trap is waiting there whenever that stops being true.
+
 ### WireGuard on `[vpn]` hosts
 
 `80_wireguard.yml` is last in the role, and that is load-bearing: every apt

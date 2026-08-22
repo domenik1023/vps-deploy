@@ -353,6 +353,29 @@
       vars:
         pubkey_form: '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( .*)?$'
 
+    # The list 70_crowdsec.yml walks when packagecloud has nothing for this
+    # host's own release. An empty list, or one holding something that is not a
+    # suite name, turns a clear "pin crowdsec_apt_suite" failure back into the
+    # apt error it exists to prevent - which names neither CrowdSec nor the
+    # release, and only after five retries.
+    - name: The CrowdSec suite fallbacks must be usable Ubuntu codenames
+      ansible.builtin.assert:
+        that:
+          - crowdsec_apt_suite_fallbacks is sequence
+          - crowdsec_apt_suite_fallbacks is not string
+          - crowdsec_apt_suite_fallbacks | length > 0
+          - crowdsec_apt_suite_fallbacks | reject('match', '^[a-z]+$') | list | length == 0
+          - crowdsec_apt_suite | string is match('^([a-z]+)?$')
+        fail_msg: >-
+          crowdsec_apt_suite_fallbacks must be a non-empty list of Ubuntu
+          codenames, and crowdsec_apt_suite either empty or one codename.
+          Got fallbacks={{ crowdsec_apt_suite_fallbacks }},
+          suite={{ crowdsec_apt_suite | default('<undefined>') }}.
+        success_msg: >-
+          CrowdSec suite {{ crowdsec_apt_suite | default('', true)
+            | ternary(crowdsec_apt_suite, 'auto') }},
+          falling back to {{ crowdsec_apt_suite_fallbacks | join(', ') }}
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with
