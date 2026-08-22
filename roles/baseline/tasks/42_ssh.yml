@@ -29,13 +29,26 @@
         mode: "0644"
       register: ssh_hardening_conf
 
-    # Kill socket activation so sshd binds the port itself
-    - name: Disable and mask ssh.socket
+    # Ubuntu has socket-activated sshd since 22.10: ssh.socket listens on 22
+    # and spawns an ssh@N.service per connection. A socket-activated sshd is
+    # handed its connection, so the Port in sshd_config decides nothing - the
+    # socket does. Disabling it is what makes the port move mean anything.
+    #
+    # Disabled and stopped, and explicitly **not masked**. ssh.service depends
+    # on ssh.socket, and systemd refuses to start a unit whose dependency is
+    # masked:
+    #
+    #   Failed to start ssh.service: Unit ssh.socket is masked.
+    #
+    # which stops the run two tasks below, with the drop-ins written and sshd
+    # never restarted. `masked: false` is also what repairs a host that an
+    # earlier version of this file masked.
+    - name: Disable socket activation for sshd
       ansible.builtin.systemd:
         name: ssh.socket
         state: stopped
         enabled: false
-        masked: true
+        masked: false
         daemon_reload: true
       failed_when: false  # ok if the unit doesn't exist
 
@@ -90,6 +103,18 @@
         delay: 2
         timeout: 30
       when: ssh_restarted is changed
+
+    # wait_for_connection proves Ansible got back in, which on a re-run it
+    # would have managed anyway over the existing session. This proves the
+    # thing that actually matters: something is listening on ssh_port. If the
+    # socket unit won the port, or sshd came up on 22 instead, the run should
+    # stop here rather than at the UFW deny two tasks later.
+    - name: Confirm sshd is listening on the hardened port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ ssh_port }}"
+        timeout: 30
+        state: started
 
 # Lock down the old SSH port now that sshd has moved to {{ ssh_port }}.
 # Skipped wherever the block above did not move sshd, because denying port 22

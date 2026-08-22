@@ -291,13 +291,14 @@
     # and the failure is the same each time: the run stops half way through
     # hardening, with the drop-ins written and sshd not restarted.
     #
-    #   mask the socket   so sshd binds the port itself rather than being
-    #                     spawned per connection
-    #   create /run/sshd  because masking the socket lets systemd remove the
-    #                     RuntimeDirectory, and `sshd -t` will not run without
-    #                     it - "Missing privilege separation directory"
-    #   validate          before anything restarts sshd on the new config
-    - name: Sshd validation must follow its privsep directory and the socket mask
+    #   disable the socket  so sshd binds the port itself rather than being
+    #                       handed connections by ssh.socket, which ignores the
+    #                       Port in sshd_config
+    #   create /run/sshd    because stopping the socket lets systemd remove the
+    #                       RuntimeDirectory, and `sshd -t` will not run without
+    #                       it - "Missing privilege separation directory"
+    #   validate            before anything restarts sshd on the new config
+    - name: Sshd validation must follow its privsep directory and the socket change
       ansible.builtin.assert:
         that:
           - at.socket >= 0
@@ -306,17 +307,17 @@
         fail_msg: >-
           42_ssh.yml runs these in the order socket={{ at.socket }},
           privsep={{ at.privsep }}, validate={{ at.validate }} (-1 is missing).
-          `sshd -t` needs /run/sshd, and masking ssh.socket is what lets systemd
+          `sshd -t` needs /run/sshd, and stopping ssh.socket is what lets systemd
           take that directory away - so the three have to run in that order, or
           the run stops with the drop-ins written and sshd never restarted.
-        success_msg: "42_ssh.yml masks the socket, creates /run/sshd, then validates"
+        success_msg: "42_ssh.yml disables the socket, creates /run/sshd, then validates"
       vars:
         ssh_tasks: >-
           {{ (lookup('ansible.builtin.file', ssh_file)
               | from_yaml | selectattr('block', 'defined') | first).block
              | map(attribute='name') | list }}
         ssh_file: ../roles/baseline/tasks/42_ssh.yml
-        n_socket: Disable and mask ssh.socket
+        n_socket: Disable socket activation for sshd
         n_privsep: Ensure the sshd privilege separation directory exists
         n_validate: Validate sshd config
         at:
