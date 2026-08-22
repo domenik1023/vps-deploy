@@ -173,15 +173,19 @@ missing, points elsewhere, or is rejected. Preserve that property when editing.
 `crowdsec_lapi_cscli` is the invocation prefix, which is how a LAPI running in
 a container is reached (`docker exec <container> cscli …`).
 
-**The CrowdSec APT suite is probed, not assumed.** packagecloud lags Ubuntu —
-today it carries nothing newer than `oracular`, so a 26.04 host asking for
-`resolute` fails at `apt update` with an error naming neither CrowdSec nor the
-release. `70_crowdsec.yml` asks the repository which of the host's release and
-`crowdsec_apt_suite_fallbacks` it actually has, says out loud when it falls
-back, and fails with something actionable when none match.
-`crowdsec_apt_suite` pins it and skips the probe. The Docker repository does
-carry every release today, so `62_docker.yml` still uses the host's own — the
-same trap is waiting there whenever that stops being true.
+**CrowdSec is skipped whole on a release packagecloud has not shipped for.**
+It lags Ubuntu — today it carries nothing newer than `oracular`, so a 26.04
+host asking for `resolute` fails at `apt update` with an error naming neither
+CrowdSec nor the release, and leaves a `.sources` file that breaks every later
+apt operation on that host. `70_crowdsec.yml` asks first, and on a 404 removes
+the repository, says so, and skips its whole block; the run continues and a
+re-run installs CrowdSec once upstream publishes. No fallback to an older
+suite, deliberately — `crowdsec_apt_suite` forces one if you want it. Only a
+404 counts as unsupported; an unreachable repository fails instead.
+`tests/render-check.yml` asserts nothing touching apt escapes that block, since
+one task that did would put the broken `.sources` back. The Docker repository
+does carry every release today, so `62_docker.yml` still uses the host's own —
+the same trap is waiting there whenever that stops being true.
 
 ### WireGuard on `[vpn]` hosts
 

@@ -106,15 +106,38 @@ E: The repository '.../ubuntu resolute Release' does not have a Release file.
 ```
 
 after five apt retries, naming neither CrowdSec nor the release as the cause.
+Worse, the failed run leaves a `crowdsec.sources` behind that breaks **every
+later apt operation on that host** — including ones with nothing to do with
+CrowdSec, which are what will appear to be broken.
 
-`70_crowdsec.yml` therefore asks the repository what it has: this host's
-release first, then `crowdsec_apt_suite_fallbacks` (`noble`, then `jammy`),
-using the first that answers. It prints a line when it falls back, because
-taking the previous LTS build is worth knowing about a host. CrowdSec ships Go
-binaries with few library dependencies, which is what makes that safe rather
-than a bodge.
+So `70_crowdsec.yml` asks the repository before adding it, and **skips CrowdSec
+entirely** when the answer is no:
 
-To pin it and skip the probe:
+```
+TASK [Report that CrowdSec is waiting on an upstream release]
+ok: [vpn-gwdg-01] => The CrowdSec repository has nothing for resolute yet, so
+CrowdSec is skipped on vpn-gwdg-01 and its repository has been removed.
+```
+
+The run carries on and the host gets everything else. Re-run once packagecloud
+publishes the release and CrowdSec installs itself with no further changes.
+
+There is deliberately **no fallback to an older suite**. A host running a
+release CrowdSec has not shipped for yet is better off without it than quietly
+carrying a build meant for something else, and a fallback would also mean the
+host never picks up the real packages once they appear.
+
+Note what the skip does beyond nothing: it removes
+`/etc/apt/sources.list.d/crowdsec.sources` if a previous run left one. That is
+the difference between a host that is merely missing CrowdSec and a host whose
+apt is broken.
+
+Only a definite 404 counts as "not carried yet". A connection failure, a proxy
+error or a repository outage fails the run instead, because those are not the
+same thing and should not read as one.
+
+To install anyway from a release the repository does have, having decided that
+is what you want:
 
 ```yaml
 crowdsec_apt_suite: noble
