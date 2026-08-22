@@ -392,6 +392,50 @@
              | flatten | unique | list }}
         ungated_apt: "{{ ungated_keys | select('search', 'apt|deb822_repository') | list }}"
 
+    # The kill switch has to be pointed at the interface that reaches the
+    # internet without the tunnel, and there are two tempting ways to work that
+    # out, both of which have now been tried on a real host and failed:
+    #
+    #   default_ipv4.interface   follows the tunnel, so it is right exactly
+    #                            once and says wg0 on every run afterwards -
+    #                            pointing the kill switch at the tunnel, which
+    #                            blocks the tunnel and opens the public link
+    #   matching ansible_host    fails on any provider handing out a floating
+    #                            or NAT'd address, where the VM holds only a
+    #                            private one and the public address is on a
+    #                            router
+    #
+    # The default route in the main table is neither: wg-quick puts the
+    # tunnel's route in a table of its own, so main names the public interface
+    # whether the tunnel is up or not.
+    #
+    # Asserted against the task's argv rather than the file's text, because the
+    # text includes the comment explaining all of the above - and a search for
+    # "default_ipv4" duly matched that, failing on a correct file. Either
+    # replacement derivation would delete this task as unused.
+    - name: The public interface must come from the main routing table
+      ansible.builtin.assert:
+        that:
+          - route_argv == ['ip', '-4', 'route', 'show', 'default', 'table', 'main']
+        fail_msg: >-
+          80_wireguard.yml must read the public interface from
+          `ip -4 route show default table main`, which names it whether the
+          tunnel is up or not. Found {{ route_argv | default([]) | join(' ')
+            | default('no such task', true) }}.
+        success_msg: "the public interface is read from the main routing table"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/80_wireguard.yml')
+             | from_yaml }}
+        route_task: >-
+          {{ wg_tasks
+             | selectattr('name', 'equalto', 'Find the interface holding the default route')
+             | first | default({}, true) }}
+        # .get() with the key spelled out, never map(attribute='a.b.c'):
+        # Jinja reads dots in `attribute` as nested access, so it would look
+        # for task.ansible.builtin.command, find nothing, and pass.
+        route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with

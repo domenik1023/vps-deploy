@@ -336,6 +336,15 @@ succeeded, with `Could not find the requested service`.
 `tests/render-check.yml` reads the notify list out of the handlers file, so a
 third one added later falls under the same rule automatically.
 
+**`selectattr`/`map(attribute=…)` read dots as nested access.** So
+`selectattr('ansible.builtin.apt', 'defined')` looks for
+`task.ansible.builtin.apt`, finds nothing, and quietly passes — which is how a
+test that inspects task files ends up asserting nothing at all. Both assertions
+in `tests/render-check.yml` that read a module name off a task were written
+that way first and were worthless until a negative test caught them. Subscript
+the literal key instead: `task.get('ansible.builtin.command', {})`, or compare
+against `task | list`, which yields its keys.
+
 **Facts must be read as `ansible_facts['name']`.** `ansible.cfg` sets
 `inject_facts_as_vars = False`, so `ansible_distribution_release` and friends
 are undefined.

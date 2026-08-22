@@ -33,27 +33,37 @@
       wg_private_key or wg_generate_key. All of them come from the client
       config the UniFi WireGuard server generates - see docs/wireguard.md.
 
-# Which interface holds the public address. See wg_wan_interface in
-# defaults/main/60_wireguard.yml for why this is matched against ansible_host
-# rather than read from default_ipv4: that fact says wg0 on every run after the
-# first, and a kill switch pointed at the tunnel blocks the tunnel and opens
-# the public interface.
+# Which interface reaches the internet without the tunnel.
+#
+# Read from the default route in the **main** routing table, and every word of
+# that matters. wg-quick with AllowedIPs = 0.0.0.0/0 does not touch main: it
+# puts the tunnel's default route in a table of its own and reaches it with an
+# `ip rule`. So main keeps naming the public interface, before the tunnel
+# exists and after it is up, which is the stability this needs.
+#
+# Deliberately not ansible_facts['default_ipv4']['interface']: that follows the
+# tunnel, so it is correct exactly once - on the run that builds it - and says
+# wg0 on every run after. A kill switch pointed at the tunnel blocks the tunnel
+# and opens the public interface, which is the whole thing backwards.
+#
+# Deliberately not matched against ansible_host either, which is what this used
+# to do. It fails on any provider that hands out a floating or NAT'd address -
+# an OpenStack cloud, most academic ones - where the VM's own interface holds a
+# private address and the public one lives on a router. The route knows; the
+# address does not.
+- name: Find the interface holding the default route
+  ansible.builtin.command:
+    argv: [ip, "-4", route, show, default, table, main]
+  register: wg_default_route
+  changed_when: false
+  check_mode: false
+
 - name: Resolve the public interface
   ansible.builtin.set_fact:
     wg_wan_interface_resolved: >-
       {{ wg_wan_interface if wg_wan_interface | length > 0
-         else (wan_candidates | first | default('', true)) }}
-  vars:
-    wan_candidates: >-
-      {{ ansible_facts['interfaces']
-         | map('regex_replace', '[-.:]', '_')
-         | select('in', ansible_facts)
-         | map('extract', ansible_facts)
-         | selectattr('ipv4', 'defined')
-         | selectattr('ipv4.address', 'defined')
-         | selectattr('ipv4.address', 'equalto', ansible_host)
-         | map(attribute='device')
-         | list }}
+         else (wg_default_route.stdout | regex_findall('\sdev\s+(\S+)')
+               | reject('equalto', wg_interface) | first | default('', true)) }}
 
 - name: The public interface must be known, and must not be the tunnel
   ansible.builtin.assert:
@@ -61,13 +71,14 @@
       - wg_wan_interface_resolved | length > 0
       - wg_wan_interface_resolved != wg_interface
     fail_msg: >-
-      Could not work out which interface holds {{ inventory_hostname }}'s
-      public address ({{ ansible_host }}), or it resolved to the tunnel itself
-      ({{ wg_wan_interface_resolved | default('nothing') }}). This happens when
-      ansible_host is a name rather than an address, or when the VPS reaches
-      the internet through provider NAT so the public address is not on any
-      local interface. Set wg_wan_interface in host_vars to the real one -
-      `ip -4 addr` on the host names it.
+      Could not work out which interface {{ inventory_hostname }} reaches the
+      internet on, or it came out as the tunnel itself
+      ({{ wg_wan_interface_resolved | default('nothing') }}).
+      `ip -4 route show default table main` returned:
+      {{ wg_default_route.stdout | default('') | trim | default('nothing', true) }}.
+      That table should always name the public interface, tunnel or no tunnel.
+      A host with no default route there, or several, needs wg_wan_interface set
+      in host_vars.
 
 # Whether this run is generating the key rather than taking it from the vault.
 # Named once because four tasks below turn on it and they must agree.

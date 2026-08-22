@@ -28,15 +28,21 @@ wg_persistent_keepalive: 25
 # through the tunnel stalls on large packets while ping stays fine.
 wg_mtu: 1420
 
-# The interface the public address is on. Left empty to be derived, by finding
-# the interface whose IPv4 address is ansible_host.
+# The interface this host reaches the internet on. Empty to derive it, from
+# the default route in the main routing table.
 #
-# Deliberately NOT ansible_facts['default_ipv4']['interface']: that is correct
-# exactly once, on the run that builds the tunnel, and reports wg0 on every run
-# afterwards - at which point the kill switch would be told to block the
-# tunnel and let the public interface through, which is the whole thing
-# backwards. Pin it here or in host_vars if the VPS reaches the internet
-# through provider NAT, where the public address is not on any local interface.
+# Main is the right table because wg-quick does not touch it: with
+# AllowedIPs = 0.0.0.0/0 the tunnel's default route goes in a table of its own,
+# reached by an `ip rule`. So main names the public interface whether the
+# tunnel is up or not.
+#
+# Note this is the interface, not the address, and on a NAT'd host the two
+# disagree: an OpenStack floating IP lives on a router, and the VM sees only a
+# private address. The kill switch cares about the interface, so that is fine -
+# but it is why this cannot be derived from ansible_host.
+#
+# Set it here or in host_vars for a host with more than one default route,
+# where picking the first is a coin toss rather than an answer.
 wg_wan_interface: ""
 
 # Generate the keypair on the host instead of taking wg_private_key from the

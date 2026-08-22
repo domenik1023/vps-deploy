@@ -66,7 +66,9 @@ wg_peer_endpoint: "vpn.example.com:51820"
 #
 # wg_generate_key: true
 
-# Only if the VPS reaches the internet through provider NAT, so its public
-# address is not on any local interface and cannot be matched against
-# ansible_host. `ip -4 addr` on the host names the right one.
+# The interface reaching the internet without the tunnel. Derived from the
+# default route in the main routing table, which names it whether the tunnel is
+# up or not - including on a NAT'd host, where the VM sees only a private
+# address and the public one lives on a router. Set it only for a host with
+# more than one default route, where picking the first is a coin toss.
 # wg_wan_interface: ens3
