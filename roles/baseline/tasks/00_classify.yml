@@ -1,0 +1,38 @@
+# --- HOST CLASSIFICATION ---
+# Every host must be in exactly one of [local], [vps] and [vpn]. That
+# membership is what host_class reads, and host_class is what decides whether
+# this host gets the SSH port move, a CrowdSec registration and a WireGuard
+# tunnel - see defaults/main/00_identity.yml.
+#
+# This runs first, before any task changes anything, because both failure modes
+# are quiet and expensive:
+#
+#   in no class      the derived switches all resolve false, so the host is
+#                    hardened like a LAN box while sitting on a public address.
+#                    Nothing errors; it just never gets the port move or
+#                    CrowdSec, and nobody notices until something finds it.
+#   in two classes   `first` picks one by list order, which is alphabetical in
+#                    the definition and not a decision anyone made. A host in
+#                    [vps] and [vpn] would come out as vps, quietly skipping the
+#                    tunnel it exists for.
+#
+# [lapi] is not a class and is not checked here: main.yml runs against
+# `all:!lapi`, so a host in [lapi] alone never reaches this file.
+
+- name: Every host must be in exactly one of local, vps and vpn
+  ansible.builtin.assert:
+    that:
+      - classes | length == 1
+    fail_msg: >-
+      {{ inventory_hostname }} is in
+      {{ classes | length }} of the three host classes
+      ({{ classes | join(', ') | default('none', true) }}); its groups are
+      {{ group_names | join(', ') }}. Put it in exactly one of [local], [vps]
+      or [vpn] in the inventory - that membership is what decides whether it
+      gets the SSH port move, CrowdSec and a WireGuard tunnel.
+    success_msg: >-
+      {{ inventory_hostname }} is a {{ host_class }} host
+      (ssh_hardening={{ ssh_hardening_manage }},
+      crowdsec={{ crowdsec_manage }}, wireguard={{ wireguard_manage }})
+  vars:
+    classes: "{{ ['local', 'vps', 'vpn'] | intersect(group_names) }}"

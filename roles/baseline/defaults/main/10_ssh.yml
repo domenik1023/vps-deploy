@@ -1,0 +1,5 @@
+# --- SSH ---
+ssh_port: 22822
+# ssh_old_port is the standard port opened during initial bootstrap.
+# It is explicitly denied by hardening tasks once the custom port is confirmed.
+ssh_old_port: 22

@@ -17,6 +17,7 @@ ansible-galaxy collection install -r requirements.yml   # community.general, ans
 ansible-playbook main.yml -i inventory --syntax-check
 ansible-lint
 ansible-playbook tests/render-check.yml   # variable shapes + design invariants
+tests/killswitch-netns.sh                # the WireGuard kill switch, against a real kernel
 
 ansible-playbook main.yml -i inventory --list-hosts      # confirm targeting after inventory/group changes
 ansible-inventory -i inventory --host <name>             # resolved vars for one host
@@ -54,30 +55,59 @@ trusting it: `alloy fmt <file>` and `alloy validate <file>`, from the binary in
 the release matching `alloy_agent_version`.
 
 For anything the render check still cannot reach, write a throwaway play that
-loads the role's `defaults/main.yml` via `vars_files`, renders the expression to
-a file, and parse it back with Python to confirm the shape.
+loads the role's defaults via `vars_files`, renders the expression to a file,
+and parse it back with Python to confirm the shape. `roles/baseline/defaults/`
+is a `main/` **directory**, which Ansible loads whole but `vars_files` cannot
+take — so list its files individually, as `tests/render-check.yml` does. The
+first assertion in that file compares the list it loaded against a glob of the
+directory, because a seventh defaults file nobody wired up would otherwise be
+untested and silent about it.
 
 ## Architecture
 
-Two roles and two plays in `main.yml`, in this order: `config` (hardening) then
-`alloy` (telemetry). The split is a play boundary rather than a second
-`include_role` so the hardening role's task order stays a statement about
-itself; `hardening.yml` records the switched SSH port with `set_fact`, and host
-facts persist across plays within a run, so the second play still connects.
+Two roles and two plays in `main.yml`, in this order: `baseline` (everything
+every managed host gets) then `alloy` (telemetry). The split is a play boundary
+rather than a second `include_role` so the baseline role's task order stays a
+statement about itself; `42_ssh.yml` records the switched SSH port with
+`set_fact`, and host facts persist across plays within a run, so the second play
+still connects.
 
-`config/tasks/main.yml` includes six files **and the order is load-bearing**:
+`baseline/tasks/main.yml` includes its files **in a load-bearing order**, and
+they are numbered so that order is visible in `ls` rather than only in a
+comment. A new file gets a number that places it, not the next one free:
 
-`hostname.yml` → `user.yml` → `hardening.yml` → `sysctl.yml` → `software.yml` →
-`crowdsec.yml`
+`10_hostname` → `20_user` → `30_packages` → `40_firewall` → `41_fail2ban` →
+`42_ssh` → `50_sysctl` → `60_updates` → `61_time` → `62_docker` →
+`70_crowdsec`
 
-- `hostname.yml` is first because the host's own name is what everything after
-  it records itself as, and the Alloy play labels all its telemetry with it.
-- `hardening.yml` installs `python3-debian`, which `deb822_repository` in
-  `software.yml` and `crowdsec.yml` needs and a stock Ubuntu image lacks.
-- `software.yml` starts Docker before `crowdsec.yml` probes for `DOCKER-USER`.
+- `10_hostname.yml` is first because the host's own name is what everything
+  after it records itself as, and the Alloy play labels all its telemetry with
+  it.
+- `20_user.yml` before `42_ssh.yml`, which locks the root account last.
+- `30_packages.yml` installs `python3-debian`, which `deb822_repository` in
+  `62_docker.yml` and `70_crowdsec.yml` needs and a stock Ubuntu image lacks.
+- `40_firewall.yml` strictly before `42_ssh.yml`: the bootstrap allow on the
+  live session's port and the `limit` on the port sshd is about to move to must
+  both exist before it moves. The matching deny on the old port lives in
+  `42_ssh.yml` instead, next to the move that justifies it.
+- `62_docker.yml` starts Docker before `70_crowdsec.yml` probes for
+  `DOCKER-USER`.
 
 The `alloy` play must stay after it: cAdvisor and the Docker log discovery both
-expect the socket `software.yml` creates.
+expect the socket `62_docker.yml` creates.
+
+Each include carries a **tag** named after its concern, so one can be re-run on
+its own (`--tags docker`, `--tags crowdsec`). They are for a converged host, not
+for bootstrapping: `--tags crowdsec` on a fresh box skips `42_ssh.yml`, so the
+`set_fact` that moves `ansible_port` never runs and every task after it tries
+the wrong port.
+
+**Free-form file bodies live in `templates/`; data structures stay in the
+task.** `daemon.json` and the CrowdSec bouncer overlay are built as mappings and
+written with `to_nice_json` / `to_nice_yaml`, where the round trip through the
+filter is itself the check that the shape is right — those stay inline. An sshd
+drop-in, a fail2ban jail, a systemd unit or the sysctl file is text with holes
+in it, and belongs in `templates/`.
 
 ### Host targeting
 
@@ -87,10 +117,31 @@ target — a delegate absent from the inventory silently falls back to SSH
 defaults (port 22, no `ansible_user`). Configuring it would disable the very
 LAPI the fleet depends on.
 
-Within the hardening play, `when: "'local' not in group_names"` skips SSH
-hardening (to avoid self-lockout on LAN test boxes) and the entire CrowdSec
-include. Alloy is not skipped there — a LAN box reaches the default
-`ingest.net.d1023.de` without any override.
+**Every host is in exactly one of `[local]`, `[vps]` and `[vpn]`**, and that
+membership is the only thing deciding how much of the role it gets.
+`00_classify.yml` asserts it first thing, before any task changes anything,
+because both failure modes are quiet: a host in no class silently gets the
+least, and a host in two gets whichever `first` picks by list order rather than
+whichever anyone meant.
+
+`host_class` derives from those groups in `defaults/main/00_identity.yml`, and
+three switches derive from it — `ssh_hardening_manage`, `crowdsec_manage`,
+`wireguard_manage`. Nothing else in the role tests `group_names`. They are
+stated positively on purpose. The old spelling was
+`when: "'local' not in group_names"`, which was correct while there were
+exactly two classes and wrong the moment there was a third: anything not in
+`[local]` got full SSH hardening and a CrowdSec registration on the shared
+LAPI, whether or not that was intended. All three now default false for a host
+in no class, so the failure direction is *less*, not more.
+
+Gating CrowdSec is also what keeps its **iptables** work off LAN boxes. The
+unthrottled LOG rules in `before.rules` and `before6.rules` and the bouncer's
+`INPUT` / `DOCKER-USER` chains are all inside `70_crowdsec.yml`, so there is no
+second switch for them and nowhere else for them to live.
+
+Alloy is not skipped anywhere — a LAN box reaches the default
+`ingest.net.d1023.de` without any override, and so does a `[vpn]` host, over
+its tunnel.
 
 Hosts are named in `inventory`; addresses and per-host settings live in
 `host_vars/<name>.yml`. The name is not cosmetic — `crowdsec_lapi_login` and
@@ -99,7 +150,7 @@ orphans its machine and bouncer registration on the LAPI.
 
 ### The mid-play SSH port switch
 
-`hardening.yml` moves sshd off port 22 while Ansible is connected over it:
+`42_ssh.yml` moves sshd off port 22 while Ansible is connected over it:
 allow the current port in UFW *before* `ufw enable`, `limit` the new port,
 restart sshd, `set_fact ansible_port`, `wait_for_connection`, then deny port 22.
 Reordering any of this locks you out. `ansible.cfg` sets `pipelining` and
@@ -113,7 +164,7 @@ alerts go to the central LAPI, so bans propagate fleet-wide. See
 `docs/crowdsec.md` for the operational side (adding log sources, verification,
 troubleshooting).
 
-`crowdsec_credentials.yml` mints machine credentials and the bouncer API key by
+`71_crowdsec_credentials.yml` mints machine credentials and the bouncer API key by
 running `cscli` on the LAPI host over delegation; nothing is stored in the
 vault. It is idempotent by **verify-then-mint**: check what the agent already
 has (`cscli lapi status` for the machine, an authenticated `GET /v1/decisions`
@@ -121,6 +172,72 @@ for the bouncer key) and only generate a new secret when the existing one is
 missing, points elsewhere, or is rejected. Preserve that property when editing.
 `crowdsec_lapi_cscli` is the invocation prefix, which is how a LAPI running in
 a container is reached (`docker exec <container> cscli …`).
+
+**CrowdSec is skipped whole on a release packagecloud has not shipped for.**
+It lags Ubuntu — today it carries nothing newer than `oracular`, so a 26.04
+host asking for `resolute` fails at `apt update` with an error naming neither
+CrowdSec nor the release, and leaves a `.sources` file that breaks every later
+apt operation on that host. `70_crowdsec.yml` asks first, and on a 404 removes
+the repository, says so, and skips its whole block; the run continues and a
+re-run installs CrowdSec once upstream publishes. No fallback to an older
+suite, deliberately — `crowdsec_apt_suite` forces one if you want it. Only a
+404 counts as unsupported; an unreachable repository fails instead.
+`tests/render-check.yml` asserts nothing touching apt escapes that block, since
+one task that did would put the broken `.sources` back. The Docker repository
+does carry every release today, so `62_docker.yml` still uses the host's own —
+the same trap is waiting there whenever that stops being true.
+
+### WireGuard on `[vpn]` hosts
+
+`80_wireguard.yml` is last in the role, and that is load-bearing: every apt
+install above it then happens over the direct connection, so a bootstrap run
+never depends on the tunnel or on the UDM routing peers to the internet.
+
+The hard part is not the tunnel, it is keeping SSH reachable on the public
+interface while the default route is `wg0`. `wg-quick` with `0.0.0.0/0` in
+`AllowedIPs` adds `not fwmark <t> table <t>` at priority 32765, so a reply to
+an inbound connection is routed into the tunnel and the session hangs. The kill
+switch marks connections arriving on the public interface (`mangle PREROUTING`),
+restores the mark on the way out (`mangle OUTPUT`) and adds an `ip rule` at
+priority 30000 sending those to the main table.
+
+**The mark is a single bit used as its own mask, and it is not wg-quick's
+fwmark.** wg-quick derives that from the first free routing table counting up
+from 51820, at run time, and overrides whatever `FwMark` the config asks for —
+so it is not a number this repo can know, and `wg.conf.j2` deliberately does
+not set one. The mask matters separately: wg-quick sets its fwmark on the
+encrypted packets it sends, and an unmasked `CONNMARK --restore-mark` clears
+it, routing the tunnel's own traffic back into the tunnel.
+
+**There is a second, dumber rule keeping SSH alive**: `tcp --sport <ssh_port>`
+returns before the final `DROP`, matching on port alone with no conntrack and
+no `ip rule` involved. It is what still holds if the mangle half is wrong, and
+`tests/render-check.yml` asserts both its presence and that every `RETURN`
+precedes the `DROP`. Losing that ordering is a trip to the provider's serial
+console.
+
+**Container traffic is filtered in `DOCKER-USER`, not in ufw.** Docker's
+`FORWARD` jumps run ahead of ufw's, so `ufw-before-forward` never sees it. The
+same reason the CrowdSec bouncer uses that chain.
+
+**`ufw reload` disarms the kill switch**, because its `iptables-restore`
+flushes the builtins the chains are jumped into from. `Reload UFW` notifies
+`Restart WireGuard kill switch`, defined after it — exactly as it already
+notifies the bouncer restart. This is the second reason `ufw_allow_rules` has
+to live in `roles/baseline`.
+
+**`[vpn]` hosts run loose reverse path filtering** (`sysctl_rp_filter: 2` in
+`group_vars/vpn.yml`). Strict mode drops inbound SSH on the public interface
+the moment the default route is the tunnel — the kernel finds the return path
+points down `wg0` and discards the packet before any firewall rule is
+consulted. The kernel takes `max(all, <iface>)` for this, which is why `all`
+and `default` move together.
+
+A rollback is armed with `systemd-run --on-active` before anything moves and
+cancelled only after the host has answered *and* the tunnel has handshaked. It
+retreats to the pre-tunnel state rather than just dropping rules, so a reboot
+cannot re-apply what locked us out. `docs/wireguard.md` has the UDM side and
+the recovery procedure.
 
 ### Alloy
 
@@ -208,6 +325,26 @@ dead.
 **Handlers fire in definition order, not notification order.** `Reload systemd`
 is first in `handlers/main.yml` so it precedes any service it affects.
 
+**Anything `Reload UFW` notifies has to be safe on every host class.** It fires
+on any host that changes a ufw rule, LAN boxes included since
+`docker_host_access_cidrs` adds one there, and it notifies restarts for two
+services that only exist where CrowdSec or WireGuard was installed. Both carry
+a `when` on the matching `*_manage` switch — not `failed_when: false`, so a
+service genuinely missing from a host that should have it still fails. An
+unguarded one kills the run at the very end, after every task has already
+succeeded, with `Could not find the requested service`.
+`tests/render-check.yml` reads the notify list out of the handlers file, so a
+third one added later falls under the same rule automatically.
+
+**`selectattr`/`map(attribute=…)` read dots as nested access.** So
+`selectattr('ansible.builtin.apt', 'defined')` looks for
+`task.ansible.builtin.apt`, finds nothing, and quietly passes — which is how a
+test that inspects task files ends up asserting nothing at all. Both assertions
+in `tests/render-check.yml` that read a module name off a task were written
+that way first and were worthless until a negative test caught them. Subscript
+the literal key instead: `task.get('ansible.builtin.command', {})`, or compare
+against `task | list`, which yields its keys.
+
 **Facts must be read as `ansible_facts['name']`.** `ansible.cfg` sets
 `inject_facts_as_vars = False`, so `ansible_distribution_release` and friends
 are undefined.
@@ -221,6 +358,20 @@ exist in both families or the bouncer aborts at startup — and its `-t` config
 test runs the same initialisation, so systemd never starts it. IPv4-only chains
 like `DOCKER-USER` go in `crowdsec_bouncer_iptables_v4_chains`, which is probed
 before use.
+
+**Docker containers cannot reach the host by its own address unless told
+they may.** A container talking to `<host IP>:<port>` for something outside its
+compose network sends a packet that arrives on the bridge and traverses
+`INPUT`, because the destination is local — Docker's rules are all in `FORWARD`
+and never see it, so UFW's default-deny drops it. That is the published-port
+trap below, running the other way round.
+`docker_host_access_cidrs` opens it, set for `[local]` only. It is a variable
+of its own rather than an `ufw_allow_rules` entry because a host_vars
+`ufw_allow_rules` replaces a group_vars list wholesale, and losing this rule
+silently is the exact bug it exists to fix. Note that each entry opens *every*
+host port to that source, and that Docker's fallback address pool overlaps the
+LAN's `192.168.0.0/16` — pin an unusual compose subnet and name it exactly
+rather than widening the range.
 
 **UFW does not filter Docker-published ports.** Docker's `FORWARD` jump precedes
 UFW's, so `-p 8080:80` is reachable regardless of firewall rules. This is
@@ -236,7 +387,7 @@ also caps prefixes at 29 characters, and the prefix must contain neither
 exclusions, and matching either makes the parser silently discard every line it
 exists to read. Note also that `ufw_logging` is for reading by hand only —
 ufw rate-limits its own LOG rules at every level below `high`, so the rule
-CrowdSec actually reads is a separate, unlimited one installed by `crowdsec.yml`.
+CrowdSec actually reads is a separate, unlimited one installed by `70_crowdsec.yml`.
 
 **Fail2ban is deliberately duller than CrowdSec** so CrowdSec bans first and the
 decision reaches the whole fleet. The two are not independent — whichever bans
@@ -251,11 +402,11 @@ existing containers and volumes.
 `constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
-`hostname.yml` closes that by setting the system hostname to
+`10_hostname.yml` closes that by setting the system hostname to
 `inventory_hostname`, which is why it fixes all six at once and no relabelling
 is needed. Alloy reads the hostname once at startup and its config carries no
 literal copy, so a rename does not change the config and upstream's handler
-never fires — `roles/alloy` restarts it explicitly on the fact `hostname.yml`
+never fires — `roles/alloy` restarts it explicitly on the fact `10_hostname.yml`
 sets. Facts persist across plays, which is what makes that work.
 
 **The Alloy config is templated twice.** `grafana.grafana.alloy` writes
@@ -271,9 +422,9 @@ credential checking to enable. No UFW rule is added for any of them by default,
 and that is deliberate twice over: nothing needs to reach them, and any `ufw`
 rule change reloads UFW, which deletes every non-builtin chain and takes the
 CrowdSec bouncer's rules with it. The `Reload UFW` handler notifies a bouncer
-restart for that reason, and it is scoped to `roles/config` — a rule added from
+restart for that reason, and it is scoped to `roles/baseline` — a rule added from
 `roles/alloy` could not reach it, which is why `ufw_allow_rules` lives in
-`roles/config` even though its only current caller is Alloy.
+`roles/baseline` even though its only current caller is Alloy.
 
 Widening `alloy_ui_bind` costs more than the bind address. `alloy_custom_args`
 emits `--server.http.listen-addr` only when the bind differs from Alloy's own
@@ -295,7 +446,7 @@ drops it, and Docker's own rules are in `FORWARD` and never see it.
 range, so `0.0.0.0` cannot be set by accident.
 
 **`tests/render-check.yml` must assert against rendered host_vars, not just
-defaults.** It loads both roles' `defaults/main.yml` with `vars_files`, so any
+defaults.** It loads both roles' defaults with `vars_files`, so any
 assertion naming one of those variables is checking the *default* — a host_vars
 file overriding it is invisible. That gap shipped a `prometheus.scrape
 "instance/traefik"` past green CI, which Alloy rejects outright. The per-host
@@ -307,7 +458,19 @@ host-settable variables belong there.
 interactive OIDC. Do not add credentials to the agent config expecting the
 server to check them; nothing does.
 
+**The admin user's public keys are installed by `20_user.yml`, before
+`42_ssh.yml` can lock the door.** `admin_ssh_keys` is a list of public keys in
+`defaults/main/00_identity.yml` — public, so they live in the repository rather
+than being copied onto each host by hand. The task after it asserts the account
+will not be left without a key, because `42_ssh.yml` turns off password
+authentication, restricts `AllowUsers` to that account and locks root: a host
+that reaches it with an empty `authorized_keys` is a serial-console job. The
+assert is written as "keys to install, or keys already there" so that `--check`
+against a fresh host does not fail on a key the run would have installed.
+`admin_ssh_keys_exclusive` is off so a cloud-init-seeded key is not revoked on
+the same run that disables passwords.
+
 `group_vars/all/vault.yml` holds only `vault_admin_password`, which must be a
-crypt hash — `user.yml` asserts this, because the `user` module writes the value
+crypt hash — `20_user.yml` asserts this, because the `user` module writes the value
 into `/etc/shadow` verbatim and a plaintext value leaves the account with no
 usable password.

@@ -1,0 +1,354 @@
+# --- WIREGUARD TUNNEL + KILL SWITCH ([vpn] hosts only) ---
+# Last in the role, and that is load-bearing rather than tidy: everything above
+# installs packages, and doing that before the default route moves means a
+# bootstrap run never depends on the tunnel or on the UDM routing peers to the
+# internet. By the time this file runs there is nothing left to download.
+#
+# It is also the most dangerous file here. It moves the host's default route
+# while Ansible is connected over the public address, and installs a firewall
+# that drops anything not going through the tunnel. Two things keep that
+# survivable, and both matter:
+#
+#   the kill switch returns on tcp --sport {{ ssh_port }}, so replies to an
+#   inbound SSH session leave by the public interface even if the mangle rules
+#   are wrong;
+#
+#   a rollback timer is armed before the route moves and cancelled only after
+#   the host has answered on the far side of the change. A run that locks
+#   itself out undoes itself in {{ wg_rollback_delay }}.
+#
+# See docs/wireguard.md for the UDM side and for recovery.
+
+- name: Require the per-host WireGuard settings
+  ansible.builtin.assert:
+    that:
+      - wg_address | default('') is match('^[0-9a-fA-F:.]+/[0-9]+$')
+      - wg_private_key | default('') | length > 0 or wg_generate_key | bool
+      - wg_peer_public_key | default('') | length > 0
+      - wg_peer_endpoint | default('') is match('^.+:[0-9]+$')
+    fail_msg: >-
+      {{ inventory_hostname }} is in [vpn] but its host_vars do not describe a
+      tunnel. It needs wg_address (a CIDR, e.g. 10.0.2.11/32),
+      wg_peer_public_key, wg_peer_endpoint as host:port, and either
+      wg_private_key or wg_generate_key. All of them come from the client
+      config the UniFi WireGuard server generates - see docs/wireguard.md.
+
+# Which interface reaches the internet without the tunnel.
+#
+# Read from the default route in the **main** routing table, and every word of
+# that matters. wg-quick with AllowedIPs = 0.0.0.0/0 does not touch main: it
+# puts the tunnel's default route in a table of its own and reaches it with an
+# `ip rule`. So main keeps naming the public interface, before the tunnel
+# exists and after it is up, which is the stability this needs.
+#
+# Deliberately not ansible_facts['default_ipv4']['interface']: that follows the
+# tunnel, so it is correct exactly once - on the run that builds it - and says
+# wg0 on every run after. A kill switch pointed at the tunnel blocks the tunnel
+# and opens the public interface, which is the whole thing backwards.
+#
+# Deliberately not matched against ansible_host either, which is what this used
+# to do. It fails on any provider that hands out a floating or NAT'd address -
+# an OpenStack cloud, most academic ones - where the VM's own interface holds a
+# private address and the public one lives on a router. The route knows; the
+# address does not.
+- name: Find the interface holding the default route
+  ansible.builtin.command:
+    argv: [ip, "-4", route, show, default, table, main]
+  register: wg_default_route
+  changed_when: false
+  check_mode: false
+
+- name: Resolve the public interface
+  ansible.builtin.set_fact:
+    wg_wan_interface_resolved: >-
+      {{ wg_wan_interface if wg_wan_interface | length > 0
+         else (wg_default_route.stdout | regex_findall('\sdev\s+(\S+)')
+               | reject('equalto', wg_interface) | first | default('', true)) }}
+
+- name: The public interface must be known, and must not be the tunnel
+  ansible.builtin.assert:
+    that:
+      - wg_wan_interface_resolved | length > 0
+      - wg_wan_interface_resolved != wg_interface
+    fail_msg: >-
+      Could not work out which interface {{ inventory_hostname }} reaches the
+      internet on, or it came out as the tunnel itself
+      ({{ wg_wan_interface_resolved | default('nothing') }}).
+      `ip -4 route show default table main` returned:
+      {{ wg_default_route.stdout | default('') | trim | default('nothing', true) }}.
+      That table should always name the public interface, tunnel or no tunnel.
+      A host with no default route there, or several, needs wg_wan_interface set
+      in host_vars.
+
+# Whether this run is generating the key rather than taking it from the vault.
+# Named once because four tasks below turn on it and they must agree.
+- name: Note whether the private key is generated here
+  ansible.builtin.set_fact:
+    wg_key_on_host: "{{ wg_generate_key | bool and wg_private_key | default('') | length == 0 }}"
+
+# wg-quick applies `DNS =` by piping into `resolvconf`, and does nothing else
+# if it is missing - it fails, and the interface never comes up. Which package
+# provides that command varies (systemd-resolved's compatibility symlink,
+# openresolv, the old resolvconf package), and a minimal cloud image may have
+# none of them.
+#
+# Checked here rather than discovered at `wg-quick up`, where the error is
+# "resolvconf: command not found" from inside a systemd unit, several tasks
+# after the one that could have said so.
+- name: Check that wg_dns has something to apply it with
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /usr/bin/resolvconf
+    - /usr/sbin/resolvconf
+    - /sbin/resolvconf
+    - /bin/resolvconf
+  register: wg_resolvconf
+  when: wg_dns | default([]) | length > 0
+
+- name: Setting wg_dns needs a resolvconf implementation on the host
+  ansible.builtin.assert:
+    that:
+      - wg_resolvconf.results | default([]) | selectattr('stat', 'defined')
+        | map(attribute='stat') | selectattr('exists') | list | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }} sets wg_dns ({{ wg_dns | join(', ') }}) but has
+      no `resolvconf` command, which is how wg-quick applies it -
+      `wg-quick up {{ wg_interface }}` would fail with "resolvconf: command not
+      found" and the tunnel would never come up. Install one (`apt install
+      openresolv`, or systemd-resolved's compatibility symlink), or drop wg_dns
+      and point the host at a resolver another way.
+  when: wg_dns | default([]) | length > 0
+
+- name: Install WireGuard
+  ansible.builtin.apt:
+    name:
+      - wireguard
+      - wireguard-tools
+    state: present
+
+- name: Ensure the WireGuard configuration directory exists
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# The keypair never leaves the host. Which half of the exchange you are on
+# depends on the server: some UniFi versions generate the client keypair and
+# hand back a finished config, in which case wg_private_key comes from that and
+# this does nothing; others give you only the server's public key and a
+# preshared key, and expect a client public key back - which is what this is
+# for. `creates:` makes it a one-off, so re-running never rotates a key that
+# the server already knows.
+- name: Generate a private key on the host
+  ansible.builtin.shell:
+    cmd: umask 077 && wg genkey > /etc/wireguard/privatekey
+    creates: /etc/wireguard/privatekey
+  register: wg_key_generated
+  when: wg_key_on_host
+
+- name: Read the generated private key back
+  # slurp, not lookup('file'): a lookup runs on the controller, where this file
+  # does not exist - it was just created on the target. The same mistake writes
+  # an empty PrivateKey into wg0.conf and fails at `wg-quick up` with nothing
+  # pointing at the cause.
+  ansible.builtin.slurp:
+    src: /etc/wireguard/privatekey
+  register: wg_privkey_file
+  no_log: true
+  when: wg_key_on_host
+
+- name: Settle on the private key to write
+  ansible.builtin.set_fact:
+    wg_private_key_resolved: >-
+      {{ (wg_privkey_file.content | b64decode | trim) if wg_key_on_host
+         else wg_private_key }}
+  no_log: true
+
+- name: Derive the public key to register on the WireGuard server
+  ansible.builtin.command:
+    argv: [wg, pubkey]
+    stdin: "{{ wg_private_key_resolved }}"
+  register: wg_pubkey
+  changed_when: false
+  when: wg_key_on_host
+
+- name: Report the public key to register on the WireGuard server
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}'s WireGuard public key is {{ wg_pubkey.stdout }}
+  when: wg_key_on_host
+
+# Stop on the run that minted the key, before anything touches routing.
+#
+# The key is new, so the server cannot know it yet, and every task below would
+# run to the handshake check and fail there - after moving the default route
+# and arming a rollback, for a reason that has nothing to do with either. Fail
+# here instead, where the only thing that has happened is a key file being
+# written, and say what to do with it.
+#
+# Only on the run that generated it: `creates:` means the next run reports no
+# change and carries straight on.
+- name: Stop so the new public key can be registered on the server
+  ansible.builtin.fail:
+    msg: >-
+      Generated a new WireGuard key for {{ inventory_hostname }}. Add it to the
+      WireGuard server as a client, with public key
+      {{ wg_pubkey.stdout }}
+      and allowed address {{ wg_address }}, then run this play again. Nothing
+      has been changed on the host beyond writing the key, and the tunnel has
+      not been brought up - a re-run picks up the same key and continues.
+  when:
+    - wg_key_on_host
+    - wg_key_generated.changed | default(false)
+
+- name: Write the WireGuard interface configuration
+  ansible.builtin.template:
+    src: wg.conf.j2
+    dest: "/etc/wireguard/{{ wg_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  register: wg_conf
+
+# --- KILL SWITCH ---
+- name: Install the kill switch script
+  ansible.builtin.template:
+    src: wg-killswitch.j2
+    dest: /usr/local/sbin/wg-killswitch
+    owner: root
+    group: root
+    mode: "0755"
+  register: wg_killswitch_script
+
+- name: Install the kill switch unit
+  ansible.builtin.template:
+    src: wg-killswitch.service.j2
+    dest: /etc/systemd/system/wg-killswitch.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: wg_killswitch_unit
+  notify: Reload systemd
+
+# A run that armed the timer and then failed before cancelling it leaves the
+# unit behind, and systemd-run refuses to reuse a name that is still there -
+# stopped or failed. Clear both, or every subsequent run arms nothing and
+# quietly loses its safety net at the moment it needs one.
+- name: Stop a rollback left over from an earlier run
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - wg-rollback.timer
+    - wg-rollback.service
+  failed_when: false
+  when: not ansible_check_mode
+
+# The one thing systemd_service cannot express, and the one that matters: a
+# transient unit that ran and failed stays registered under its name until it
+# is reset, and systemd-run will not reuse it.
+- name: Forget a failed rollback
+  ansible.builtin.command:
+    argv: [systemctl, reset-failed, wg-rollback.timer, wg-rollback.service]
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+# Before anything moves. systemd-run's transient timer survives the connection
+# dying, which is exactly the case it is here for; the matching stop is the
+# last task in this file and only runs once the host has answered.
+#
+# It retreats all the way to the pre-tunnel state rather than just dropping the
+# rules, so that a reboot cannot re-apply the thing that locked us out.
+- name: Arm the automatic rollback
+  ansible.builtin.command:
+    argv:
+      - systemd-run
+      - "--on-active={{ wg_rollback_delay }}"
+      - "--unit=wg-rollback"
+      - /bin/bash
+      - -c
+      - >-
+        systemctl disable --now wg-quick@{{ wg_interface }};
+        systemctl disable --now wg-killswitch;
+        /usr/local/sbin/wg-killswitch off
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Apply the kill switch
+  ansible.builtin.systemd_service:
+    name: wg-killswitch
+    enabled: true
+    state: "{{ 'restarted' if (wg_killswitch_script.changed or wg_killswitch_unit.changed) else 'started' }}"
+    daemon_reload: true
+  when: wg_killswitch | bool
+
+- name: Remove the kill switch when it is turned off
+  ansible.builtin.systemd_service:
+    name: wg-killswitch
+    enabled: false
+    state: stopped
+  failed_when: false
+  when: not wg_killswitch | bool
+
+# --- THE TUNNEL ---
+# wg-quick's own unit reads the config once, at start. A changed config needs a
+# restart rather than a reload, and restarting it is what moves the default
+# route on the very first run.
+- name: Bring up the tunnel
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wg_interface }}"
+    enabled: true
+    state: "{{ 'restarted' if wg_conf.changed else 'started' }}"
+    daemon_reload: true
+
+- name: Wait for the host to answer with the tunnel up
+  ansible.builtin.wait_for_connection:
+    delay: 2
+    timeout: 60
+
+# A tunnel that is up but never handshakes looks identical to a working one
+# from here - the interface exists, the route is in place, and every packet
+# vanishes. The failure is nearly always on the server side, so name those
+# causes rather than just reporting a timeout.
+- name: Wait for a handshake with the WireGuard server
+  ansible.builtin.command:
+    argv: [wg, show, "{{ wg_interface }}", latest-handshakes]
+  register: wg_handshake
+  changed_when: false
+  # `wg show <iface> latest-handshakes` prints "<peer key>\t<unix seconds>" per
+  # peer, and 0 means never. Matched with a regex rather than split-and-compare
+  # because Ansible has no `split` filter - `map('split')` looks reasonable and
+  # fails at run time, on the host, after the default route has already moved.
+  until: wg_handshake.stdout_lines | select('search', '\\s[1-9][0-9]*$') | list | length > 0
+  retries: 12
+  delay: 5
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: The tunnel must have handshaked before the rollback is cancelled
+  ansible.builtin.assert:
+    that:
+      - wg_handshake.stdout_lines | default([]) | select('search', '\\s[1-9][0-9]*$') | list | length > 0
+    fail_msg: >-
+      {{ wg_interface }} is up on {{ inventory_hostname }} but has never
+      handshaked with {{ wg_peer_endpoint }}. Check, in this order: the client
+      is registered on the WireGuard server and not disabled; wg_peer_public_key
+      is the server's key and not this host's; wg_preshared_key matches; the
+      server's UDP port is reachable from here. The rollback armed above has
+      NOT been cancelled, so this host returns to its pre-tunnel state within
+      {{ wg_rollback_delay }} - fix the server side and re-run.
+  when: not ansible_check_mode
+
+# Only now. Everything above has to have worked, including the host answering
+# on the far side of the routing change.
+- name: Cancel the automatic rollback
+  ansible.builtin.command:
+    argv: [systemctl, stop, wg-rollback.timer]
+  changed_when: true
+  failed_when: false
+  when: not ansible_check_mode

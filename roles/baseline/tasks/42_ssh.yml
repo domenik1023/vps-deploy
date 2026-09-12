@@ -1,0 +1,148 @@
+# --- SSH hardening ([vps] and [vpn] only) ---
+# Skipped on LAN boxes to prevent a lockout you would have to walk to the
+# machine to fix. ssh_hardening_manage derives from the host's inventory group
+# - see defaults/main/00_identity.yml.
+- name: SSH hardening block
+  when: ssh_hardening_manage | bool
+  block:
+    - name: Ensure sshd_config.d exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        mode: "0755"
+
+    - name: Set SSH port via drop-in
+      ansible.builtin.template:
+        src: sshd-port.conf.j2
+        dest: /etc/ssh/sshd_config.d/10-port.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: ssh_port_conf
+
+    - name: Hardening options via drop-in
+      ansible.builtin.template:
+        src: sshd-hardening.conf.j2
+        dest: /etc/ssh/sshd_config.d/20-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: ssh_hardening_conf
+
+    # Ubuntu has socket-activated sshd since 22.10: ssh.socket listens on 22
+    # and spawns an ssh@N.service per connection. A socket-activated sshd is
+    # handed its connection, so the Port in sshd_config decides nothing - the
+    # socket does. Disabling it is what makes the port move mean anything.
+    #
+    # Disabled and stopped, and explicitly **not masked**. ssh.service depends
+    # on ssh.socket, and systemd refuses to start a unit whose dependency is
+    # masked:
+    #
+    #   Failed to start ssh.service: Unit ssh.socket is masked.
+    #
+    # which stops the run two tasks below, with the drop-ins written and sshd
+    # never restarted. `masked: false` is also what repairs a host that an
+    # earlier version of this file masked.
+    - name: Disable socket activation for sshd
+      ansible.builtin.systemd:
+        name: ssh.socket
+        state: stopped
+        enabled: false
+        masked: false
+        daemon_reload: true
+      failed_when: false  # ok if the unit doesn't exist
+
+    # `sshd -t` refuses to run without its privilege separation directory, and
+    # that directory is a systemd RuntimeDirectory: it lives on tmpfs, systemd
+    # creates it when the unit starts and removes it when the unit stops.
+    #
+    # On a host using socket activation - Ubuntu's default since 22.10 - the
+    # running sshd is a per-connection `ssh@N.service` instance and
+    # `ssh.service` itself may never have started. The task above has just
+    # stopped and masked the socket that was standing in for it, so nothing
+    # holds /run/sshd any more and the validation fails with "Missing privilege
+    # separation directory: /run/sshd" on a config that is perfectly valid.
+    #
+    # Creating it by hand costs nothing: systemd recreates and reclaims it on
+    # the next start. It has to happen after the socket is masked, or the
+    # instance shutting down takes the directory with it again.
+    - name: Ensure the sshd privilege separation directory exists
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Validate sshd config
+      ansible.builtin.command: sshd -t
+      changed_when: false
+
+    - name: Ensure ssh service is enabled and running
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Restart ssh if config changed
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_conf.changed or ssh_hardening_conf.changed
+      register: ssh_restarted
+
+    # After sshd moves to the new port, subsequent tasks must reconnect there.
+    - name: Switch ansible_port to the new SSH port for the rest of the play
+      ansible.builtin.set_fact:
+        ansible_port: "{{ ssh_port }}"
+      when: ssh_restarted is changed
+
+    - name: Wait for sshd on the new port
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 30
+      when: ssh_restarted is changed
+
+    # wait_for_connection proves Ansible got back in, which on a re-run it
+    # would have managed anyway over the existing session. This proves the
+    # thing that actually matters: something is listening on ssh_port. If the
+    # socket unit won the port, or sshd came up on 22 instead, the run should
+    # stop here rather than at the UFW deny two tasks later.
+    - name: Confirm sshd is listening on the hardened port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ ssh_port }}"
+        timeout: 30
+        state: started
+
+# Lock down the old SSH port now that sshd has moved to {{ ssh_port }}.
+# Skipped wherever the block above did not move sshd, because denying port 22
+# would then lock us out.
+- name: Tighten UFW on old SSH port
+  when:
+    - ssh_hardening_manage | bool
+    - ssh_old_port != ssh_port
+  block:
+    # Remove the bootstrap allow before adding the deny — UFW evaluates
+    # rules in order and "first match wins", so a leftover allow would
+    # shadow the deny.
+    - name: Remove bootstrap allow rule for old SSH port
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_old_port }}"
+        proto: tcp
+        delete: true
+
+    - name: Deny standard SSH port (port 22)
+      community.general.ufw:
+        rule: deny
+        port: "{{ ssh_old_port }}"
+        proto: tcp
+
+# --- Root lockdown (keep last; ensure admin user has sudo before this runs) ---
+- name: Lock the root account (no password, no login)
+  ansible.builtin.user:
+    name: root
+    password: "!"
+    shell: /usr/sbin/nologin

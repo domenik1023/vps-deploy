@@ -1,0 +1,22 @@
+# --- Fail2ban jail for sshd on custom port ---
+# Deliberately duller than CrowdSec, which should ban first - see
+# fail2ban_maxretry in defaults/main/20_firewall.yml.
+#
+# The jail names ssh_port before 42_ssh.yml has moved sshd there. That is fine:
+# fail2ban reads the journal and bans through ufw, so it never connects to the
+# port and does not care whether anything is listening on it yet.
+- name: Configure fail2ban jail for sshd
+  ansible.builtin.template:
+    src: fail2ban-sshd.conf.j2
+    dest: /etc/fail2ban/jail.d/sshd-local.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: f2b_jail
+
+# --- Fail2ban restart if jail changed ---
+- name: Restart fail2ban if jail changed
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: restarted
+  when: f2b_jail.changed

@@ -6,11 +6,37 @@
 # central LAPI. Renaming a host that is already registered leaves an orphaned
 # machine and bouncer behind - clean those up with `cscli machines delete` and
 # `cscli bouncers delete` on the master.
+#
+# Three groups classify a host, and every host must be in exactly one of them.
+# That membership is the only thing that decides how much of the playbook it
+# gets: roles/baseline derives host_class from it and gates SSH hardening,
+# CrowdSec and WireGuard on the result. 00_classify.yml fails the run for a
+# host in none of them or in more than one, rather than quietly configuring it
+# as something it is not.
 
+# Externally hosted and directly internet-facing. Full SSH hardening, CrowdSec
+# agent and bouncer, and the unthrottled iptables LOG rules those need.
 [vps]
 vps-pangolin
 vps-docker
 
+# Externally hosted, but reachable only through a WireGuard tunnel to the LAN.
+# Same hardening and CrowdSec as [vps], plus the tunnel and a kill switch: the
+# default route is wg0 and nothing leaves the public interface except the
+# tunnel itself and replies to inbound SSH. These exist to run containers that
+# want more RAM than the LAN boxes have, as an extension of the LAN.
+#
+# Every entry needs the wg_* settings in its host_vars - see docs/wireguard.md.
+[vpn]
+vpn-gwdg-01
+#vpn-example
+
+# On the LAN, behind NAT. SSH hardening is skipped to avoid locking yourself
+# out of a box you can walk to, and CrowdSec is not installed: these see none
+# of the internet noise it exists to catch, and each would still consume a
+# machine registration and a bouncer key on the central LAPI. UFW is still
+# enabled, and Docker bridge networks are allowed through it to reach services
+# the host binds - see docker_host_access_cidrs in group_vars/local.yml.
 [local]
 komodo
 reverseproxy
@@ -22,5 +48,8 @@ reverseproxy
 # It has to be listed even though it is never configured: a delegate_to target
 # missing from the inventory falls back to SSH defaults (port 22, no
 # ansible_user), ignoring whatever this host actually needs.
+#
+# Not one of the three classes above - it is never classified because it is
+# never configured.
 [lapi]
 crowdsec-master

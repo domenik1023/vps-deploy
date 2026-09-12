@@ -4,6 +4,7 @@
 
 Hardens a fresh Ubuntu VPS with:
 
+- Three host classes — `vps` (internet-facing), `vpn` (off-site, reached only through a WireGuard tunnel to the LAN) and `local` (on the LAN) — which decide how much of the below each host gets
 - SSH key-only authentication on a custom port (22822), with port 22 denied after hardening
 - UFW firewall with connection-rate limiting on the SSH port
 - Fail2ban as a local backstop behind CrowdSec (bans after 15 failed attempts)
@@ -11,6 +12,7 @@ Hardens a fresh Ubuntu VPS with:
 - Grafana Alloy telemetry agent pushing metrics, logs, traces and profiles to the central observability stack
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
+- WireGuard with a kill switch on `vpn` hosts: the default route is the tunnel, and nothing leaves the public interface if it drops
 - Docker Engine with security daemon config (log rotation, live-restore, no-new-privileges; optional user namespace remap)
 - Chrony NTP for accurate system time
 - Daily unattended security upgrades, with a weekly reboot window for updates that need one
@@ -20,7 +22,7 @@ Hardens a fresh Ubuntu VPS with:
 ```
 vps-deploy/
 ├── main.yml                          # Entry point
-├── inventory                         # Host names, grouped (vps / local / lapi)
+├── inventory                         # Host names, grouped (vps / vpn / local / lapi)
 ├── ansible.cfg                       # Ansible settings
 ├── requirements.yml                  # Galaxy collections
 ├── CLAUDE.md                         # Orientation for Claude Code
@@ -31,11 +33,15 @@ vps-deploy/
 ├── group_vars/
 │   ├── all/
 │   │   └── vault.yml                 # Admin password hash — encrypt with ansible-vault
-│   └── vps.yml                       # Off-site hosts: the public ingest hostname
+│   ├── vps.yml                       # Off-site hosts: the public ingest hostname
+│   ├── vpn.yml                       # Tunnelled hosts: LAN ingest, loose rp_filter
+│   └── local.yml                     # LAN hosts: Docker bridge access to the host
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
-│   └── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
+│   ├── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
+│   └── wireguard.md                  # Tunnel setup, the kill switch, recovery
 ├── host_vars/                        # Optional per-host settings, by name
+│   ├── vpn-example.yml.example       # Template for a new [vpn] host
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
 │   ├── vps-pangolin.yml
 │   ├── komodo.yml
@@ -43,20 +49,34 @@ vps-deploy/
 │   ├── testvm.yml
 │   └── crowdsec-master.yml           # Central LAPI (delegation target only)
 └── roles/
-    ├── config/
-    │   ├── defaults/
-    │   │   └── main.yml              # All configurable variables
+    ├── baseline/                     # Everything every managed host gets
+    │   ├── defaults/main/            # Configurable variables, split by domain
+    │   │   ├── 00_identity.yml       # Hostname, admin user
+    │   │   ├── 10_ssh.yml
+    │   │   ├── 20_firewall.yml       # UFW, fail2ban
+    │   │   ├── 30_system.yml         # Unattended upgrades
+    │   │   ├── 40_docker.yml
+    │   │   ├── 50_crowdsec.yml
+    │   │   └── 60_wireguard.yml
     │   ├── handlers/
     │   │   └── main.yml              # Service restart handlers
+    │   ├── templates/                # Free-form file bodies (sshd, systemd, sysctl)
     │   └── tasks/
     │       ├── main.yml              # Task orchestration
-    │       ├── hostname.yml          # System hostname = inventory name
-    │       ├── user.yml              # Admin user + sudo setup
-    │       ├── hardening.yml         # SSH, UFW, Fail2ban, root lockdown
-    │       ├── sysctl.yml            # Kernel parameter hardening
-    │       ├── software.yml          # Docker, NTP, auto-updates
-    │       ├── crowdsec.yml          # CrowdSec agent + firewall bouncer
-    │       └── crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
+    │       ├── 00_classify.yml       # Exactly one of local / vps / vpn
+    │       ├── 10_hostname.yml       # System hostname = inventory name
+    │       ├── 20_user.yml           # Admin user + sudo setup
+    │       ├── 30_packages.yml       # apt upgrade + base packages
+    │       ├── 40_firewall.yml       # UFW enable and allow rules
+    │       ├── 41_fail2ban.yml       # sshd jail
+    │       ├── 42_ssh.yml            # SSH hardening, port move, root lockdown
+    │       ├── 50_sysctl.yml         # Kernel parameter hardening
+    │       ├── 60_updates.yml        # Unattended upgrades + reboot window
+    │       ├── 61_time.yml           # Chrony NTP
+    │       ├── 62_docker.yml         # Docker engine and daemon config
+    │       ├── 70_crowdsec.yml       # CrowdSec agent + firewall bouncer
+    │       ├── 71_crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
+    │       └── 80_wireguard.yml      # Tunnel + kill switch ([vpn] only)
     └── alloy/
         ├── defaults/
         │   └── main.yml              # Pipelines, endpoints, bind addresses, version pin
@@ -70,7 +90,8 @@ vps-deploy/
 
 1. Target host is running Ubuntu (tested on 22.04/24.04/26.04)
 2. SSH access as root (or a user with sudo) is available on port 22 for the initial run
-3. Your public key is present in `~/.ssh/domenik1023.pub` (or adjust the private key path below)
+3. Your public key is listed in `admin_ssh_keys` (`roles/baseline/defaults/main/00_identity.yml`). The playbook installs it for the admin user before it hardens SSH, and refuses to continue if that would leave the account with no key at all.
+   A host that needs a *different* key for its first run sets `ansible_ssh_private_key_file` in its host_vars; see [Inventory and Host Variables](#inventory-and-host-variables).
 4. Python 3 is installed on the target host
 5. Ansible collections installed locally:
    ```bash
@@ -104,10 +125,12 @@ The admin user password is stored in `group_vars/all/vault.yml` and **must be en
 > Out of the box CrowdSec watches sshd and the firewall's own drop logs;
 > application traffic needs a source adding.
 
-CrowdSec is installed on internet-facing hosts only: the `[local]` group is
-skipped, the same way SSH hardening skips it. Local hosts sit behind NAT and
-see none of the traffic CrowdSec exists to catch, and each would still consume
-a machine registration and a bouncer key on the central LAPI.
+CrowdSec is installed on `[vps]` and `[vpn]` hosts only, the same rule that
+decides SSH hardening. LAN hosts sit behind NAT and see none of the traffic
+CrowdSec exists to catch, and each would still consume a machine registration
+and a bouncer key on the central LAPI. That one gate also keeps CrowdSec's
+iptables work off them: the unthrottled LOG rules in ufw's `before.rules` and
+the bouncer's `INPUT` / `DOCKER-USER` chains are all inside the same include.
 
 Each agent needs two secrets from the central LAPI server: a machine
 login/password and a firewall bouncer API key. Both are created for you — point
@@ -237,23 +260,61 @@ host-specific otherwise (address, SSH port, per-host overrides) goes in
 vps-pangolin
 vps-docker
 
+[vpn]
+vpn-hetzner
+
 [local]
 komodo
 reverseproxy
 ```
 
-The group is not cosmetic either. `[local]` skips the SSH port move (so a LAN
-box cannot lock you out) and skips CrowdSec entirely — a NAT'd host sees none of
-the traffic CrowdSec exists to catch, and each agent would still consume a
-machine registration and a bouncer key on the central LAPI. `[vps]` additionally
-switches the Alloy ingest hostname to the public one. UFW is enabled everywhere,
-including `[local]`.
+**Every host must be in exactly one of `[vps]`, `[vpn]` and `[local]`.** That
+membership is the only thing that decides how much of the playbook it gets:
+`roles/baseline` derives `host_class` from it, and `00_classify.yml` fails the
+run — before anything changes — for a host in none of them or in more than one.
+
+| | `local` | `vps` | `vpn` |
+|---|---|---|---|
+| Where | on the LAN | off-site, internet-facing | off-site, through a tunnel |
+| SSH port move | no — a LAN box cannot be allowed to lock you out | yes | yes |
+| CrowdSec + its iptables rules | no | yes | yes |
+| WireGuard + kill switch | no | no | yes |
+| UFW | yes | yes | yes |
+| Docker bridges reach the host | yes | no | no |
+| Alloy ingest | LAN name | public name | LAN name, over the tunnel |
+
+`[lapi]` is not one of the three. It holds the central CrowdSec LAPI server,
+which is in the inventory only as a delegation target and is never configured —
+both plays run against `all:!lapi`.
+
+A `[vpn]` host needs its tunnel described in host_vars before its first run;
+`host_vars/vpn-example.yml.example` is the template and
+**[docs/wireguard.md](docs/wireguard.md)** is the procedure.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own
 ansible_host: 203.0.113.10
 ansible_port: 22          # 22822 once hardening has run
 ```
+
+### A different SSH key for one host
+
+Some providers hand you a box that only accepts a key of their choosing, so the
+key for the first run is not the one every other host uses. Put it in that
+host's host_vars rather than reaching for `ssh-agent` or a second command line:
+
+```yaml
+# host_vars/<name>.yml
+ansible_ssh_private_key_file: ~/.ssh/hetzner-bootstrap
+```
+
+This **overrides** `--private-key` on the command line, so the usual invocation
+keeps working unchanged for every other host — verified with `-vvv`, which
+prints the `IdentityFile` each connection actually offers.
+
+It sits next to `ansible_port` for the same reason and behaves the same way:
+both describe how to reach this host *right now*, and both are edited once the
+first run has changed it.
 
 Names are not cosmetic. `crowdsec_lapi_login` and `crowdsec_bouncer_name` both
 derive from `inventory_hostname`, so the name is what the host registers as on
@@ -270,12 +331,18 @@ new name; delete the leftovers on the master with `cscli machines delete` and
 
 ## Configuration
 
-Hardening, Docker and CrowdSec values live in `roles/config/defaults/main.yml`;
+Hardening, Docker and CrowdSec values live in `roles/baseline/defaults/main/`;
 Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 [below](#grafana-alloy-1).
 
 | Variable | Default | Description |
 |---|---|---|
+| `host_class` | derived from the inventory group | `local`, `vps` or `vpn`. Empty for a host in none of them, which makes every switch below false — the safe direction. `00_classify.yml` rejects that case outright |
+| `ssh_hardening_manage` | `vps` and `vpn` | Whether sshd moves to `ssh_port` and port 22 is denied |
+| `crowdsec_manage` | `vps` and `vpn` | Whether the CrowdSec agent, bouncer and their iptables LOG rules are installed |
+| `wireguard_manage` | `vpn` only | Whether the tunnel and kill switch are built |
+| `admin_ssh_keys` | one key | Public keys installed for the admin user, before `42_ssh.yml` disables password authentication. `20_user.yml` refuses to continue if this is empty and the account has no `authorized_keys` |
+| `admin_ssh_keys_exclusive` | `false` | Whether those are the *only* keys the admin user may use. Off so a cloud-init-seeded key is not removed on the same run that turns off passwords |
 | `system_hostname` | `{{ inventory_hostname }}` | System hostname to set. Alloy's `instance` label comes from it, so a mismatch with the inventory name hides that host's telemetry |
 | `system_hostname_manage` | `true` | Set `false` to leave the host's own name alone |
 | `system_hostname_pattern` | RFC 1123 regex | Validates the name before it is written; underscores are legal in an inventory name but not in a hostname |
@@ -295,6 +362,8 @@ Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 | `crowdsec_collections_extra` | `[]` | Per-host additions — add here rather than replacing the base list |
 | `ufw_logging` | `low` | UFW log level; the port-scan scenario reads these drop lines |
 | `ufw_allow_rules` | `[]` | Extra UFW allow rules, as `{ src, dest, port, proto, comment }` mappings. Lives here rather than with the role that needs it, because `ufw reload` flushes the CrowdSec bouncer's chains and only this role's handler restores them |
+| `docker_host_access_cidrs` | `[]`, `["172.16.0.0/12"]` on `local` | Docker bridge subnets allowed to reach services the host binds. Container→host packets traverse `INPUT`, where UFW's default-deny drops them — Docker's own rules are in `FORWARD` and never see them. A variable of its own rather than a `ufw_allow_rules` entry, because a host_vars override would replace that list wholesale |
+| `sysctl_rp_filter` | `1`, `2` on `vpn` | Reverse path filtering. Strict (`1`) drops inbound SSH on a host whose default route is a tunnel, before any firewall rule is consulted |
 | `crowdsec_acquisitions` | `{}` | Extra log sources per host — see [docs/crowdsec.md](docs/crowdsec.md) |
 | `crowdsec_firewall_bouncer_package` | `crowdsec-firewall-bouncer-iptables` | Bouncer package (`-nftables` variant for pure-nftables hosts) |
 | `crowdsec_firewall_bouncer_service` | `crowdsec-firewall-bouncer` | Systemd unit; both packages ship the same one |
@@ -346,6 +415,13 @@ each pipeline actually collects.
 
 ## Usage
 
+> `42_ssh.yml` sets `PasswordAuthentication no` and `AllowUsers <admin_user>`,
+> then locks the root account. `20_user.yml` installs `admin_ssh_keys` for that
+> account first, and asserts the account will not be left without a key — so a
+> host whose key list is empty *and* whose `authorized_keys` is missing fails
+> the run there rather than becoming a serial-console job. Keep your key in
+> that list.
+
 ### Initial run (port 22, root or sudo user)
 
 ```bash
@@ -354,6 +430,10 @@ ansible-playbook main.yml -i inventory \
   --ask-vault-pass \
   -u root
 ```
+
+Drop `--private-key` for a host that sets `ansible_ssh_private_key_file` in its
+host_vars — that setting wins either way, but leaving both in place makes it
+look as though the command line is what decides.
 
 ### Subsequent runs (custom port, admin user)
 

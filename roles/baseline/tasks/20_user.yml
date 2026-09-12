@@ -1,0 +1,75 @@
+- name: Set language to English
+  community.general.locale_gen:
+    name: "en_US.UTF-8"
+    state: present
+
+- name: Allow admin user passwordless sudo
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ admin_user }}"
+    content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+# The user module writes `password` into /etc/shadow verbatim. A plaintext
+# value lands there as an unparseable hash, so the account silently ends up
+# with no working password at all - the module only warns about it.
+- name: Verify the admin password is a crypt hash
+  ansible.builtin.assert:
+    that:
+      - admin_password.startswith('$')
+    fail_msg: >-
+      admin_password must be a crypt hash, not plaintext. Generate one with
+      `python3 -c "from passlib.hash import sha512_crypt;
+      print(sha512_crypt.hash('yourpassword'))"` and store it as
+      vault_admin_password in group_vars/all/vault.yml.
+  no_log: true
+
+- name: Ensure admin user exists
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    shell: /bin/bash
+    create_home: true
+    password: "{{ admin_password }}"
+  register: admin_account
+
+# Before 42_ssh.yml, which is the whole point of doing it here: that file turns
+# off password authentication, restricts AllowUsers to this account and locks
+# root. A host that reaches it without a usable key for this user is only
+# reachable from the provider's serial console afterwards.
+- name: Install the admin user's authorized keys
+  ansible.posix.authorized_key:
+    user: "{{ admin_user }}"
+    key: "{{ admin_ssh_keys | join('\n') }}"
+    exclusive: "{{ admin_ssh_keys_exclusive | bool }}"
+    state: present
+  when: admin_ssh_keys | length > 0
+
+- name: Read back the admin user's authorized keys
+  ansible.builtin.stat:
+    path: "{{ admin_account.home }}/.ssh/authorized_keys"
+  register: admin_authorized_keys
+
+# The lockout guard. Passing either way is fine - a key was just installed, or
+# one was already there - but neither means the next play locks the door and
+# throws away the handle.
+#
+# Written as an either/or rather than a check of the file alone so that
+# --check is still useful: in check mode the task above has not written
+# anything, and a fresh host would otherwise fail a dry run that a real run
+# would sail through.
+- name: The admin user must be able to log in by key before SSH is hardened
+  ansible.builtin.assert:
+    that:
+      - admin_ssh_keys | length > 0 or
+        (admin_authorized_keys.stat.exists and admin_authorized_keys.stat.size > 0)
+    fail_msg: >-
+      {{ admin_user }} on {{ inventory_hostname }} has no authorized_keys and
+      admin_ssh_keys is empty, but ssh_hardening_manage is on for this host.
+      Continuing would disable password authentication, restrict AllowUsers to
+      {{ admin_user }} and lock root, leaving no way in except the provider's
+      serial console. Add the key to admin_ssh_keys in
+      defaults/main/00_identity.yml, or put it on the host by hand first.
+    success_msg: "{{ admin_user }} can log in by key"
+  when: ssh_hardening_manage | bool

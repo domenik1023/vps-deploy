@@ -1,0 +1,84 @@
+# --- Host class ---
+# Which of the three inventory groups this host is in, and the three switches
+# derived from it. The groups are the single source of truth about what a host
+# is; nothing else in the role tests group_names.
+#
+# Derived rather than set per group so that the *absence* of a class is a
+# defined state and the safe one: a host in none of them gets no SSH port move,
+# no CrowdSec registration and no tunnel, instead of picking up whatever the
+# old `'local' not in group_names` test happened to let through. 00_classify.yml
+# then fails the run outright, so the fail-safe is a backstop and not the
+# behaviour anyone relies on.
+#
+# `first` is deliberate over anything that would tolerate two matches: a host in
+# both [vps] and [vpn] is a mistake with a real cost either way round, so it is
+# rejected rather than resolved.
+host_class: "{{ ['local', 'vps', 'vpn'] | intersect(group_names) | first | default('', true) }}"
+
+# Off-site hosts get the SSH port move; LAN boxes do not, because a lockout
+# there costs a walk to the machine rather than a support ticket.
+ssh_hardening_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Off-site hosts get the CrowdSec agent, the bouncer, and with them the
+# unthrottled iptables LOG rules in ufw's before.rules. All of that is inside
+# one include, so this one switch covers the lot.
+crowdsec_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Only [vpn] hosts build a tunnel and a kill switch.
+wireguard_manage: "{{ host_class == 'vpn' }}"
+
+# --- Host identity ---
+# The system hostname, set to whatever this host is called in the inventory.
+#
+# It is not cosmetic. Grafana Alloy labels every metric, log line and profile
+# with `instance`, and takes that from the system hostname rather than from
+# anything Ansible knows - so a box called `pangolin` locally but
+# `vps-pangolin` in the inventory ships telemetry no dashboard filtering on the
+# inventory name will ever match. CrowdSec avoids the same trap only because it
+# derives its machine and bouncer names from inventory_hostname explicitly.
+#
+# Override per host for a name that is not the inventory name (an FQDN, say);
+# set system_hostname_manage to false to leave the host's own name untouched.
+#
+# Renaming a host that is already reporting splits its history: existing
+# Prometheus series and Loki streams stay under the old instance label and new
+# ones arrive under the new one, so queries spanning the change need both.
+system_hostname: "{{ inventory_hostname }}"
+system_hostname_manage: true
+
+# RFC 1123: letters, digits and hyphens, each label starting and ending
+# alphanumeric, 63 characters at most. Underscores are the trap worth naming -
+# legal in an inventory name, illegal in a hostname, and systemd rejects the
+# value outright rather than mangling it into something that works.
+# tests/render-check.yml exercises this against names that must and must not
+# pass; hostname.yml asserts the resolved name against it before writing.
+system_hostname_pattern: '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+
+# --- User ---
+admin_user: domenik1023
+# admin_password must be defined in group_vars/all/vault.yml (ansible-vault encrypted)
+# Set it as: vault_admin_password: "<sha512-crypt hash>"
+admin_password: "{{ vault_admin_password }}"
+
+# Public keys installed for the admin user, one string per key.
+#
+# This is not a convenience. 42_ssh.yml sets PasswordAuthentication no, limits
+# AllowUsers to this account and locks root - so a host where this account has
+# no authorized key is unreachable the moment that runs, and the only way back
+# is the provider's serial console. 20_user.yml therefore installs these before
+# any of that happens, and refuses to continue if the account would be left
+# with no key at all.
+#
+# Public keys only. They are not secrets and belong in the repository, where
+# adding a machine is one line rather than a manual copy onto every host.
+admin_ssh_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMQ7AbgzffGjNjVwfizz0RbZ8+/uR78cxQ+AihEVi0Y6 domenik1023@(^_^)"
+
+# Whether the keys above are the *only* ones the admin user may log in with.
+#
+# False by default, and deliberately: a provider image sometimes seeds the
+# account from cloud-init, and removing that key on the same run that disables
+# password authentication removes the way back in if the list here turns out to
+# be wrong. Turn it on once a host is known good, to make the list declarative
+# and revoke anything that arrived some other way.
+admin_ssh_keys_exclusive: false

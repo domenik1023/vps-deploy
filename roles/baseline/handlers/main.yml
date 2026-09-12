@@ -1,0 +1,62 @@
+# Handlers fire in the order they are defined here, not the order they are
+# notified, so the daemon-reload has to come before any service it affects.
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Restart Docker
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+
+# `ufw reload` is a stop/start: it flushes the built-in chains and deletes every
+# non-builtin one, which takes the CrowdSec bouncer's rules with it. So it has
+# to be defined ahead of the bouncer handler that puts them back, and it has to
+# notify that handler itself - a run that only touches before.rules would
+# otherwise leave the host unprotected until the next bouncer restart.
+- name: Reload UFW
+  community.general.ufw:
+    state: reloaded
+  notify:
+    - Restart CrowdSec bouncer
+    - Restart WireGuard kill switch
+
+- name: Restart CrowdSec
+  ansible.builtin.service:
+    name: crowdsec
+    state: restarted
+
+# Both handlers below are notified by Reload UFW, which fires on *any* host
+# that changes a ufw rule - and that now includes LAN boxes, because
+# docker_host_access_cidrs adds one there. Neither service exists on a LAN box,
+# so both need the same guard that decided whether they were installed at all.
+#
+# Without it the run dies at the very end, after every task has succeeded, with
+# "Could not find the requested service crowdsec-firewall-bouncer". Gated on
+# the *_manage switch rather than swallowed with failed_when, so a bouncer
+# genuinely missing from a [vps] host is still an error.
+- name: Restart CrowdSec bouncer
+  ansible.builtin.service:
+    name: "{{ crowdsec_firewall_bouncer_service }}"
+    state: restarted
+  when:
+    - crowdsec_manage | bool
+    # crowdsec_manage says this host *should* have CrowdSec; it does not say it
+    # does. A [vpn] or [vps] host on a release packagecloud has not shipped for
+    # yet has the switch on and no bouncer, so restarting one fails the run at
+    # the very end - the same failure this guard was added for, one layer down.
+    - crowdsec_suite_available | default(true) | bool
+
+# Same story as the bouncer, one table over: the kill switch's chains are
+# jumped into from OUTPUT and DOCKER-USER, and `ufw reload`'s iptables-restore
+# flushes the builtins those jumps live in. A [vpn] host would be left routing
+# everything into a tunnel with nothing stopping traffic leaving the public
+# interface if the tunnel dropped - which is the failure the kill switch exists
+# to prevent, reintroduced by an unrelated firewall rule change.
+#
+# Defined after Reload UFW, because handlers fire in definition order.
+- name: Restart WireGuard kill switch
+  ansible.builtin.systemd_service:
+    name: wg-killswitch
+    state: restarted
+  when: wireguard_manage | bool and wg_killswitch | bool

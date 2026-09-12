@@ -50,7 +50,8 @@ alloy_otlp_extra_receivers:
 # arrive on the bridge interface and traverse INPUT, where UFW's default-deny
 # drops them - Docker's own rules are in FORWARD and never see this. Scoped to
 # the bridge subnet and the gateway address so it opens nothing on the public
-# interface. See ufw_allow_rules in roles/config/defaults/main.yml.
+# interface. See ufw_allow_rules in
+# roles/baseline/defaults/main/20_firewall.yml.
 ufw_allow_rules:
   - src: "172.19.0.0/16"
     dest: "172.19.0.1"

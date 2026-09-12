@@ -9,14 +9,23 @@
 #
 #   ansible-playbook tests/render-check.yml
 #
-# It deliberately reads roles/config/defaults/main.yml rather than restating the
-# expressions, so it tests the real definitions.
+# It deliberately reads the roles' own defaults rather than restating the
+# expressions, so it tests the real definitions. vars_files cannot take a
+# directory, so roles/baseline/defaults/main/ has to be listed file by file -
+# and the first assertion below is what stops a seventh file being added
+# without anyone wiring it up here.
 - name: Check that the role's derived variables render to the right shapes
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
-    - ../roles/config/defaults/main.yml
+    - ../roles/baseline/defaults/main/00_identity.yml
+    - ../roles/baseline/defaults/main/10_ssh.yml
+    - ../roles/baseline/defaults/main/20_firewall.yml
+    - ../roles/baseline/defaults/main/30_system.yml
+    - ../roles/baseline/defaults/main/40_docker.yml
+    - ../roles/baseline/defaults/main/50_crowdsec.yml
+    - ../roles/baseline/defaults/main/60_wireguard.yml
     - ../roles/alloy/defaults/main.yml
   vars:
     # Only present so defaults referencing it can be loaded; never used.
@@ -24,8 +33,447 @@
     # Relative to this playbook. The Alloy config is a template rather than a
     # variable, so its assertions render it here instead of reading a value.
     alloy_template: ../roles/alloy/templates/config.alloy.j2
+    killswitch_template: ../roles/baseline/templates/wg-killswitch.j2
+
+    # One host_vars file, read as data. Templated lazily, so `item` resolves to
+    # whichever file the loop that used it is on.
+    #
+    # The regex is not decoration. `ansible-vault encrypt_string` emits
+    # `key: !vault |`, from_yaml has no constructor for that tag, and the whole
+    # play dies with "could not determine a constructor for the tag '!vault'"
+    # the moment any host keeps a secret in its host_vars - which is how a
+    # [vpn] host stores its private and preshared keys. Dropping the tag leaves
+    # an ordinary block scalar holding the ciphertext: the key is still there,
+    # which is all these assertions look at, and nothing tries to decrypt it.
+    host_vars_of: >-
+      {{ lookup('ansible.builtin.file', item)
+         | regex_replace('!vault\s*\|', '|')
+         | from_yaml | default({}, true) }}
 
   tasks:
+    # Every assertion below reads a variable that came from one of the files in
+    # vars_files. Splitting the defaults into a directory made it possible to
+    # add a seventh file and have nothing here notice - the assertions would go
+    # on passing, testing the six that are loaded. Compare the two lists.
+    - name: Every baseline defaults file must be loaded by this play
+      ansible.builtin.assert:
+        that:
+          - defaults_on_disk | difference(defaults_loaded) | length == 0
+        fail_msg: >-
+          {{ defaults_on_disk | difference(defaults_loaded) | join(', ') }}
+          exists in roles/baseline/defaults/main/ but is not in this play's
+          vars_files, so nothing here asserts anything about it. Add it to both.
+        success_msg: "{{ defaults_loaded | length }} baseline defaults files loaded"
+      vars:
+        defaults_on_disk: >-
+          {{ query('ansible.builtin.fileglob', '../roles/baseline/defaults/main/*.yml')
+             | map('basename') | sort }}
+        defaults_loaded:
+          - 00_identity.yml
+          - 10_ssh.yml
+          - 20_firewall.yml
+          - 30_system.yml
+          - 40_docker.yml
+          - 50_crowdsec.yml
+          - 60_wireguard.yml
+
+    # localhost is in no host class, which is the state 00_classify.yml exists
+    # to reject on a real host - and it is also the one that has to fail safe
+    # if that assert is ever weakened or skipped. A host whose class cannot be
+    # worked out must get *less* than a LAN box, not more: no SSH port move to
+    # lock itself out with, no machine registration on the shared LAPI, no
+    # tunnel. The old `'local' not in group_names` test did the opposite.
+    - name: A host in no class must get nothing rather than everything
+      ansible.builtin.assert:
+        that:
+          - host_class == ''
+          - not ssh_hardening_manage | bool
+          - not crowdsec_manage | bool
+          - not wireguard_manage | bool
+        fail_msg: >-
+          With no host class ({{ host_class | default('undefined') }}), the
+          gating switches came out as ssh={{ ssh_hardening_manage }},
+          crowdsec={{ crowdsec_manage }}, wireguard={{ wireguard_manage }}.
+          All three must be false: an unclassified host is the failure case,
+          and it has to fail towards doing less.
+
+    # Opens every port on the host to whatever is on those subnets, so the
+    # subnets are the whole of the scoping. 0.0.0.0/0 there is not a wider
+    # version of the same rule, it is `ufw allow from any` - on a host whose
+    # only firewall is ufw.
+    - name: Docker host access must stay scoped to private bridge subnets
+      ansible.builtin.assert:
+        that:
+          - docker_host_access_cidrs is sequence
+          - docker_host_access_cidrs is not string
+          - docker_host_access_cidrs is not mapping
+          - docker_host_access_cidrs | reject('match', private_cidr) | list | length == 0
+        fail_msg: >-
+          docker_host_access_cidrs must hold private CIDRs only;
+          {{ docker_host_access_cidrs | reject('match', private_cidr) | list | join(', ') }}
+          is not one. Each entry allows every port on this host from that
+          source, so a public range there opens the box to the internet.
+      vars:
+        private_cidr: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9./]*$'
+
+    # The mark is used as its own mask, in `--set-xmark M/M`,
+    # `--restore-mark --nfmask M --ctmask M` and `ip rule fwmark M/M`. A value
+    # with more than one bit set still works there, but the point of the mask
+    # is to leave every other bit alone - wg-quick sets its own fwmark on the
+    # encrypted packets it sends, and clearing that routes the tunnel's traffic
+    # back into the tunnel. One bit, and above any routing table number
+    # wg-quick would pick (it counts up from 51820 = 0xca6c).
+    - name: The kill switch mark must be a single bit clear of wg-quick's fwmark
+      ansible.builtin.assert:
+        that:
+          - wg_killswitch_mark is match('^0x[1248]0*$')
+          - wg_killswitch_mark | int(base=16) > 65535
+        fail_msg: >-
+          wg_killswitch_mark ({{ wg_killswitch_mark }}) must be a single bit
+          written in hex - 0x1, 0x2, 0x4, 0x8 and those followed by zeros - and
+          must sit above 0xffff so it cannot collide with the routing table
+          number wg-quick derives its own fwmark from.
+
+    # wg-quick installs its rules at 32764 and 32765. A kill switch rule at or
+    # below those in priority order is never consulted, and the symptom is not
+    # a firewall error - it is an SSH session that hangs the moment the default
+    # route moves, on a host whose console is at the provider.
+    - name: The kill switch ip rule must outrank wg-quick's own
+      ansible.builtin.assert:
+        that:
+          - wg_killswitch_rule_priority | int > 0
+          - wg_killswitch_rule_priority | int < 32764
+        fail_msg: >-
+          wg_killswitch_rule_priority ({{ wg_killswitch_rule_priority }}) must
+          be between 1 and 32763. wg-quick adds `not fwmark <t> table <t>` at
+          32765 and `table main suppress_prefixlength 0` at 32764; a rule
+          numbered above those never gets to send inbound replies back out the
+          public interface.
+
+    # The lockout test. Every RETURN in the kill switch's OUTPUT chain has to
+    # come before its DROP, because iptables stops at the first match - and the
+    # two rules that matter most are the tunnel's own port (without it the
+    # tunnel can never come up) and tcp --sport <ssh_port> (which is what keeps
+    # an SSH session alive if the conntrack marking is wrong). Reordering or
+    # dropping either is a trip to the provider's serial console.
+    - name: The kill switch must let the tunnel and SSH out before it drops
+      ansible.builtin.assert:
+        that:
+          - out_rules | length > 3
+          - out_rules[-1] is search('-j DROP')
+          - out_rules[:-1] | select('search', '-j DROP') | list | length == 0
+          - out_rules | select('search', '--sport "\$SSH_PORT"') | list | length == 1
+          - out_rules | select('search', '--dport "\$WG_PORT"') | list | length == 1
+          - killswitch_rendered.count('{' ~ '{') == 0
+          - killswitch_rendered.count('{' ~ '%') == 0
+        fail_msg: >-
+          The kill switch's OUTPUT chain no longer ends in a single DROP with
+          every RETURN ahead of it, or has lost the SSH or WireGuard exception.
+          Rendered rules, in order:
+          {{ out_rules | join(' | ') }}
+      vars:
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
+        out_rules: >-
+          {{ killswitch_rendered.splitlines()
+             | select('search', '-A "\$OUT_CHAIN"') | map('trim') | list }}
+
+    # Both toggles change what the script lets past its final DROP, and both
+    # fail quietly in the direction that costs something: an extra_allow that
+    # renders nothing is a hole nobody opened but everybody assumes is there,
+    # and a DNS exception that cannot be turned off is a permanent leak out of
+    # the public interface.
+    # The kill switch is a shell script assembled by a template, with a loop
+    # and two conditionals in it. Everything else here checks what the rules
+    # say; this checks that the file is a script at all. A stray delimiter or
+    # an unbalanced quote from an extra_allow entry would otherwise land on the
+    # host as a unit that fails to start, on the run that also moved the
+    # default route into the tunnel.
+    - name: Render the kill switch script somewhere bash can parse it
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .sh
+      register: killswitch_tmp
+      changed_when: false
+
+    - name: The rendered kill switch must be valid bash
+      block:
+        - name: Write the rendered kill switch
+          ansible.builtin.copy:
+            content: >-
+              {{ lookup('ansible.builtin.template', killswitch_template,
+                        template_vars=syntax_vars) }}
+            dest: "{{ killswitch_tmp.path }}"
+            mode: "0600"
+          changed_when: false
+          vars:
+            syntax_vars:
+              wg_wan_interface_resolved: eth0
+              wg_peer_endpoint: "vpn.example.com:51820"
+              wg_killswitch_extra_allow:
+                - "-p tcp --dport 443 -d 203.0.113.10"
+
+        - name: Parse it
+          ansible.builtin.command:
+            argv: [bash, -n, "{{ killswitch_tmp.path }}"]
+          changed_when: false
+      always:
+        - name: Clean up the rendered kill switch
+          ansible.builtin.file:
+            path: "{{ killswitch_tmp.path }}"
+            state: absent
+          changed_when: false
+
+    - name: The kill switch toggles must add and remove the rules they name
+      ansible.builtin.assert:
+        that:
+          - with_dns is search('--dport 53')
+          - without_dns is not search('--dport 53')
+          - with_extra is search('-p tcp --dport 443 -d 203.0.113.10')
+        fail_msg: >-
+          wg_killswitch_allow_dns or wg_killswitch_extra_allow no longer
+          controls what the kill switch script emits.
+      vars:
+        base_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        with_dns: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=base_vars | combine({'wg_killswitch_allow_dns': true})) }}
+        without_dns: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=base_vars | combine({'wg_killswitch_allow_dns': false})) }}
+        with_extra: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=base_vars | combine({'wg_killswitch_extra_allow':
+                      ['-p tcp --dport 443 -d 203.0.113.10']})) }}
+
+    # Reload UFW fires on any host that changes a ufw rule, which since
+    # docker_host_access_cidrs includes LAN boxes - and it notifies handlers
+    # for two services that only exist where CrowdSec or WireGuard was
+    # installed. An unguarded one of those kills the run at the very end, after
+    # every task has succeeded, with "Could not find the requested service".
+    #
+    # Read out of the handlers file rather than restated, so adding a third
+    # notify to Reload UFW puts it under the same rule automatically.
+    - name: Everything Reload UFW notifies must be safe on every host class
+      ansible.builtin.assert:
+        that:
+          - ufw_notifies | length > 0
+          - unguarded | length == 0
+        fail_msg: >-
+          {{ unguarded | join(', ') }} in roles/baseline/handlers/main.yml
+          {{ 'is' if unguarded | length == 1 else 'are' }} notified by Reload
+          UFW but carr{{ 'ies' if unguarded | length == 1 else 'y' }} no `when`.
+          Reload UFW runs on every host that touches a ufw rule, LAN boxes
+          included, so anything it notifies has to be gated on the same switch
+          that decided whether its service was installed at all.
+        success_msg: >-
+          Reload UFW notifies {{ ufw_notifies | join(', ') }}, all guarded
+      vars:
+        baseline_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/handlers/main.yml')
+             | from_yaml }}
+        reload_ufw: "{{ baseline_handlers | selectattr('name', 'equalto', 'Reload UFW') | first }}"
+        # `notify` may be a single string or a list.
+        ufw_notifies: >-
+          {{ reload_ufw.notify if reload_ufw.notify is sequence
+             and reload_ufw.notify is not string else [reload_ufw.notify] }}
+        unguarded: >-
+          {{ baseline_handlers | selectattr('name', 'in', ufw_notifies)
+             | rejectattr('when', 'defined') | map(attribute='name') | list }}
+
+    # Three tasks in 42_ssh.yml's hardening block have to stay in this order,
+    # and the failure is the same each time: the run stops half way through
+    # hardening, with the drop-ins written and sshd not restarted.
+    #
+    #   disable the socket  so sshd binds the port itself rather than being
+    #                       handed connections by ssh.socket, which ignores the
+    #                       Port in sshd_config
+    #   create /run/sshd    because stopping the socket lets systemd remove the
+    #                       RuntimeDirectory, and `sshd -t` will not run without
+    #                       it - "Missing privilege separation directory"
+    #   validate            before anything restarts sshd on the new config
+    - name: Sshd validation must follow its privsep directory and the socket change
+      ansible.builtin.assert:
+        that:
+          - at.socket >= 0
+          - at.privsep > at.socket
+          - at.validate > at.privsep
+        fail_msg: >-
+          42_ssh.yml runs these in the order socket={{ at.socket }},
+          privsep={{ at.privsep }}, validate={{ at.validate }} (-1 is missing).
+          `sshd -t` needs /run/sshd, and stopping ssh.socket is what lets systemd
+          take that directory away - so the three have to run in that order, or
+          the run stops with the drop-ins written and sshd never restarted.
+        success_msg: "42_ssh.yml disables the socket, creates /run/sshd, then validates"
+      vars:
+        ssh_tasks: >-
+          {{ (lookup('ansible.builtin.file', ssh_file)
+              | from_yaml | selectattr('block', 'defined') | first).block
+             | map(attribute='name') | list }}
+        ssh_file: ../roles/baseline/tasks/42_ssh.yml
+        n_socket: Disable socket activation for sshd
+        n_privsep: Ensure the sshd privilege separation directory exists
+        n_validate: Validate sshd config
+        at:
+          socket: "{{ ssh_tasks.index(n_socket) if n_socket in ssh_tasks else -1 }}"
+          privsep: "{{ ssh_tasks.index(n_privsep) if n_privsep in ssh_tasks else -1 }}"
+          validate: "{{ ssh_tasks.index(n_validate) if n_validate in ssh_tasks else -1 }}"
+
+    # These are installed for the account that 42_ssh.yml then makes the only
+    # one allowed to log in, with passwords off and root locked. An entry that
+    # is not a usable public key is not a typo, it is a host reachable only
+    # from the provider's serial console.
+    #
+    # The private-key check is the one worth having: pasting the wrong half of
+    # a keypair here publishes it to every host in the fleet and to the
+    # repository, and the file would still look plausible at a glance.
+    - name: Admin SSH keys must be public keys, and nothing else
+      ansible.builtin.assert:
+        that:
+          - admin_ssh_keys is sequence
+          - admin_ssh_keys is not string
+          - admin_ssh_keys is not mapping
+          - admin_ssh_keys | reject('match', pubkey_form) | list | length == 0
+          - admin_ssh_keys | select('search', 'PRIVATE KEY') | list | length == 0
+          - admin_ssh_keys_exclusive is boolean
+        fail_msg: >-
+          admin_ssh_keys must hold OpenSSH public keys - "<type> <base64>
+          [comment]".
+          {{ admin_ssh_keys | reject('match', pubkey_form) | list | join(', ')
+             | default('An entry looks like a PRIVATE key.', true) }}
+        success_msg: >-
+          {{ admin_ssh_keys | length }} admin public key(s),
+          exclusive={{ admin_ssh_keys_exclusive }}
+      vars:
+        pubkey_form: '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-\S+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+=*( .*)?$'
+
+    # CrowdSec is skipped whole on a release packagecloud does not carry yet,
+    # and "skipped" has to mean it: a task that escapes the gated block adds a
+    # .sources file naming a suite that does not exist, and from then on every
+    # apt operation on the host fails - including the ones in 30_packages.yml,
+    # which have nothing to do with CrowdSec and will be what appears to break.
+    #
+    # So nothing outside that block may touch apt.
+    - name: Nothing installs CrowdSec outside the availability gate
+      ansible.builtin.assert:
+        that:
+          - gated | length == 1
+          - "'crowdsec_suite_available' in gated | first"
+          - ungated_apt | length == 0
+          - crowdsec_apt_suite | string is match('^([a-z]+)?$')
+        fail_msg: >-
+          70_crowdsec.yml must keep every apt task inside one block gated on
+          crowdsec_suite_available.
+          {{ ungated_apt | join(', ') | default('The gate itself is missing.', true) }}
+          {{ 'is' if ungated_apt | length == 1 else 'are' }} outside it.
+        success_msg: >-
+          {{ (crowdsec_tasks | selectattr('block', 'defined') | first).block | length }}
+          CrowdSec tasks gated on the repository carrying this release
+      vars:
+        crowdsec_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/70_crowdsec.yml')
+             | from_yaml }}
+        gated: "{{ crowdsec_tasks | selectattr('block', 'defined') | map(attribute='when') | list }}"
+        # `dict | list` yields its keys, so this is every module and keyword
+        # used by a task that is not inside the block.
+        #
+        # Not selectattr('ansible.builtin.apt', 'defined'): Jinja reads the dots
+        # as nested attribute access, so that looks for task.ansible.builtin.apt,
+        # finds nothing, and passes whatever the file says. Which it duly did,
+        # until the negative test caught it.
+        ungated_keys: >-
+          {{ crowdsec_tasks | rejectattr('block', 'defined') | map('list')
+             | flatten | unique | list }}
+        ungated_apt: "{{ ungated_keys | select('search', 'apt|deb822_repository') | list }}"
+
+    # The kill switch has to be pointed at the interface that reaches the
+    # internet without the tunnel, and there are two tempting ways to work that
+    # out, both of which have now been tried on a real host and failed:
+    #
+    #   default_ipv4.interface   follows the tunnel, so it is right exactly
+    #                            once and says wg0 on every run afterwards -
+    #                            pointing the kill switch at the tunnel, which
+    #                            blocks the tunnel and opens the public link
+    #   matching ansible_host    fails on any provider handing out a floating
+    #                            or NAT'd address, where the VM holds only a
+    #                            private one and the public address is on a
+    #                            router
+    #
+    # The default route in the main table is neither: wg-quick puts the
+    # tunnel's route in a table of its own, so main names the public interface
+    # whether the tunnel is up or not.
+    #
+    # Asserted against the task's argv rather than the file's text, because the
+    # text includes the comment explaining all of the above - and a search for
+    # "default_ipv4" duly matched that, failing on a correct file. Either
+    # replacement derivation would delete this task as unused.
+    - name: The public interface must come from the main routing table
+      ansible.builtin.assert:
+        that:
+          - route_argv == ['ip', '-4', 'route', 'show', 'default', 'table', 'main']
+        fail_msg: >-
+          80_wireguard.yml must read the public interface from
+          `ip -4 route show default table main`, which names it whether the
+          tunnel is up or not. Found {{ route_argv | default([]) | join(' ')
+            | default('no such task', true) }}.
+        success_msg: "the public interface is read from the main routing table"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/80_wireguard.yml')
+             | from_yaml }}
+        route_task: >-
+          {{ wg_tasks
+             | selectattr('name', 'equalto', 'Find the interface holding the default route')
+             | first | default({}, true) }}
+        # .get() with the key spelled out, never map(attribute='a.b.c'):
+        # Jinja reads dots in `attribute` as nested access, so it would look
+        # for task.ansible.builtin.command, find nothing, and pass.
+        route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
+
+    # wg.conf.j2 must read the private key from wg_private_key_resolved, the
+    # fact 80_wireguard.yml settles on - never from wg_private_key, which is
+    # the *input* and is simply absent whenever the host generates its own key.
+    #
+    # That is not hypothetical: the template kept saying wg_private_key after
+    # the fact was introduced, and the run died at "'wg_private_key' is
+    # undefined" - with the message censored, because the task carries
+    # no_log for the obvious reason.
+    #
+    # Rendering with only the generated-key variables is the test. A template
+    # that reaches for wg_private_key raises here, exactly as it did on the
+    # host, rather than being read for and found in a comment.
+    - name: The tunnel config must take its key from the resolved fact
+      ansible.builtin.assert:
+        that:
+          - rendered is search('PrivateKey = ' ~ probe_key)
+          - rendered is search('Address = 10.0.2.11/32')
+          - rendered is search('PublicKey = SERVERKEY=')
+          # No preshared key given, so the line must not appear at all - an
+          # empty PresharedKey is a config wg-quick refuses to load.
+          - rendered is not search('PresharedKey')
+        fail_msg: "wg.conf.j2 rendered:\n{{ rendered }}"
+        success_msg: "wg.conf.j2 renders from wg_private_key_resolved alone"
+      vars:
+        probe_key: GENERATEDONHOST=
+        # Deliberately no wg_private_key: this is what a host that generated
+        # its own key actually has.
+        wg_conf_vars:
+          wg_private_key_resolved: GENERATEDONHOST=
+          wg_address: 10.0.2.11/32
+          wg_peer_public_key: SERVERKEY=
+          wg_peer_endpoint: vpn.example.com:51820
+          wg_dns: []
+        rendered: >-
+          {{ lookup('ansible.builtin.template',
+                    '../roles/baseline/templates/wg.conf.j2',
+                    template_vars=wg_conf_vars) }}
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with
@@ -396,7 +844,7 @@
         label: "{{ item | basename }}"
       vars:
         alloy_host_vars: ../host_vars/*.yml
-        host_overrides: "{{ lookup('ansible.builtin.file', item) | from_yaml | default({}, true) }}"
+        host_overrides: "{{ host_vars_of }}"
         rendered: "{{ lookup('ansible.builtin.template', alloy_template, template_vars=host_overrides) }}"
         # Every `component.kind "label" {` at the start of a line.
         labels: "{{ rendered | regex_findall('^[a-z_][a-z0-9_.]* \"([^\"]*)\" \\{', multiline=True) }}"
@@ -414,6 +862,41 @@
         # also names the outbound loki.write and remote_write URLs.
         binds: "{{ (rendered | regex_findall('(?:grpc|http) \\{ endpoint = \"([^\":]*):')) + (rendered | regex_findall('listen_address = \"([^\"]*)\"')) }}"
         private_address: '^(10\.|192\.168\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
+
+    # 80_wireguard.yml asserts the same thing on the host, but only once the
+    # play has already set the hostname, created the admin user, moved sshd and
+    # installed Docker. Half-configured host_vars should not get that far: a
+    # [vpn] host that turns out to be missing its endpoint has spent a full run
+    # to find out, and left a box hardened but with no route home.
+    #
+    # Keyed off any wg_ setting being present rather than off group membership,
+    # because this play has no inventory - the file is the only evidence that
+    # somebody meant this host to have a tunnel.
+    - name: Any host_vars naming a tunnel must name all of it
+      ansible.builtin.assert:
+        that:
+          - wg_required | difference(host_settings) | length == 0
+          - "'wg_private_key' in host_settings or host_overrides.wg_generate_key | default(false)"
+        fail_msg: >-
+          host_vars/{{ item | basename }} sets
+          {{ host_settings | join(', ') }}, which is a partial tunnel. It also
+          needs {{ wg_required | difference(host_settings) | join(', ')
+                   | default('a private key', true) }}.
+          All of it comes from the client config the WireGuard server generated
+          - see docs/wireguard.md.
+        success_msg: "{{ item | basename }} describes a complete tunnel"
+      when: host_settings | length > 0
+      loop: "{{ query('ansible.builtin.fileglob', alloy_host_vars) | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        alloy_host_vars: ../host_vars/*.yml
+        host_overrides: "{{ host_vars_of }}"
+        host_settings: "{{ host_overrides.keys() | select('match', '^wg_') | list }}"
+        wg_required:
+          - wg_address
+          - wg_peer_public_key
+          - wg_peer_endpoint
 
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional

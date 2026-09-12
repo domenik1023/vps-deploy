@@ -61,7 +61,7 @@ cannot serve that purpose, for two independent reasons:
   rule gets you a log line on a different path, with its own 3/min limit
   hardcoded in UFW's source and unaffected by loglevel.
 
-So `crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
+So `70_crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
 both `/etc/ufw/before.rules` and `/etc/ufw/before6.rules`:
 
 ```
@@ -94,6 +94,57 @@ the firewall bouncer's rules with it. The `Reload UFW` handler notifies
 
 Application traffic is **not** covered by either. CrowdSec parses only what it
 is pointed at, so a host serving HTTP needs its own source — see below.
+
+## Where the packages come from
+
+packagecloud does not keep up with Ubuntu. At the time of writing the CrowdSec
+repository has nothing newer than `oracular` (24.10), so a host on 25.04 or
+26.04 asking for its own release gets:
+
+```
+E: The repository '.../ubuntu resolute Release' does not have a Release file.
+```
+
+after five apt retries, naming neither CrowdSec nor the release as the cause.
+Worse, the failed run leaves a `crowdsec.sources` behind that breaks **every
+later apt operation on that host** — including ones with nothing to do with
+CrowdSec, which are what will appear to be broken.
+
+So `70_crowdsec.yml` asks the repository before adding it, and **skips CrowdSec
+entirely** when the answer is no:
+
+```
+TASK [Report that CrowdSec is waiting on an upstream release]
+ok: [vpn-gwdg-01] => The CrowdSec repository has nothing for resolute yet, so
+CrowdSec is skipped on vpn-gwdg-01 and its repository has been removed.
+```
+
+The run carries on and the host gets everything else. Re-run once packagecloud
+publishes the release and CrowdSec installs itself with no further changes.
+
+There is deliberately **no fallback to an older suite**. A host running a
+release CrowdSec has not shipped for yet is better off without it than quietly
+carrying a build meant for something else, and a fallback would also mean the
+host never picks up the real packages once they appear.
+
+Note what the skip does beyond nothing: it removes
+`/etc/apt/sources.list.d/crowdsec.sources` if a previous run left one. That is
+the difference between a host that is merely missing CrowdSec and a host whose
+apt is broken.
+
+Only a definite 404 counts as "not carried yet". A connection failure, a proxy
+error or a repository outage fails the run instead, because those are not the
+same thing and should not read as one.
+
+To install anyway from a release the repository does have, having decided that
+is what you want:
+
+```yaml
+crowdsec_apt_suite: noble
+```
+
+Check what is actually published under
+<https://packagecloud.io/crowdsec/crowdsec/ubuntu/dists/>.
 
 ## Collections
 

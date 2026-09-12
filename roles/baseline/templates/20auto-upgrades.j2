@@ -1,0 +1,6 @@
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+// Rebooting is handled by the reboot-if-required timer, which can pick a
+// weekday; unattended-upgrades only understands a time of day.
+Unattended-Upgrade::Automatic-Reboot "false";

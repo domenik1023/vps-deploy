@@ -1,0 +1,116 @@
+# --- WireGuard ---
+# Applied to [vpn] hosts only; wireguard_manage in 00_identity.yml is what
+# gates it. These boxes are rented off-site but belong to the LAN: the default
+# route is the tunnel, and the kill switch means a tunnel that drops takes the
+# host's internet with it rather than quietly falling back to the VPS's own
+# public address.
+#
+# The per-host half - address, keys, endpoint - comes from the client you create
+# on the WireGuard server. See docs/wireguard.md; there is no API to automate
+# that side, and which half of the keypair you have to move depends on the
+# server's version - see wg_generate_key below.
+
+wg_interface: wg0
+
+# Full tunnel. Anything narrower makes the kill switch a lie: traffic outside
+# the AllowedIPs would have no tunnel to take and would be dropped rather than
+# routed, which looks exactly like a broken tunnel.
+wg_allowed_ips:
+  - "0.0.0.0/0"
+
+# The UDM is behind a home connection, so the host has to keep the mapping
+# open from its side. 25s is the WireGuard default recommendation and is below
+# every common NAT timeout.
+wg_persistent_keepalive: 25
+
+# 1420 = 1500 - 80 for the WireGuard header over IPv4. Lower it if the VPS's
+# own link is not 1500 (some providers hand out 1450 on a virtual NIC), or TCP
+# through the tunnel stalls on large packets while ping stays fine.
+wg_mtu: 1420
+
+# The interface this host reaches the internet on. Empty to derive it, from
+# the default route in the main routing table.
+#
+# Main is the right table because wg-quick does not touch it: with
+# AllowedIPs = 0.0.0.0/0 the tunnel's default route goes in a table of its own,
+# reached by an `ip rule`. So main names the public interface whether the
+# tunnel is up or not.
+#
+# Note this is the interface, not the address, and on a NAT'd host the two
+# disagree: an OpenStack floating IP lives on a router, and the VM sees only a
+# private address. The kill switch cares about the interface, so that is fine -
+# but it is why this cannot be derived from ansible_host.
+#
+# Set it here or in host_vars for a host with more than one default route,
+# where picking the first is a coin toss rather than an answer.
+wg_wan_interface: ""
+
+# Generate the keypair on the host instead of taking wg_private_key from the
+# vault, and print the public half to register on the server.
+#
+# Which one you want depends on the server, and UniFi versions differ: some
+# generate the client keypair and hand back a finished config, others give you
+# only the server's public key and a preshared key and expect a client public
+# key back. This is for the second, and it is the better shape - the private
+# key is generated on the host that uses it and never travels.
+#
+# The run that mints the key stops right after printing it, because the server
+# cannot know it yet and everything below would fail at the handshake check
+# after moving the default route. Register the key, run again, and the second
+# pass continues with the same key - `wg genkey` is guarded by `creates:`.
+wg_generate_key: false
+
+# --- Kill switch ---
+# Nothing leaves the public interface except the tunnel itself and the few
+# exceptions below. Container traffic is covered too, in DOCKER-USER, because
+# Docker's FORWARD jumps run ahead of ufw's and ufw-before-forward never sees
+# it.
+wg_killswitch: true
+
+# The connmark bit that means "this connection came in on the public interface,
+# so its replies go back out of it". Set on inbound packets, restored onto
+# outbound ones, and matched by an `ip rule` that sends those to the main
+# routing table instead of the tunnel.
+#
+# A single bit, used as both value and mask, and that matters: wg-quick sets
+# its own fwmark on the encrypted packets it sends, and an unmasked
+# `CONNMARK --restore-mark` would overwrite it - which routes the tunnel's own
+# packets back into the tunnel. Masked to one bit, the two coexist.
+#
+# It is not wg-quick's fwmark and must not be set to it. wg-quick picks that
+# value at runtime (the first free routing table from 51820 up) and overrides
+# whatever FwMark the config file asks for, so it is not a number this repo can
+# know.
+wg_killswitch_mark: "0x40000"
+
+# Priority of the `ip rule` that acts on that mark. Must be below wg-quick's
+# own rules, which it installs at 32764 and 32765, or the tunnel's default
+# route wins and marked replies never reach the public interface.
+wg_killswitch_rule_priority: 30000
+
+# Let DNS out of the public interface even when the tunnel is down.
+#
+# Worth understanding before turning it off: a wg_peer_endpoint that is a DNS
+# name has to be resolved before the tunnel can come up, and with the tunnel
+# down the only resolver the host can reach is out there. Blocking it means the
+# tunnel can never recover on its own. An endpoint written as a bare IP address
+# does not have this problem, and is the only case where turning this off is
+# safe.
+wg_killswitch_allow_dns: true
+
+# Extra iptables match specifications allowed out of the public interface, each
+# appended to the kill switch's OUTPUT chain ahead of its final DROP. Written
+# as raw iptables arguments, e.g.
+#
+#   wg_killswitch_extra_allow:
+#     - "-p tcp --dport 443 -d 203.0.113.10"
+#
+# Scope every entry. An unscoped one is a hole in the only thing keeping this
+# host's traffic inside the tunnel.
+wg_killswitch_extra_allow: []
+
+# How long the automatic rollback waits before undoing the tunnel and the kill
+# switch, if the play does not get far enough to cancel it. It is armed before
+# the default route moves and cancelled once the host has been confirmed
+# reachable, so it only ever fires on a run that locked itself out.
+wg_rollback_delay: 5min

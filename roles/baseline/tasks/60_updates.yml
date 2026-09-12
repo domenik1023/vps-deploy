@@ -1,0 +1,37 @@
+# --- UNATTENDED UPGRADES ---
+
+# 20auto-upgrades is the standard file to toggle the periodic update timer
+- name: Configure auto-updates (daily)
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+# Upgrades that need a reboot leave /run/reboot-required behind. Take it at a
+# fixed weekly window instead of whenever the upgrade happens to land.
+- name: Install the reboot-if-required service
+  ansible.builtin.template:
+    src: reboot-if-required.service.j2
+    dest: /etc/systemd/system/reboot-if-required.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install the reboot-if-required timer
+  ansible.builtin.template:
+    src: reboot-if-required.timer.j2
+    dest: /etc/systemd/system/reboot-if-required.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Set the weekly reboot timer state
+  ansible.builtin.systemd_service:
+    name: reboot-if-required.timer
+    enabled: "{{ unattended_reboot_enabled | bool }}"
+    state: "{{ 'started' if unattended_reboot_enabled | bool else 'stopped' }}"
+    daemon_reload: true

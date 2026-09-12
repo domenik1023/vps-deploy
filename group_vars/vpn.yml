@@ -1,0 +1,31 @@
+# Settings shared by every off-site host that reaches the LAN over WireGuard.
+#
+# The per-host half of the tunnel - address, keys, endpoint - lives in
+# host_vars/<name>.yml, because it comes out of the client config the UniFi
+# WireGuard server generates for that client. See docs/wireguard.md.
+
+# The LAN ingest hostname, which is also the role default - stated here anyway,
+# because "the same value as a LAN box" is true for a completely different
+# reason and that reason is worth writing down. A [vpn] host is off-site, so
+# the obvious thing would be group_vars/vps.yml's public ingest.d1023.de. It
+# takes the LAN name instead because its default route is the tunnel: the LAN
+# is one hop away and the public name would leave the tunnel, get proxied back
+# in, and be indistinguishable from a working setup until the tunnel dropped.
+#
+# Two things have to hold for this, and neither is visible from here. DNS for
+# ingest.net.d1023.de has to resolve on this host, which means wg_dns pointing
+# at the LAN resolver in host_vars. And the UDM has to route the peer to the
+# internet, because the Alloy play runs after the tunnel is up and fetches its
+# release from GitHub through it.
+alloy_ingest_base: "https://ingest.net.d1023.de"
+
+# Loose reverse path filtering. Strict (the role default of 1) drops inbound
+# SSH on the public interface as soon as the default route is the tunnel: the
+# kernel looks for a route back to that source, finds it points down wg0, and
+# discards the packet before any firewall rule is consulted. The kill switch's
+# careful work on replies never gets the chance to matter.
+#
+# This is a kernel-level relaxation and it is real: loose mode accepts a packet
+# from any source the host has *some* route to, which with a 0.0.0.0/0 tunnel
+# is everything. Anti-spoofing on these hosts is the firewall's job instead.
+sysctl_rp_filter: 2

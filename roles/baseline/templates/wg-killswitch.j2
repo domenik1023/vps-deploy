@@ -1,0 +1,222 @@
+#!/bin/bash
+# Managed by Ansible - roles/baseline/templates/wg-killswitch.j2. Local edits
+# are overwritten on the next run.
+#
+#   wg-killswitch on    install the rules
+#   wg-killswitch off   remove them
+#
+# Nothing leaves {{ wg_wan_interface_resolved }} except the tunnel's own
+# packets and the exceptions listed under "the host itself" below. Everything
+# else is expected to go through {{ wg_interface }}, which holds the default
+# route while it is up. When it is down, traffic is dropped rather than
+# escaping on the VPS's public address - that is the point.
+#
+# Three places, because one is not enough:
+#
+#   mangle    marks connections arriving on the public interface, restores the
+#             mark on the way out, and an `ip rule` sends those to the main
+#             routing table. Without it, replies to an inbound SSH connection
+#             would be routed into the tunnel and the session would hang the
+#             instant the default route moved.
+#   filter    OUTPUT covers traffic the host originates.
+#   filter    DOCKER-USER covers containers. They are forwarded traffic, and
+#             Docker's own FORWARD jumps run ahead of ufw's, so a rule in
+#             ufw-before-forward would never be reached.
+#
+# Every chain here is created by this script and jumped into from a builtin.
+# `ufw reload` flushes the builtins and takes those jumps with it, so the
+# Reload UFW handler restarts this unit - the same reason it restarts the
+# CrowdSec bouncer.
+#
+# The mark is masked to a single bit. wg-quick sets its own fwmark on the
+# encrypted packets it sends, and an unmasked --restore-mark would clear it,
+# routing the tunnel's own traffic back into the tunnel.
+set -euo pipefail
+
+WAN='{{ wg_wan_interface_resolved }}'
+MARK='{{ wg_killswitch_mark }}'
+PRIO='{{ wg_killswitch_rule_priority }}'
+SSH_PORT='{{ ssh_port }}'
+WG_PORT='{{ wg_peer_endpoint.rsplit(":", 1)[1] }}'
+
+OUT_CHAIN='WG-KILLSWITCH-OUT'
+FWD_CHAIN='WG-KILLSWITCH-FWD'
+MARK_CHAIN='WG-KILLSWITCH-MARK'
+RESTORE_CHAIN='WG-KILLSWITCH-RESTORE'
+
+# Create the chain, or empty it if a previous run left it there. Rebuilding
+# from empty is what makes this safe to run repeatedly, including from the
+# Reload UFW handler.
+ensure_chain() {
+    local ipt=$1 table=$2 chain=$3
+    "$ipt" -t "$table" -N "$chain" 2>/dev/null || "$ipt" -t "$table" -F "$chain"
+}
+
+remove_chain() {
+    local ipt=$1 table=$2 chain=$3
+    "$ipt" -t "$table" -F "$chain" 2>/dev/null || true
+    "$ipt" -t "$table" -X "$chain" 2>/dev/null || true
+}
+
+# Delete every copy of the rule first, then insert one at the top. -D in a loop
+# rather than once: a crashed run, or a Docker restart between runs, can leave
+# more than one behind, and a duplicate jump is a rule that survives `off`.
+ensure_jump() {
+    local ipt=$1 table=$2 parent=$3
+    shift 3
+    while "$ipt" -t "$table" -D "$parent" "$@" 2>/dev/null; do :; done
+    "$ipt" -t "$table" -I "$parent" 1 "$@"
+}
+
+remove_jump() {
+    local ipt=$1 table=$2 parent=$3
+    shift 3
+    while "$ipt" -t "$table" -D "$parent" "$@" 2>/dev/null; do :; done
+}
+
+# The chain exists in this family, whether we made it or Docker did.
+has_chain() {
+    "$1" -t "$2" -L "$3" -n >/dev/null 2>&1
+}
+
+# Whether this address family can be configured at all.
+#
+# A host with IPv6 turned off has no ip6tables tables and no `ip -6 rule`, and
+# every v6 command below fails. Without this check the first of them aborts the
+# script under `set -e` - half way through, after the v4 rules are in but
+# before the v6 filter chain exists - and the unit lands in `failed` with the
+# host protected on one family and not the other. Check once, and skip the
+# family cleanly instead.
+family_usable() {
+    local ipt=$1 fam=$2
+    [ "$fam" = 4 ] && return 0
+    [ -e /proc/net/if_inet6 ] || return 1
+    "$ipt" -t mangle -L -n >/dev/null 2>&1 || return 1
+    ip -6 rule show >/dev/null 2>&1 || return 1
+}
+
+build() {
+    local ipt=$1 fam=$2
+
+    # --- mangle: replies leave by the interface the connection arrived on ---
+    ensure_chain "$ipt" mangle "$MARK_CHAIN"
+    "$ipt" -t mangle -A "$MARK_CHAIN" -j CONNMARK --set-xmark "$MARK/$MARK"
+    ensure_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$MARK_CHAIN"
+
+    ensure_chain "$ipt" mangle "$RESTORE_CHAIN"
+    "$ipt" -t mangle -A "$RESTORE_CHAIN" \
+        -j CONNMARK --restore-mark --nfmask "$MARK" --ctmask "$MARK"
+    ensure_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
+
+    # Marked packets take the main table, where the public interface still
+    # holds a default route, instead of wg-quick's tunnel table. Below
+    # wg-quick's own rules at 32764/32765 so it is consulted first.
+    ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null || true
+    ip -"$fam" rule add fwmark "$MARK/$MARK" table main priority "$PRIO"
+
+    # --- filter OUTPUT: the host itself ---
+    ensure_chain "$ipt" filter "$OUT_CHAIN"
+
+    # Loopback, {{ wg_interface }} and every bridge in one rule: only the
+    # public interface is policed here, and a container reaching the host is
+    # 40_firewall.yml's job.
+    "$ipt" -A "$OUT_CHAIN" ! -o "$WAN" -j RETURN
+
+    # The tunnel's own packets, or it could never come up.
+    "$ipt" -A "$OUT_CHAIN" -p udp --dport "$WG_PORT" -j RETURN
+
+    # Replies to an inbound SSH session, matched on the source port. This one
+    # needs no conntrack mark and no `ip rule`, which is deliberate: it is the
+    # rule that still holds if the mangle half is wrong, and losing SSH here
+    # means a trip to the provider's serial console.
+    "$ipt" -A "$OUT_CHAIN" -p tcp --sport "$SSH_PORT" -j RETURN
+
+    # Everything else that was reached from the outside.
+    "$ipt" -A "$OUT_CHAIN" -m connmark --mark "$MARK/$MARK" -j RETURN
+
+    # Address configuration. Without these the host loses its own address when
+    # the DHCP lease expires, or when a router advertisement goes unanswered -
+    # a slow failure that looks nothing like a firewall problem.
+    if [ "$fam" = 4 ]; then
+        "$ipt" -A "$OUT_CHAIN" -p udp --sport 68 --dport 67 -j RETURN
+    else
+        "$ipt" -A "$OUT_CHAIN" -p ipv6-icmp -j RETURN
+        "$ipt" -A "$OUT_CHAIN" -p udp --sport 546 --dport 547 -j RETURN
+    fi
+{% if wg_killswitch_allow_dns %}
+
+    # Resolving wg_peer_endpoint, which has to happen before the tunnel that
+    # would otherwise carry DNS can come up. See wg_killswitch_allow_dns.
+    "$ipt" -A "$OUT_CHAIN" -p udp --dport 53 -j RETURN
+    "$ipt" -A "$OUT_CHAIN" -p tcp --dport 53 -j RETURN
+{% endif %}
+{% for spec in wg_killswitch_extra_allow %}
+    "$ipt" -A "$OUT_CHAIN" {{ spec }} -j RETURN
+{% endfor %}
+
+    "$ipt" -A "$OUT_CHAIN" -j DROP
+    ensure_jump "$ipt" filter OUTPUT -j "$OUT_CHAIN"
+
+    # --- filter DOCKER-USER: containers ---
+    # Created if absent so that this unit can run before dockerd; Docker's own
+    # -N is a no-op on a chain that already exists. Skipped for IPv6 unless
+    # Docker made one, because without Docker IPv6 there is no v6 container
+    # traffic to forward.
+    if [ "$fam" = 4 ]; then
+        "$ipt" -N DOCKER-USER 2>/dev/null || true
+    fi
+    if has_chain "$ipt" filter DOCKER-USER; then
+        ensure_chain "$ipt" filter "$FWD_CHAIN"
+        # Nothing from the internet reaches a container: published ports are
+        # bound on every address, and Docker's FORWARD rules accept them
+        # regardless of ufw. Reach them over the tunnel instead.
+        "$ipt" -A "$FWD_CHAIN" -i "$WAN" -j DROP
+        # And no container egress outside the tunnel.
+        "$ipt" -A "$FWD_CHAIN" -o "$WAN" -j DROP
+        "$ipt" -A "$FWD_CHAIN" -j RETURN
+        ensure_jump "$ipt" filter DOCKER-USER -j "$FWD_CHAIN"
+    fi
+}
+
+teardown() {
+    local ipt=$1 fam=$2
+
+    remove_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$MARK_CHAIN"
+    remove_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
+    remove_jump "$ipt" filter OUTPUT -j "$OUT_CHAIN"
+    if has_chain "$ipt" filter DOCKER-USER; then
+        remove_jump "$ipt" filter DOCKER-USER -j "$FWD_CHAIN"
+    fi
+
+    remove_chain "$ipt" mangle "$MARK_CHAIN"
+    remove_chain "$ipt" mangle "$RESTORE_CHAIN"
+    remove_chain "$ipt" filter "$OUT_CHAIN"
+    remove_chain "$ipt" filter "$FWD_CHAIN"
+
+    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null; do :; done
+}
+
+# Within build() the final DROP is the last rule added, so a build that dies
+# part way leaves a chain that has not started dropping anything yet. That is
+# the right direction to fail in for the run that installs it: an incomplete
+# kill switch leaks, a half-built one that dropped first would take SSH with it.
+case "${1:-}" in
+    on)
+        build iptables 4
+        if family_usable ip6tables 6; then
+            build ip6tables 6
+        else
+            echo "wg-killswitch: IPv6 unavailable on this host, skipping v6 rules" >&2
+        fi
+        ;;
+    off)
+        teardown iptables 4
+        if family_usable ip6tables 6; then
+            teardown ip6tables 6
+        fi
+        ;;
+    *)
+        echo "usage: $(basename "$0") on|off" >&2
+        exit 2
+        ;;
+esac

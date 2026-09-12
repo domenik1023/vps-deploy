@@ -1,0 +1,7 @@
+# --- NTP ---
+
+- name: Ensure chrony is enabled and running
+  ansible.builtin.service:
+    name: chronyd
+    enabled: true
+    state: started

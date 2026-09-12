@@ -1,0 +1,74 @@
+# Template for a [vpn] host. Copy to host_vars/<name>.yml, fill in from the
+# client config the UniFi WireGuard server generated, and add <name> to [vpn]
+# in the inventory. See docs/wireguard.md for the UDM side and for what to
+# check before the first run.
+#
+# The .example suffix keeps this file out of both Ansible's host_vars loading
+# and the per-host loop in tests/render-check.yml.
+
+# The key this host accepts. Only needed when it differs from the one the rest
+# of the fleet uses - a provider that injects its own key for the first boot,
+# say. It overrides --private-key on the command line, so the usual invocation
+# keeps working for every other host.
+# ansible_ssh_private_key_file: ~/.ssh/provider-bootstrap
+
+# Reach it on the public address for the first run. The hardening tasks move
+# sshd to ssh_port and then deny ssh_old_port, so set this to 22822 afterwards
+# - and keep using the public address, not the tunnel address: the tunnel is
+# built by the run, so on a bootstrap run it does not exist yet.
+ansible_host: 203.0.113.10
+ansible_port: 22
+
+# --- The tunnel ---
+# Straight out of the [Interface] block of the generated client config.
+wg_address: 10.0.2.11/32
+
+# The LAN resolver, so that ingest.net.d1023.de (see group_vars/vpn.yml) and
+# anything else internal resolves once the tunnel is up.
+wg_dns:
+  - 192.168.2.1
+
+# From the [Peer] block. wg_peer_endpoint is host:port; prefer a bare IP if the
+# home connection has a static one, because a DNS name has to be resolved
+# before the tunnel can come up - see wg_killswitch_allow_dns.
+wg_peer_public_key: "REPLACE_WITH_THE_SERVERS_PUBLIC_KEY"
+wg_peer_endpoint: "vpn.example.com:51820"
+
+# Secrets. Never in plain text here - encrypt each one in place:
+#
+#   ansible-vault encrypt_string --name wg_preshared_key '<PresharedKey>'
+#
+# and paste what it prints. Leave wg_preshared_key out if the server does not
+# use one - but if it does, omitting it gives a tunnel that comes up and never
+# handshakes. Plain text here works too; see "Vaulting, or not" in
+# docs/wireguard.md for what that costs.
+#
+# wg_preshared_key: !vault |
+#           $ANSIBLE_VAULT;1.1;AES256
+#           ...
+
+# --- The private key: pick one ---
+#
+# If the server handed you a finished client config, it contains a PrivateKey.
+# Encrypt it the same way and set it here:
+#
+#   ansible-vault encrypt_string --name wg_private_key '<PrivateKey>'
+#
+# wg_private_key: !vault |
+#           $ANSIBLE_VAULT;1.1;AES256
+#           ...
+#
+# If instead the server gave you only its own public key and expects a client
+# public key back - which is what UniFi does in some versions - set this and
+# leave wg_private_key out. The first run generates the keypair on the host,
+# prints the public half and stops before touching routing; register that key
+# on the server and run again. See docs/wireguard.md.
+#
+# wg_generate_key: true
+
+# The interface reaching the internet without the tunnel. Derived from the
+# default route in the main routing table, which names it whether the tunnel is
+# up or not - including on a NAT'd host, where the VM sees only a private
+# address and the public one lives on a router. Set it only for a host with
+# more than one default route, where picking the first is a coin toss.
+# wg_wan_interface: ens3
