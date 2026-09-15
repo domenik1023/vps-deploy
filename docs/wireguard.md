@@ -74,6 +74,13 @@ rather than a misconfigured one:
   release from GitHub through it, so a peer that can reach OPNsense but not
   the internet fails the run at Alloy rather than at WireGuard.
 
+  Registering the peer above and adding this rule are two different pages,
+  and only the second one complains if you forget it by *not existing* rather
+  than by erroring — the tunnel still comes up and handshakes with no access
+  at all. **[docs/opnsense-firewall.md](opnsense-firewall.md)** covers the
+  rule shapes in use, rule ordering, and how to do this from the API instead
+  of the UI.
+
 ### 2. Write the host_vars file
 
 Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:

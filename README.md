@@ -41,7 +41,8 @@ vps-deploy/
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 │   ├── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
-│   └── wireguard.md                  # Tunnel setup, the kill switch, recovery
+│   ├── wireguard.md                  # Tunnel setup, the kill switch, recovery
+│   └── opnsense-firewall.md          # Firewall rules for WireGuard peers — not automatic
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── vpn-example.yml.example       # Template for a new [vpn] host
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
@@ -301,7 +302,10 @@ both plays run against `all:!lapi`.
 
 A `[vpn]` host needs its tunnel described in host_vars before its first run;
 `host_vars/vpn-example.yml.example` is the template and
-**[docs/wireguard.md](docs/wireguard.md)** is the procedure.
+**[docs/wireguard.md](docs/wireguard.md)** is the procedure. Registering the
+peer on OPNsense does not by itself grant it any access — that is a separate
+firewall rule, covered in
+**[docs/opnsense-firewall.md](docs/opnsense-firewall.md)**.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own
