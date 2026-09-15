@@ -98,7 +98,14 @@ ip rule add table main suppress_prefixlength 0 priority 32764
 # switch would look exactly like a broken test.
 set +e
 
+# A rule this script left behind at an older wg_killswitch_rule_priority.
+# Deleting only at the *current* priority orphans it, and on a host where the
+# stale number sits above wg-quick's own the wrong rule still wins.
+ip rule add fwmark $MARK/$MARK table main priority 30000
+
 $work/wg-killswitch on >/dev/null 2>&1; echo \"ON_EXIT=\$?\"
+echo \"MARK_RULE_COUNT=\$(ip rule show | grep -c $MARK || true)\"
+echo \"MARK_RULE_PRIO=\$(ip rule show | grep $MARK | grep -oE '^[0-9]+' | tr '\\n' ' ')\"
 echo \"LAST_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | tail -1)\"
 echo \"SSH_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | grep -c -- '--sport 22822')\"
 echo \"UNMARKED=\$(ip route get 203.0.113.99 | head -1)\"
@@ -137,6 +144,12 @@ check "a marked reply takes the public link"  "dev $WAN"  "$(get MARKED)"
 # route MTU, so the same rule on the public interface would do nothing.
 check "clamps MSS on traffic forwarded into the tunnel" "1" "$(get MSS_JUMP)"
 check "the clamp follows the tunnel path MTU"           "1" "$(get MSS_RULE)"
+
+# Lowering wg_killswitch_rule_priority has to actually move the rule, not add
+# a second one beside the old. Exactly one rule for this mark, at the
+# configured priority, with the stale 30000 one gone.
+check "replaces a rule left at an older priority" "1" "$(get MARK_RULE_COUNT)"
+check "and installs it at the configured priority" "100" "$(get MARK_RULE_PRIO)"
 
 check "removes cleanly and exits 0"           "0"    "$(get OFF_EXIT)"
 check "leaves no iptables rules behind"       "0"    "$(get LEFTOVER_RULES)"

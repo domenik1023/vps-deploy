@@ -195,6 +195,42 @@
           Check `ip rule` on the actual host if you need to verify this rather
           than trusting a number here.
 
+    # Lowering wg_killswitch_rule_priority only helps if the old rule actually
+    # goes away. Both deletes used to pin `priority "$PRIO"`, which meant a rule
+    # this script had left at some *earlier* value was never matched: `on` added
+    # the new rule beside the stale one and `off` removed only the new one. On a
+    # host carrying a stale 30000 from before the default was lowered, that is
+    # the rule sitting above wg-quick's own - so it wins the race and inbound
+    # replies go into the tunnel, which is the whole failure the priority change
+    # was meant to fix. It cost a live debugging session on wings-p01.
+    #
+    # tests/killswitch-netns.sh proves the behaviour against a real kernel by
+    # planting a rule at 30000 first; this keeps the shape from regressing in CI
+    # where namespaces may be unavailable.
+    - name: The kill switch must delete its ip rule by mark, not by priority
+      ansible.builtin.assert:
+        that:
+          - rule_deletes | length == 2
+          - rule_deletes | select('search', 'priority') | list | length == 0
+          - killswitch_rendered is search('rule add fwmark "\$MARK/\$MARK" table main priority "\$PRIO"')
+        fail_msg: >-
+          The kill switch's `ip rule del` must match on the mark alone so that
+          a rule left at an earlier wg_killswitch_rule_priority is removed too.
+          Found {{ rule_deletes | length }} delete(s),
+          {{ rule_deletes | select('search', 'priority') | list | length }} of
+          them pinned to a priority: {{ rule_deletes | join(' | ') }}
+        success_msg: "the ip rule is deleted by mark and added at the configured priority"
+      vars:
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
+        rule_deletes: >-
+          {{ killswitch_rendered.splitlines()
+             | select('search', 'rule del fwmark') | map('trim') | list }}
+
     # The lockout test. Every RETURN in the kill switch's OUTPUT chain has to
     # come before its DROP, because iptables stops at the first match - and the
     # two rules that matter most are the tunnel's own port (without it the

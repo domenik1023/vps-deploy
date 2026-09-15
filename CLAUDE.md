@@ -281,6 +281,20 @@ restored correctly on both chains, and packets still went into the tunnel,
 because `ip rule` is evaluated lowest-number-first and wg-quick's rule won.
 The default is now `100`, chosen to sit below either number rather than trust
 one. Check `ip rule` on any new deployment instead of assuming either value.
+
+**Lowering that number only helps if the old rule goes away, and it used not
+to.** Both `ip rule del` calls pinned `priority "$PRIO"`, so a rule the script
+had left at an *earlier* value was never matched: `on` added the new rule
+beside the stale one, and `off` removed only the new one. A host provisioned
+back when the default was `30000` therefore kept a `30000` rule forever — and
+that is the one sitting above wg-quick's own `29999`, so it still won the race
+and inbound replies still went into the tunnel. The symptom is the documented
+one exactly, on a host whose config says `100`. Both deletes now match on the
+mark alone and loop, so a priority change actually moves the rule and `off`
+leaves nothing behind. `tests/killswitch-netns.sh` plants a rule at `30000`
+before running `on` and asserts exactly one remains, at the configured
+priority; `tests/render-check.yml` keeps the shape from regressing where
+namespaces are unavailable.
 The kill switch marks connections arriving on the public interface (`mangle
 PREROUTING`), restores the mark on the way out (`mangle OUTPUT`) and adds an
 `ip rule` at `wg_killswitch_rule_priority` sending those to the main table.

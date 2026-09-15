@@ -122,7 +122,15 @@ build() {
     # be below (checked before) whatever wg-quick actually installs, which is
     # not reliably 32764/32765 - see wg_killswitch_rule_priority in
     # defaults/main.yml for what a real deployment showed.
-    ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null || true
+    #
+    # The delete matches on the mark alone, deliberately, and loops. Pinning it
+    # to "$PRIO" - which is what this did - means a rule this script left at
+    # some *other* priority is never removed: lowering the default from 30000
+    # to 100 then adds the new rule and orphans the old one, and on a host
+    # where the stale number sits above wg-quick's own the wrong rule can still
+    # win. Deleting by mark makes a priority change actually take effect, and
+    # is why `off` leaves nothing behind after one.
+    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
     ip -"$fam" rule add fwmark "$MARK/$MARK" table main priority "$PRIO"
 {% if wg_mss_clamp %}
 
@@ -236,7 +244,9 @@ teardown() {
     remove_chain "$ipt" filter "$OUT_CHAIN"
     remove_chain "$ipt" filter "$FWD_CHAIN"
 
-    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null; do :; done
+    # By mark, not by priority - same reason as in build(): a rule left at an
+    # earlier value of wg_killswitch_rule_priority has to go too.
+    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
 }
 
 # Within build() the final DROP is the last rule added, so a build that dies
