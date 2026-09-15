@@ -78,8 +78,8 @@ rather than a misconfigured one:
   and only the second one complains if you forget it by *not existing* rather
   than by erroring — the tunnel still comes up and handshakes with no access
   at all. **[docs/opnsense-firewall.md](opnsense-firewall.md)** covers the
-  rule shapes in use, rule ordering, and how to do this from the API instead
-  of the UI.
+  rule shapes in use, why they go on the WireGuard interface tab rather than
+  WAN, and how to tell which piece is missing from the host.
 
 ### 2. Write the host_vars file
 
