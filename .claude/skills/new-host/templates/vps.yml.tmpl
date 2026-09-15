@@ -1,0 +1,16 @@
+# <NAME> - [vps]. Internet-facing: full hardening, CrowdSec agent and bouncer.
+ansible_host: <ADDRESS>
+# 22 for the bootstrap run; set to 22822 once sshd has moved.
+ansible_port: <PORT>
+
+# Only if the image's first-boot user is not root.
+# ansible_user: cloud
+
+# Optional. See docs/alloy.md and docs/crowdsec.md.
+# alloy_extra_scrape_targets:
+#   - { name: "example", address: "127.0.0.1:9100" }
+# alloy_access_logs:
+#   - path: /path/to/access.log
+#     format: caddy          # or traefik
+# crowdsec_collections_extra:
+#   - crowdsecurity/caddy

@@ -170,6 +170,12 @@ Alloy is not skipped anywhere — a LAN box reaches the default
 `ingest.net.d1023.de` without any override, and so does a `[vpn]` host, over
 its tunnel.
 
+Adding a host is guided by the `new-host` skill in `.claude/skills/new-host/`:
+it asks for what cannot be derived, checks the host_vars invariants below, and
+writes a lean `host_vars/<name>.yml` from `templates/<class>.yml.tmpl` plus the
+inventory line. The long-form `host_vars/vpn-example.yml.example` stays as
+reference; generated files do not copy its commentary.
+
 Hosts are named in `inventory`; addresses and per-host settings live in
 `host_vars/<name>.yml`. The name is not cosmetic — `crowdsec_lapi_login` and
 `crowdsec_bouncer_name` derive from `inventory_hostname`, so renaming a host

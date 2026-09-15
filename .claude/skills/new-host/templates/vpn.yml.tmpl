@@ -1,0 +1,39 @@
+# <NAME> - [vpn]. Default route through the OPNsense tunnel. The tunnel values
+# come from the peer registered on OPNsense; see docs/wireguard.md and
+# docs/opnsense-firewall.md.
+#
+# Bootstrap on the public address - the tunnel does not exist yet. Set vpn_ip
+# below once it is proven, to move later runs onto the tunnel address.
+ansible_host: "{{ vpn_ip | default('<ADDRESS>') }}"
+# 22 for the bootstrap run; set to 22822 once sshd has moved.
+ansible_port: <PORT>
+
+# Only if the image's first-boot user is not root.
+# ansible_user: cloud
+
+# No fallback: a run with this set fails outright if the tunnel is down.
+# vpn_ip: <WG_ADDRESS_WITHOUT_MASK>
+
+# --- The tunnel ---
+# Must match this peer's Allowed IPs on OPNsense exactly.
+wg_address: <WG_ADDRESS>
+wg_dns:
+  - 9.9.9.9
+
+# OPNsense's own instance key and host:port - never this host's key.
+wg_peer_public_key: "<WG_PEER_PUBLIC_KEY>"
+wg_peer_endpoint: "<WG_PEER_ENDPOINT>"
+
+# Only if the OPNsense peer entry has one. Vaulted, never plain:
+#   ansible-vault encrypt_string --name wg_preshared_key '<PresharedKey>'
+# wg_preshared_key: !vault |
+#           $ANSIBLE_VAULT;1.1;AES256
+#           ...
+
+# Only on a host with more than one default route, where picking the first is
+# a coin toss. `ip -4 addr` names the right one.
+# wg_wan_interface: ens3
+
+# OPNsense never hands out a client private key, so the host makes its own.
+# The first run prints the public half and stops before touching routing.
+wg_generate_key: true
