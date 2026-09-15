@@ -583,6 +583,55 @@
         # for task.ansible.builtin.command, find nothing, and pass.
         route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
 
+    # wg-quick applies `DNS =` by piping into `resolvconf` and fails outright
+    # without it, so the role installs a provider. That install has to come
+    # *before* the assert that checks for the command, or the run stops on a
+    # host it was one task away from fixing - the same shape as 20_user.yml
+    # installing the admin keys before asserting the account has one.
+    #
+    # The gate matters as much as the order: unconditional, this would install
+    # systemd-resolved on every [vpn] host whether or not it set wg_dns, and
+    # that package takes over /etc/resolv.conf.
+    - name: The resolvconf provider must be installed before it is asserted on
+      ansible.builtin.assert:
+        that:
+          - install_name in names
+          - assert_name in names
+          - install_before_assert
+          - install_when is search('wg_dns')
+          - install_pkg is search('wg_resolvconf_package')
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must install the resolvconf provider
+          before it asserts the command exists, gated on wg_dns and naming
+          wg_resolvconf_package. Found install
+          {{ 'before' if install_before_assert else 'missing or after' }}
+          the assert; when={{ install_when | default('none', true) }};
+          package={{ install_pkg | default('none', true) }}.
+        success_msg: "the resolvconf provider is installed before it is asserted on"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        install_name: Install a resolvconf provider for wg_dns
+        assert_name: Setting wg_dns needs a resolvconf implementation on the host
+        # Ordering read off the file text rather than by slicing the name list
+        # at the assert's index: ansible-lint renders these expressions
+        # statically, where `names` is not yet a real list and a slice index
+        # raises. A search for one task name followed by the other says the
+        # same thing with filters lint can evaluate.
+        tunnel_src: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml') }}
+        install_before_assert: >-
+          {{ tunnel_src is search(install_name ~ '[\s\S]*' ~ assert_name) }}
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', install_name)
+             | first | default({}, true) }}
+        # .get() with the key spelled out, never map(attribute='a.b.c') - Jinja
+        # reads the dots as nested access and would quietly find nothing.
+        install_pkg: "{{ install_task.get('ansible.builtin.apt', {}).get('name', '') }}"
+        install_when: "{{ install_task.get('when', []) | join(' ') }}"
+
     # wg.conf.j2 must read the private key from wg_private_key_resolved, the
     # fact roles/wireguard/tasks/tunnel.yml settles on - never from wg_private_key, which is
     # the *input* and is simply absent whenever the host generates its own key.

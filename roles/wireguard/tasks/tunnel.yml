@@ -116,9 +116,29 @@
 # openresolv, the old resolvconf package), and a minimal cloud image may have
 # none of them.
 #
+# Install one rather than stopping for it. The old behaviour was to assert and
+# fail, which is a halt three tasks short of the tunnel for something one apt
+# install fixes - and it fires on exactly the minimal cloud image this role is
+# most likely to meet. See wg_resolvconf_package in defaults/main.yml for why
+# systemd-resolved and what installing it changes about the host.
+#
+# Before the check below, not after, so the assert is a post-condition on a run
+# that has already tried to fix it - the same shape as 20_user.yml asserting
+# "keys to install, or keys already there".
+- name: Install a resolvconf provider for wg_dns
+  ansible.builtin.apt:
+    name: "{{ wg_resolvconf_package }}"
+    state: present
+  when:
+    - wg_dns | default([]) | length > 0
+    - wg_resolvconf_package | default('') | length > 0
+
 # Checked here rather than discovered at `wg-quick up`, where the error is
 # "resolvconf: command not found" from inside a systemd unit, several tasks
 # after the one that could have said so.
+#
+# stat reports a symlink as existing, which matters: systemd-resolved provides
+# the command as /usr/sbin/resolvconf -> ../bin/resolvectl, not a real file.
 - name: Check that wg_dns has something to apply it with
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -139,9 +159,14 @@
       {{ inventory_hostname }} sets wg_dns ({{ wg_dns | join(', ') }}) but has
       no `resolvconf` command, which is how wg-quick applies it -
       `wg-quick up {{ wg_interface }}` would fail with "resolvconf: command not
-      found" and the tunnel would never come up. Install one (`apt install
-      openresolv`, or systemd-resolved's compatibility symlink), or drop wg_dns
-      and point the host at a resolver another way.
+      found" and the tunnel would never come up.
+      {% if wg_resolvconf_package | default('') | length > 0 %}The task above
+      installed {{ wg_resolvconf_package }} and it still did not provide the
+      command, so that package is the wrong one for this host - try
+      openresolv.{% else %}wg_resolvconf_package is empty, so nothing was
+      installed. Set it (systemd-resolved on Ubuntu, or openresolv), install a
+      provider by hand, or drop wg_dns and point the host at a resolver another
+      way.{% endif %}
   when: wg_dns | default([]) | length > 0
 
 - name: Install WireGuard

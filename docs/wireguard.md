@@ -82,6 +82,19 @@ Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
 | --- | --- |
 | this host's own tunnel address (what you're about to register as Allowed IPs) | `wg_address` |
 | a DNS resolver for the tunnel | `wg_dns` (a list) — a public one; there is no LAN resolver reachable from here |
+
+Setting `wg_dns` pulls in a dependency worth knowing about: `wg-quick` applies
+`DNS =` by piping into the `resolvconf` command, and does nothing else if it is
+missing — it fails, and the interface never comes up. A minimal cloud image can
+have no provider at all. The role installs one for you
+(`wg_resolvconf_package`, default `systemd-resolved`, which on Ubuntu 24.04 is
+the only package that `Provides: resolvconf` and ships
+`/usr/sbin/resolvconf → resolvectl`), and then still asserts the command exists
+before going near the tunnel.
+
+Installing `systemd-resolved` takes over `/etc/resolv.conf`. On a host already
+managing that file another way, set `wg_resolvconf_package: openresolv`, or
+`""` to install nothing and have the run stop so you can decide by hand.
 | OPNsense's **instance** public key | `wg_peer_public_key` |
 | OPNsense's public host:port | `wg_peer_endpoint` |
 | the preshared key, if you generated one on the peer | `wg_preshared_key` |

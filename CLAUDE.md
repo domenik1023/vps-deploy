@@ -222,6 +222,18 @@ a bootstrap run never depends on the tunnel or on OPNsense routing this peer to
 the internet. `tasks/tunnel.yml` holds the work; `tasks/main.yml` is the
 `wireguard_manage` gate.
 
+Setting `wg_dns` costs a package. `wg-quick` applies `DNS =` by piping into
+`resolvconf` and fails outright without it, so the role installs
+`wg_resolvconf_package` (default `systemd-resolved` — on Ubuntu 24.04 the only
+package that `Provides: resolvconf`, shipping `/usr/sbin/resolvconf` as a
+symlink to `resolvectl`, which scopes the tunnel's DNS to the interface rather
+than rewriting `/etc/resolv.conf` globally). The install is gated on `wg_dns`
+and comes **before** the assert that checks for the command, so the assert is a
+post-condition rather than a stop on a host the run was about to fix —
+`tests/render-check.yml` asserts both the order and the gate. Note that
+installing systemd-resolved takes over `/etc/resolv.conf`, so a host managing
+that file another way wants `openresolv` or `""`.
+
 The role reads `ssh_port` from `roles/baseline` rather than defining its own —
 a kill switch that returns on a different port than sshd listens on is a
 serial-console trip, so there is deliberately only one copy. That makes the
