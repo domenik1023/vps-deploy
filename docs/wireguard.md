@@ -284,6 +284,55 @@ Both of those restarts are gated on `wireguard_manage` and `crowdsec_manage`
 respectively, because `Reload UFW` also fires on hosts where neither service
 exists.
 
+## Containers and the tunnel's MTU
+
+Symptom, and it does not look like an MTU problem: containers on a `[vpn]` host
+appear to have no working internet. TCP connections open, `ping` works, DNS
+works, and then anything with real payload hangs — `docker pull` stalls,
+`apt update` sits there, HTTPS dies part-way through the certificate exchange.
+The host itself is fine throughout, which is the clue.
+
+The host is fine because the kernel picks the MSS it advertises from the
+outgoing route's MTU. With `AllowedIPs = 0.0.0.0/0` that route is `wg0` at
+`wg_mtu` (1420), so the host asks for 1380 without being told to. A container
+cannot do that: it sits on a 1500-MTU bridge, advertises `MSS 1460` from its
+own view of the world, and **the kernel never rewrites the MSS of traffic it
+forwards** — a router is not supposed to.
+
+The two directions then fail differently:
+
+| direction | what happens | recovers? |
+|---|---|---|
+| container → internet | oversized frame reaches this host, does not fit `wg0`, host drops it and sends ICMP frag-needed back down the veth | yes — same kernel, no middlebox |
+| internet → container | remote sends 1460-byte segments because the container asked for them; they die at OPNsense, which must send ICMP frag-needed back across the public internet to the remote | usually not — that ICMP is widely filtered |
+
+So the second direction black-holes, and nothing ever tells the container to
+ask for less.
+
+`wg_mss_clamp` (on by default) fixes it with one rule in `mangle FORWARD` that
+rewrites the MSS option on SYNs leaving the tunnel. The option means "do not
+send me more than this", so the remote never emits a packet OPNsense cannot
+carry. It is installed by the kill switch script, not by a `PostUp` line —
+`wg-quick`'s hooks only run at tunnel up/down, while `ufw reload` flushes
+`mangle FORWARD` at any time, and the kill switch is already restarted by the
+`Reload UFW` handler.
+
+Check it:
+
+```bash
+sudo iptables -t mangle -S FORWARD | grep MSS     # -o wg0 -j WG-KILLSWITCH-MSS
+sudo iptables -t mangle -S WG-KILLSWITCH-MSS      # TCPMSS --clamp-mss-to-pmtu
+sudo tcpdump -ni wg0 'tcp[tcpflags] & tcp-syn != 0' -vv   # MSS 1380 leaving, not 1460
+docker run --rm alpine wget -qO- https://github.com >/dev/null && echo ok
+```
+
+If you are debugging this on a host that predates the clamp, the give-away is
+that `curl -sS --max-filesize 1000 https://...` succeeds while a full fetch
+hangs, and that lowering the container's own MTU
+(`docker run --network=... --sysctl`, or a compose `driver_opts`) makes it work
+— that is a workaround, not the fix, because it has to be repeated on every
+network anyone creates.
+
 ## Verifying
 
 ```bash

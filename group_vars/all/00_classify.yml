@@ -1,0 +1,36 @@
+# --- Host class ---
+# Which of the three inventory groups this host is in, and the three switches
+# derived from it. The groups are the single source of truth about what a host
+# is; nothing in any role tests group_names.
+#
+# These live in group_vars rather than in a role's defaults because three roles
+# read them now - roles/baseline gates the SSH port move on
+# ssh_hardening_manage, roles/crowdsec gates itself on crowdsec_manage, and
+# roles/wireguard on wireguard_manage. A switch that decides whether a role
+# runs cannot be a default of the role it decides about, and putting all three
+# in one role's defaults would make the other two depend on that role having
+# been loaded first.
+#
+# Derived rather than set per group so that the *absence* of a class is a
+# defined state and the safe one: a host in none of them gets no SSH port move,
+# no CrowdSec registration and no tunnel, instead of picking up whatever the
+# old `'local' not in group_names` test happened to let through.
+# roles/baseline's 00_classify.yml then fails the run outright, so the fail-safe
+# is a backstop and not the behaviour anyone relies on.
+#
+# `first` is deliberate over anything that would tolerate two matches: a host in
+# both [vps] and [vpn] is a mistake with a real cost either way round, so it is
+# rejected rather than resolved.
+host_class: "{{ ['local', 'vps', 'vpn'] | intersect(group_names) | first | default('', true) }}"
+
+# Off-site hosts get the SSH port move; LAN boxes do not, because a lockout
+# there costs a walk to the machine rather than a support ticket.
+ssh_hardening_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Off-site hosts get the CrowdSec agent, the bouncer, and with them the
+# unthrottled iptables LOG rules in ufw's before.rules. All of that is inside
+# roles/crowdsec, so this one switch covers the lot.
+crowdsec_manage: "{{ host_class in ['vps', 'vpn'] }}"
+
+# Only [vpn] hosts build a tunnel and a kill switch.
+wireguard_manage: "{{ host_class == 'vpn' }}"

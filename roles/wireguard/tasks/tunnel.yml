@@ -1,8 +1,9 @@
 # --- WIREGUARD TUNNEL + KILL SWITCH ([vpn] hosts only) ---
-# Last in the role, and that is load-bearing rather than tidy: everything above
-# installs packages, and doing that before the default route moves means a
-# bootstrap run never depends on the tunnel or on OPNsense routing this peer to
-# the internet. By the time this file runs there is nothing left to download.
+# This role is last in main.yml, and that is load-bearing rather than tidy:
+# roles/baseline and roles/crowdsec install packages, and doing that before the
+# default route moves means a bootstrap run never depends on the tunnel or on
+# OPNsense routing this peer to the internet. By the time this file runs there
+# is nothing left to download.
 #
 # It is also the most dangerous file here. It moves the host's default route
 # while Ansible is connected over the public address, and installs a firewall
@@ -18,6 +19,28 @@
 #   itself out undoes itself in {{ wg_rollback_delay }}.
 #
 # See docs/wireguard.md for the OPNsense side and for recovery.
+
+# The kill switch returns on `tcp --sport {{ ssh_port }}` so that replies to an
+# inbound SSH session leave by the public interface. ssh_port is defined by
+# roles/baseline (defaults/main/10_ssh.yml), not here, because sshd is what
+# decides it and two copies that could disagree is a serial-console trip.
+#
+# That makes this role deliberately not standalone: it reads a variable another
+# role owns, which works because main.yml runs both in one play and a `roles:`
+# list loads every role's defaults at play start. Asserted rather than
+# defaulted - a wrong guess here is exactly the failure the kill switch's
+# second, dumber rule exists to prevent.
+- name: The kill switch needs the SSH port roles/baseline settled on
+  ansible.builtin.assert:
+    that:
+      - ssh_port is defined
+      - ssh_port | int > 0
+    fail_msg: >-
+      ssh_port is not defined, so the WireGuard kill switch cannot be told
+      which source port to let back out of the public interface. It comes from
+      roles/baseline/defaults/main/10_ssh.yml; this role reads it and does not
+      define a fallback on purpose. Run roles/baseline in the same play, as
+      main.yml does.
 
 - name: Require the per-host WireGuard settings
   ansible.builtin.assert:

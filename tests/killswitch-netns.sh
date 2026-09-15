@@ -50,13 +50,13 @@ cat > "$work/render.yml" <<YAML
   gather_facts: false
   vars_files:
     - $PWD/roles/baseline/defaults/main/10_ssh.yml
-    - $PWD/roles/baseline/defaults/main/60_wireguard.yml
+    - $PWD/roles/wireguard/defaults/main.yml
   vars:
     wg_wan_interface_resolved: $WAN
     wg_peer_endpoint: "vpn.example.com:51820"
   tasks:
     - copy:
-        content: "{{ lookup('template', '$PWD/roles/baseline/templates/wg-killswitch.j2') }}"
+        content: "{{ lookup('template', '$PWD/roles/wireguard/templates/wg-killswitch.j2') }}"
         dest: $work/wg-killswitch
         mode: "0755"
 YAML
@@ -104,8 +104,15 @@ echo \"SSH_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | grep -c -- '--spo
 echo \"UNMARKED=\$(ip route get 203.0.113.99 | head -1)\"
 echo \"MARKED=\$(ip route get 203.0.113.99 mark $MARK | head -1)\"
 
+# The MSS clamp. Worth asking the kernel rather than the rendered text: the
+# TCPMSS target lives in a module (xt_TCPMSS) that a stripped kernel can be
+# missing, and --clamp-mss-to-pmtu is only valid in some chains. Either way
+# iptables rejects the rule and the script aborts under `set -e`.
+echo \"MSS_JUMP=\$(iptables -t mangle -S FORWARD 2>/dev/null | grep -c -- '-o $TUN -j WG-KILLSWITCH-MSS')\"
+echo \"MSS_RULE=\$(iptables -t mangle -S WG-KILLSWITCH-MSS 2>/dev/null | grep -c -- 'TCPMSS --clamp-mss-to-pmtu')\"
+
 $work/wg-killswitch off >/dev/null 2>&1; echo \"OFF_EXIT=\$?\"
-echo \"LEFTOVER_RULES=\$(iptables -S | grep -c KILLSWITCH || true)\"
+echo \"LEFTOVER_RULES=\$(( \$(iptables -S | grep -c KILLSWITCH || true) + \$(iptables -t mangle -S | grep -c KILLSWITCH || true) ))\"
 echo \"LEFTOVER_IPRULE=\$(ip rule | grep -c $MARK || true)\"
 " 2>&1)
 
@@ -124,6 +131,12 @@ check "the chain ends in DROP"                "-j DROP" "$(get LAST_RULE)"
 # The property the design rests on.
 check "unmarked traffic takes the tunnel"     "dev $TUN"  "$(get UNMARKED)"
 check "a marked reply takes the public link"  "dev $WAN"  "$(get MARKED)"
+
+# Container traffic black-holes on the tunnel MTU without this. The clamp has
+# to be on the way *into* the tunnel: --clamp-mss-to-pmtu reads the outgoing
+# route MTU, so the same rule on the public interface would do nothing.
+check "clamps MSS on traffic forwarded into the tunnel" "1" "$(get MSS_JUMP)"
+check "the clamp follows the tunnel path MTU"           "1" "$(get MSS_RULE)"
 
 check "removes cleanly and exits 0"           "0"    "$(get OFF_EXIT)"
 check "leaves no iptables rules behind"       "0"    "$(get LEFTOVER_RULES)"

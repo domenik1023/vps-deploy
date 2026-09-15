@@ -12,20 +12,26 @@
 # It deliberately reads the roles' own defaults rather than restating the
 # expressions, so it tests the real definitions. vars_files cannot take a
 # directory, so roles/baseline/defaults/main/ has to be listed file by file -
-# and the first assertion below is what stops a seventh file being added
-# without anyone wiring it up here.
+# and the first assertion below is what stops another file being added without
+# anyone wiring it up here.
+#
+# group_vars/all/00_classify.yml is loaded explicitly too. It is not a role
+# default, so nothing would pull it in otherwise: this playbook runs against
+# localhost with no inventory, and group_vars next to *this* file is what
+# Ansible would look for. The host class assertions below read it.
 - name: Check that the role's derived variables render to the right shapes
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
+    - ../group_vars/all/00_classify.yml
     - ../roles/baseline/defaults/main/00_identity.yml
     - ../roles/baseline/defaults/main/10_ssh.yml
     - ../roles/baseline/defaults/main/20_firewall.yml
     - ../roles/baseline/defaults/main/30_system.yml
     - ../roles/baseline/defaults/main/40_docker.yml
-    - ../roles/baseline/defaults/main/50_crowdsec.yml
-    - ../roles/baseline/defaults/main/60_wireguard.yml
+    - ../roles/crowdsec/defaults/main.yml
+    - ../roles/wireguard/defaults/main.yml
     - ../roles/alloy/defaults/main.yml
   vars:
     # Only present so defaults referencing it can be loaded; never used.
@@ -33,7 +39,7 @@
     # Relative to this playbook. The Alloy config is a template rather than a
     # variable, so its assertions render it here instead of reading a value.
     alloy_template: ../roles/alloy/templates/config.alloy.j2
-    killswitch_template: ../roles/baseline/templates/wg-killswitch.j2
+    killswitch_template: ../roles/wireguard/templates/wg-killswitch.j2
 
     # One host_vars file, read as data. Templated lazily, so `item` resolves to
     # whichever file the loop that used it is on.
@@ -53,29 +59,58 @@
   tasks:
     # Every assertion below reads a variable that came from one of the files in
     # vars_files. Splitting the defaults into a directory made it possible to
-    # add a seventh file and have nothing here notice - the assertions would go
-    # on passing, testing the six that are loaded. Compare the two lists.
-    - name: Every baseline defaults file must be loaded by this play
+    # add another file and have nothing here notice - the assertions would go
+    # on passing, testing only the ones that are loaded. Compare the two lists.
+    #
+    # Four roles now, in two shapes: roles/baseline keeps a defaults/main/
+    # directory, the other three a single defaults/main.yml. Walked with `find`
+    # rather than globbed, so a role gaining a defaults file - or a fifth role
+    # appearing - lands here rather than going untested.
+    #
+    # fileglob cannot do this: it does not expand a wildcard in a directory
+    # component, so `roles/*/defaults/main.yml` matches nothing and returns an
+    # empty list - which `difference` then passes happily. That is exactly the
+    # vacuous-test shape the rest of this file exists to avoid, so the length
+    # check below is not redundant, it is the part that would have caught it.
+    #
+    # playbook_dir, not a relative path: `find` runs with the process's working
+    # directory, which is the repo root when CI runs `ansible-playbook
+    # tests/render-check.yml`, not this file's directory.
+    - name: List the role defaults files on disk
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/../roles"
+        patterns: "*.yml"
+        recurse: true
+        file_type: file
+      register: role_files
+      changed_when: false
+
+    - name: Every role defaults file must be loaded by this play
       ansible.builtin.assert:
         that:
+          - defaults_on_disk | length > 0
           - defaults_on_disk | difference(defaults_loaded) | length == 0
         fail_msg: >-
-          {{ defaults_on_disk | difference(defaults_loaded) | join(', ') }}
-          exists in roles/baseline/defaults/main/ but is not in this play's
-          vars_files, so nothing here asserts anything about it. Add it to both.
-        success_msg: "{{ defaults_loaded | length }} baseline defaults files loaded"
+          {{ defaults_on_disk | difference(defaults_loaded) | join(', ') | default('nothing', true) }}
+          exists on disk but is not in this play's vars_files, so nothing here
+          asserts anything about it. Add it to both. (Found
+          {{ defaults_on_disk | length }} defaults files; zero means the search
+          itself broke and this assertion was testing nothing.)
+        success_msg: "{{ defaults_on_disk | length }} role defaults files loaded"
       vars:
         defaults_on_disk: >-
-          {{ query('ansible.builtin.fileglob', '../roles/baseline/defaults/main/*.yml')
-             | map('basename') | sort }}
+          {{ role_files.files | map(attribute='path')
+             | map('regex_replace', '^.*/(roles/.*)$', '\1')
+             | select('search', '/defaults/main(/[^/]+)?\.yml$') | sort }}
         defaults_loaded:
-          - 00_identity.yml
-          - 10_ssh.yml
-          - 20_firewall.yml
-          - 30_system.yml
-          - 40_docker.yml
-          - 50_crowdsec.yml
-          - 60_wireguard.yml
+          - roles/alloy/defaults/main.yml
+          - roles/baseline/defaults/main/00_identity.yml
+          - roles/baseline/defaults/main/10_ssh.yml
+          - roles/baseline/defaults/main/20_firewall.yml
+          - roles/baseline/defaults/main/30_system.yml
+          - roles/baseline/defaults/main/40_docker.yml
+          - roles/crowdsec/defaults/main.yml
+          - roles/wireguard/defaults/main.yml
 
     # localhost is in no host class, which is the state 00_classify.yml exists
     # to reject on a real host - and it is also the one that has to fail safe
@@ -262,40 +297,142 @@
                     template_vars=base_vars | combine({'wg_killswitch_extra_allow':
                       ['-p tcp --dport 443 -d 203.0.113.10']})) }}
 
+    # The MSS clamp is what keeps container traffic from black-holing on the
+    # tunnel's MTU, and every part of it that could be written plausibly and
+    # wrongly is checked here, because all of them fail the same silent way:
+    # TCP that connects and then hangs on the first full-size segment.
+    #
+    #   -o "$WG_IF"            the interface matters. --clamp-mss-to-pmtu
+    #                          clamps against the *outgoing* route's MTU, so
+    #                          the same rule on $WAN clamps against the public
+    #                          interface's 1500 and does nothing at all.
+    #   --clamp-mss-to-pmtu    rather than a literal --set-mss, so it follows
+    #                          wg_mtu instead of going stale beside it.
+    #   mangle FORWARD         OUTPUT is the host's own traffic, which the
+    #                          kernel already sizes correctly; FORWARD is the
+    #                          container traffic that is actually broken.
+    - name: The MSS clamp must clamp forwarded traffic to the tunnel, not the WAN
+      ansible.builtin.assert:
+        that:
+          - with_clamp is search('-t mangle -A "\$MSS_CHAIN" -p tcp --tcp-flags SYN,RST SYN')
+          - with_clamp is search('TCPMSS --clamp-mss-to-pmtu')
+          - with_clamp is search('ensure_jump "\$ipt" mangle FORWARD -o "\$WG_IF" -j "\$MSS_CHAIN"')
+          - with_clamp is not search('mangle FORWARD -o "\$WAN"')
+          - with_clamp is not search('--set-mss')
+        fail_msg: >-
+          The kill switch's MSS clamp is missing, points at the wrong
+          interface, or has been pinned to a literal MSS. It must clamp
+          forwarded SYNs leaving the tunnel to the tunnel's own path MTU -
+          see wg_mss_clamp in roles/wireguard/defaults/main.yml.
+        success_msg: "the MSS clamp rewrites forwarded SYNs leaving the tunnel"
+      vars:
+        with_clamp: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=clamp_vars | combine({'wg_mss_clamp': true})) }}
+        clamp_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+
+    # Turning the clamp off has to stop installing it *and* keep removing it,
+    # or a host that had it on keeps the rule forever: the unit's ExecStop runs
+    # the new script's `off`, so an `off` that forgot the rule would strand it
+    # in mangle FORWARD with nothing left that knows its name.
+    - name: Turning the MSS clamp off must still clean up after a run that had it on
+      ansible.builtin.assert:
+        that:
+          - without_clamp is not search('TCPMSS')
+          - without_clamp is search('remove_jump "\$ipt" mangle FORWARD -o "\$WG_IF" -j "\$MSS_CHAIN"')
+          - without_clamp is search('remove_chain "\$ipt" mangle "\$MSS_CHAIN"')
+        fail_msg: >-
+          wg_mss_clamp: false must leave the teardown half in place. It is
+          outside the template conditional on purpose - dropping it there
+          strands the rule on any host that ran with the clamp enabled.
+        success_msg: "wg_mss_clamp: false installs nothing and still tears down"
+      vars:
+        without_clamp: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=clamp_vars | combine({'wg_mss_clamp': false})) }}
+        clamp_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+
     # Reload UFW fires on any host that changes a ufw rule, which since
     # docker_host_access_cidrs includes LAN boxes - and it notifies handlers
     # for two services that only exist where CrowdSec or WireGuard was
     # installed. An unguarded one of those kills the run at the very end, after
     # every task has succeeded, with "Could not find the requested service".
     #
-    # Read out of the handlers file rather than restated, so adding a third
+    # Read out of the handlers files rather than restated, so adding a third
     # notify to Reload UFW puts it under the same rule automatically.
-    - name: Everything Reload UFW notifies must be safe on every host class
+    #
+    # Both handlers it notifies live in other roles now, so this reads all
+    # three files. That split added a second way to break it, checked here
+    # too: a name Reload UFW notifies that exists in no role's handlers at all
+    # fails the run outright with "The requested handler was not found", and
+    # nothing in --syntax-check or ansible-lint looks for it.
+    - name: Everything Reload UFW notifies must exist and be safe on every host class
       ansible.builtin.assert:
         that:
           - ufw_notifies | length > 0
+          - missing | length == 0
           - unguarded | length == 0
         fail_msg: >-
-          {{ unguarded | join(', ') }} in roles/baseline/handlers/main.yml
+          {% if missing | length > 0 %}Reload UFW notifies {{ missing | join(', ') }},
+          which no role in play one defines - the run dies at the end with "The
+          requested handler was not found". Handlers are only shared across
+          roles in the same play.{% else %}{{ unguarded | join(', ') }}
           {{ 'is' if unguarded | length == 1 else 'are' }} notified by Reload
           UFW but carr{{ 'ies' if unguarded | length == 1 else 'y' }} no `when`.
           Reload UFW runs on every host that touches a ufw rule, LAN boxes
           included, so anything it notifies has to be gated on the same switch
-          that decided whether its service was installed at all.
+          that decided whether its service was installed at all.{% endif %}
         success_msg: >-
-          Reload UFW notifies {{ ufw_notifies | join(', ') }}, all guarded
+          Reload UFW notifies {{ ufw_notifies | join(', ') }}, all defined and guarded
       vars:
         baseline_handlers: >-
           {{ lookup('ansible.builtin.file', '../roles/baseline/handlers/main.yml')
              | from_yaml }}
+        # Every handler in play one, in the order main.yml loads the roles.
+        play_handlers: >-
+          {{ baseline_handlers
+             + (lookup('ansible.builtin.file', '../roles/crowdsec/handlers/main.yml') | from_yaml)
+             + (lookup('ansible.builtin.file', '../roles/wireguard/handlers/main.yml') | from_yaml) }}
         reload_ufw: "{{ baseline_handlers | selectattr('name', 'equalto', 'Reload UFW') | first }}"
         # `notify` may be a single string or a list.
         ufw_notifies: >-
           {{ reload_ufw.notify if reload_ufw.notify is sequence
              and reload_ufw.notify is not string else [reload_ufw.notify] }}
+        missing: >-
+          {{ ufw_notifies | difference(play_handlers | map(attribute='name') | list) }}
         unguarded: >-
-          {{ baseline_handlers | selectattr('name', 'in', ufw_notifies)
+          {{ play_handlers | selectattr('name', 'in', ufw_notifies)
              | rejectattr('when', 'defined') | map(attribute='name') | list }}
+
+    # Handlers fire in definition order, not notification order, and across
+    # roles that order is the role order in main.yml. Reload UFW has to be
+    # defined before the two restarts it notifies, or its iptables-restore
+    # flushes their chains after they have already been put back.
+    #
+    # Nothing else enforces this: swapping the roles in main.yml leaves a
+    # playbook that parses, lints and runs, and silently stops restoring the
+    # CrowdSec bouncer and the WireGuard kill switch after a ufw rule change.
+    - name: Play one must keep baseline ahead of the roles whose handlers it notifies
+      ansible.builtin.assert:
+        that:
+          - play_roles[:3] == ['baseline', 'crowdsec', 'wireguard']
+        fail_msg: >-
+          Play one's roles are {{ play_roles | join(', ') }}. They must start
+          baseline, crowdsec, wireguard: handlers fire in definition order, and
+          Reload UFW (roles/baseline) notifies Restart CrowdSec bouncer
+          (roles/crowdsec) and Restart WireGuard kill switch (roles/wireguard).
+        success_msg: "play one loads baseline, crowdsec, wireguard in that order"
+      vars:
+        main_play: >-
+          {{ (lookup('ansible.builtin.file', '../main.yml') | from_yaml)[0] }}
+        # Each entry is a mapping like {role: baseline, tags: [...]}. Written
+        # as `- role: x` and not the bare `- x` shorthand precisely so this
+        # stays readable as data.
+        play_roles: "{{ main_play.roles | map(attribute='role') | list }}"
 
     # Three tasks in 42_ssh.yml's hardening block have to stay in this order,
     # and the failure is the same each time: the run stops half way through
@@ -378,7 +515,7 @@
           - ungated_apt | length == 0
           - crowdsec_apt_suite | string is match('^([a-z]+)?$')
         fail_msg: >-
-          70_crowdsec.yml must keep every apt task inside one block gated on
+          roles/crowdsec/tasks/agent.yml must keep every apt task inside one block gated on
           crowdsec_suite_available.
           {{ ungated_apt | join(', ') | default('The gate itself is missing.', true) }}
           {{ 'is' if ungated_apt | length == 1 else 'are' }} outside it.
@@ -387,7 +524,7 @@
           CrowdSec tasks gated on the repository carrying this release
       vars:
         crowdsec_tasks: >-
-          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/70_crowdsec.yml')
+          {{ lookup('ansible.builtin.file', '../roles/crowdsec/tasks/agent.yml')
              | from_yaml }}
         gated: "{{ crowdsec_tasks | selectattr('block', 'defined') | map(attribute='when') | list }}"
         # `dict | list` yields its keys, so this is every module and keyword
@@ -428,14 +565,14 @@
         that:
           - route_argv == ['ip', '-4', 'route', 'show', 'default', 'table', 'main']
         fail_msg: >-
-          80_wireguard.yml must read the public interface from
+          roles/wireguard/tasks/tunnel.yml must read the public interface from
           `ip -4 route show default table main`, which names it whether the
           tunnel is up or not. Found {{ route_argv | default([]) | join(' ')
             | default('no such task', true) }}.
         success_msg: "the public interface is read from the main routing table"
       vars:
         wg_tasks: >-
-          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/80_wireguard.yml')
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
              | from_yaml }}
         route_task: >-
           {{ wg_tasks
@@ -447,7 +584,7 @@
         route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
 
     # wg.conf.j2 must read the private key from wg_private_key_resolved, the
-    # fact 80_wireguard.yml settles on - never from wg_private_key, which is
+    # fact roles/wireguard/tasks/tunnel.yml settles on - never from wg_private_key, which is
     # the *input* and is simply absent whenever the host generates its own key.
     #
     # That is not hypothetical: the template kept saying wg_private_key after
@@ -481,7 +618,7 @@
           wg_dns: []
         rendered: >-
           {{ lookup('ansible.builtin.template',
-                    '../roles/baseline/templates/wg.conf.j2',
+                    '../roles/wireguard/templates/wg.conf.j2',
                     template_vars=wg_conf_vars) }}
 
     - name: The cscli prefix must stay a list
@@ -873,7 +1010,7 @@
         binds: "{{ (rendered | regex_findall('(?:grpc|http) \\{ endpoint = \"([^\":]*):')) + (rendered | regex_findall('listen_address = \"([^\"]*)\"')) }}"
         private_address: '^(10\.|192\.168\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.)'
 
-    # 80_wireguard.yml asserts the same thing on the host, but only once the
+    # roles/wireguard asserts the same thing on the host, but only once the
     # play has already set the hostname, created the admin user, moved sshd and
     # installed Docker. Half-configured host_vars should not get that far: a
     # [vpn] host that turns out to be missing its endpoint has spent a full run

@@ -61,7 +61,7 @@ cannot serve that purpose, for two independent reasons:
   rule gets you a log line on a different path, with its own 3/min limit
   hardcoded in UFW's source and unaffected by loglevel.
 
-So `70_crowdsec.yml` installs its own rule at the end of `ufw-before-input`, in
+So `roles/crowdsec` installs its own rule at the end of `ufw-before-input`, in
 both `/etc/ufw/before.rules` and `/etc/ufw/before6.rules`:
 
 ```
@@ -110,7 +110,7 @@ Worse, the failed run leaves a `crowdsec.sources` behind that breaks **every
 later apt operation on that host** — including ones with nothing to do with
 CrowdSec, which are what will appear to be broken.
 
-So `70_crowdsec.yml` asks the repository before adding it, and **skips CrowdSec
+So `roles/crowdsec` asks the repository before adding it, and **skips CrowdSec
 entirely** when the answer is no:
 
 ```

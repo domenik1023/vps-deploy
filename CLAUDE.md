@@ -59,42 +59,69 @@ loads the role's defaults via `vars_files`, renders the expression to a file,
 and parse it back with Python to confirm the shape. `roles/baseline/defaults/`
 is a `main/` **directory**, which Ansible loads whole but `vars_files` cannot
 take — so list its files individually, as `tests/render-check.yml` does. The
-first assertion in that file compares the list it loaded against a glob of the
-directory, because a seventh defaults file nobody wired up would otherwise be
-untested and silent about it.
+first assertion in that file walks `roles/` with `ansible.builtin.find` and
+compares what it finds against what it loaded, because a defaults file nobody
+wired up would otherwise be untested and silent about it. It uses `find` rather
+than `fileglob` on purpose: `fileglob` does not expand a wildcard in a
+directory component, so `roles/*/defaults/main.yml` matches nothing and returns
+an empty list that `difference` passes happily — the assertion then tests
+nothing at all. That is why it also asserts the list is non-empty.
 
 ## Architecture
 
-Two roles and two plays in `main.yml`, in this order: `baseline` (everything
-every managed host gets) then `alloy` (telemetry). The split is a play boundary
-rather than a second `include_role` so the baseline role's task order stays a
-statement about itself; `42_ssh.yml` records the switched SSH port with
-`set_fact`, and host facts persist across plays within a run, so the second play
-still connects.
+Four roles and two plays in `main.yml`. Play one is a **`roles:` list** —
+`baseline` (everything every managed host gets), then `crowdsec`, then
+`wireguard`. Play two is `alloy` (telemetry).
+
+The `roles:` list is not stylistic. `Reload UFW` lives in `roles/baseline` and
+notifies handlers that live in the other two roles; handlers are shared across
+every role in a play, but a dynamic `include_role` only registers its handlers
+when it actually runs, so `--tags ssh` on a host that changes a ufw rule would
+notify a handler that was never registered and kill the run. A `roles:` entry
+is static, so the handlers exist whether or not the tag selects the tasks.
+**Handlers also fire in definition order, and across roles that order is the
+role order here** — baseline first is what keeps `Reload UFW` ahead of the two
+restarts it notifies. `tests/render-check.yml` asserts both the order and that
+every name `Reload UFW` notifies actually exists somewhere in the play.
+
+The role order carries the rest of what the old single-role file order said:
+`crowdsec` needs `python3-debian` and a running Docker from `baseline`, and
+`wireguard` is last so every apt install has already happened over the direct
+connection before the default route moves into the tunnel.
+
+Alloy stays a play boundary rather than a fourth role so the baseline role's
+task order stays a statement about itself; `42_ssh.yml` records the switched
+SSH port with `set_fact`, and host facts persist across plays within a run, so
+the second play still connects.
+
+The three gating switches — `ssh_hardening_manage`, `crowdsec_manage`,
+`wireguard_manage` — and the `host_class` they derive from live in
+**`group_vars/all/00_classify.yml`**, not in a role's defaults. A switch that
+decides whether a role runs cannot be a default of the role it decides about.
 
 `baseline/tasks/main.yml` includes its files **in a load-bearing order**, and
 they are numbered so that order is visible in `ls` rather than only in a
 comment. A new file gets a number that places it, not the next one free:
 
 `10_hostname` → `20_user` → `30_packages` → `40_firewall` → `41_fail2ban` →
-`42_ssh` → `50_sysctl` → `60_updates` → `61_time` → `62_docker` →
-`70_crowdsec`
+`42_ssh` → `50_sysctl` → `60_updates` → `61_time` → `62_docker`
 
 - `10_hostname.yml` is first because the host's own name is what everything
   after it records itself as, and the Alloy play labels all its telemetry with
   it.
 - `20_user.yml` before `42_ssh.yml`, which locks the root account last.
 - `30_packages.yml` installs `python3-debian`, which `deb822_repository` in
-  `62_docker.yml` and `70_crowdsec.yml` needs and a stock Ubuntu image lacks.
+  `62_docker.yml` and `roles/crowdsec` need and a stock Ubuntu image lacks.
 - `40_firewall.yml` strictly before `42_ssh.yml`: the bootstrap allow on the
   live session's port and the `limit` on the port sshd is about to move to must
   both exist before it moves. The matching deny on the old port lives in
   `42_ssh.yml` instead, next to the move that justifies it.
-- `62_docker.yml` starts Docker before `70_crowdsec.yml` probes for
+- `62_docker.yml` starts Docker before `roles/crowdsec` probes for
   `DOCKER-USER`.
 
-The `alloy` play must stay after it: cAdvisor and the Docker log discovery both
-expect the socket `62_docker.yml` creates.
+The `alloy` play must stay after all of it: cAdvisor and the Docker log
+discovery both expect the socket `62_docker.yml` creates, and a `[vpn]` host
+fetches the Alloy release through the tunnel `roles/wireguard` brings up.
 
 Each include carries a **tag** named after its concern, so one can be re-run on
 its own (`--tags docker`, `--tags crowdsec`). They are for a converged host, not
@@ -136,7 +163,7 @@ in no class, so the failure direction is *less*, not more.
 
 Gating CrowdSec is also what keeps its **iptables** work off LAN boxes. The
 unthrottled LOG rules in `before.rules` and `before6.rules` and the bouncer's
-`INPUT` / `DOCKER-USER` chains are all inside `70_crowdsec.yml`, so there is no
+`INPUT` / `DOCKER-USER` chains are all inside `roles/crowdsec`, so there is no
 second switch for them and nowhere else for them to live.
 
 Alloy is not skipped anywhere — a LAN box reaches the default
@@ -164,7 +191,7 @@ alerts go to the central LAPI, so bans propagate fleet-wide. See
 `docs/crowdsec.md` for the operational side (adding log sources, verification,
 troubleshooting).
 
-`71_crowdsec_credentials.yml` mints machine credentials and the bouncer API key by
+`roles/crowdsec/tasks/credentials.yml` mints machine credentials and the bouncer API key by
 running `cscli` on the LAPI host over delegation; nothing is stored in the
 vault. It is idempotent by **verify-then-mint**: check what the agent already
 has (`cscli lapi status` for the machine, an authenticated `GET /v1/decisions`
@@ -177,7 +204,7 @@ a container is reached (`docker exec <container> cscli …`).
 It lags Ubuntu — today it carries nothing newer than `oracular`, so a 26.04
 host asking for `resolute` fails at `apt update` with an error naming neither
 CrowdSec nor the release, and leaves a `.sources` file that breaks every later
-apt operation on that host. `70_crowdsec.yml` asks first, and on a 404 removes
+apt operation on that host. `roles/crowdsec` asks first, and on a 404 removes
 the repository, says so, and skips its whole block; the run continues and a
 re-run installs CrowdSec once upstream publishes. No fallback to an older
 suite, deliberately — `crowdsec_apt_suite` forces one if you want it. Only a
@@ -189,9 +216,17 @@ the same trap is waiting there whenever that stops being true.
 
 ### WireGuard on `[vpn]` hosts
 
-`80_wireguard.yml` is last in the role, and that is load-bearing: every apt
-install above it then happens over the direct connection, so a bootstrap run
-never depends on the tunnel or on OPNsense routing this peer to the internet.
+`roles/wireguard` is last in play one, and that is load-bearing: every apt
+install in `baseline` and `crowdsec` then happens over the direct connection, so
+a bootstrap run never depends on the tunnel or on OPNsense routing this peer to
+the internet. `tasks/tunnel.yml` holds the work; `tasks/main.yml` is the
+`wireguard_manage` gate.
+
+The role reads `ssh_port` from `roles/baseline` rather than defining its own —
+a kill switch that returns on a different port than sshd listens on is a
+serial-console trip, so there is deliberately only one copy. That makes the
+role not standalone, and `tunnel.yml` asserts `ssh_port` is defined rather than
+quietly defaulting it.
 
 The hard part is not the tunnel, it is keeping SSH reachable on the public
 interface while the default route is `wg0`. `wg-quick` with `0.0.0.0/0` in
@@ -227,11 +262,41 @@ console.
 `FORWARD` jumps run ahead of ufw's, so `ufw-before-forward` never sees it. The
 same reason the CrowdSec bouncer uses that chain.
 
+**Container traffic also needs its TCP MSS clamped, or it black-holes on the
+tunnel's MTU** (`wg_mss_clamp`, on by default). The host's own traffic is fine:
+the kernel sizes the MSS it advertises from the outgoing route, which with
+`AllowedIPs = 0.0.0.0/0` is `wg0`, so it asks for 1380 by itself. A container
+cannot — it sits on a 1500-MTU bridge, advertises 1460 from that, and **the
+kernel never rewrites the MSS of traffic it merely forwards**. Outbound from
+the container self-heals (this host drops the oversized frame and sends ICMP
+frag-needed back down the veth). Inbound does not: the remote is sending
+1460-byte segments because our container asked for them, they die at OPNsense,
+and the ICMP saying so has to cross the public internet back to the remote,
+where it is filtered often enough to be useless. The symptom is not "no
+network" — handshakes complete, ping works, DNS works, and every transfer
+larger than one segment hangs.
+
+The fix is one rule in `mangle FORWARD` rewriting the MSS option on SYNs
+leaving the tunnel, and three things about it are load-bearing.
+`--clamp-mss-to-pmtu` rather than a literal `--set-mss`, so it follows
+`wg_mtu`. `-o <wg_interface>` and not the public interface, because the target
+clamps against the *outgoing* route's MTU — the same rule on the WAN side
+clamps against 1500 and does nothing. And it lives in the kill switch script
+rather than in `PostUp`/`PreDown`, because `wg-quick`'s hooks only run at
+tunnel up/down while `ufw reload` flushes `mangle FORWARD` at any time, and
+because the script is already idempotent, already covers both address families
+and is already restarted by `Reload UFW`. Its teardown half is deliberately
+outside the `wg_mss_clamp` conditional so that turning the toggle off still
+removes a rule an earlier run installed. `tests/render-check.yml` asserts all
+of this, and `tests/killswitch-netns.sh` asks a real kernel.
+
 **`ufw reload` disarms the kill switch**, because its `iptables-restore`
 flushes the builtins the chains are jumped into from. `Reload UFW` notifies
 `Restart WireGuard kill switch`, defined after it — exactly as it already
 notifies the bouncer restart. This is the second reason `ufw_allow_rules` has
-to live in `roles/baseline`.
+to live in `roles/baseline`: a rule added from another role could not reach
+that handler. The same reload takes the MSS clamp below with it, which is why
+the clamp is installed by the kill switch script rather than from `PostUp`.
 
 **`[vpn]` hosts run loose reverse path filtering** (`sysctl_rp_filter: 2` in
 `group_vars/vpn.yml`). Strict mode drops inbound SSH on the public interface
@@ -337,7 +402,12 @@ time, and a base file that lost that substitution otherwise stops the bouncer
 dead.
 
 **Handlers fire in definition order, not notification order.** `Reload systemd`
-is first in `handlers/main.yml` so it precedes any service it affects.
+is first in `roles/baseline/handlers/main.yml` so it precedes any service it
+affects. Since the split that order spans roles, and the role order in
+`main.yml` sets it: `Reload UFW` is in `roles/baseline`, the two restarts it
+notifies are in `roles/crowdsec` and `roles/wireguard`, and reordering the
+roles would silently stop the bouncer and the kill switch being put back after
+a ufw rule change.
 
 **Anything `Reload UFW` notifies has to be safe on every host class.** It fires
 on any host that changes a ufw rule, LAN boxes included since
@@ -401,7 +471,7 @@ also caps prefixes at 29 characters, and the prefix must contain neither
 exclusions, and matching either makes the parser silently discard every line it
 exists to read. Note also that `ufw_logging` is for reading by hand only —
 ufw rate-limits its own LOG rules at every level below `high`, so the rule
-CrowdSec actually reads is a separate, unlimited one installed by `70_crowdsec.yml`.
+CrowdSec actually reads is a separate, unlimited one installed by `roles/crowdsec`.
 
 **Fail2ban is deliberately duller than CrowdSec** so CrowdSec bans first and the
 decision reaches the whole fleet. The two are not independent — whichever bans

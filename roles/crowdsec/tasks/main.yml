@@ -1,0 +1,23 @@
+# --- CROWDSEC ---
+# Agent + firewall bouncer, for [vps] and [vpn] hosts only. LAN boxes sit
+# behind NAT, see none of the internet noise CrowdSec exists to catch, and each
+# one would still consume a machine registration and a bouncer key on the
+# central LAPI.
+#
+# The gate is one include rather than a `when` on the role in main.yml so that
+# a LAN box reports one skipped task instead of every task in the role, and so
+# the reason sits next to the condition.
+#
+# This one include is also what keeps CrowdSec's iptables work off LAN boxes:
+# the unthrottled LOG rules in ufw's before.rules and before6.rules, and the
+# bouncer's INPUT and DOCKER-USER chains, are all inside it. There is no second
+# switch for the firewall rules because there is nowhere else for them to be.
+#
+# This role must run after roles/baseline, and main.yml orders it that way:
+# 30_packages.yml installs python3-debian, which deb822_repository below needs
+# and a stock Ubuntu image lacks, and 62_docker.yml starts Docker before
+# agent.yml probes for the DOCKER-USER chain.
+- name: Include the CrowdSec agent and bouncer
+  ansible.builtin.include_tasks:
+    file: agent.yml
+  when: crowdsec_manage | bool

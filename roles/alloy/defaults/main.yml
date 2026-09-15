@@ -18,7 +18,7 @@
 # Docker socket, so set this false on a host without Docker: the components
 # stay permanently unhealthy and Alloy logs socket errors continuously rather
 # than failing loudly once. Every host this playbook manages gets Docker from
-# roles/baseline/tasks/software.yml, so true is right by default here.
+# roles/baseline/tasks/62_docker.yml, so true is right by default here.
 alloy_enable_docker: true
 
 # systemd journal. False on non-systemd hosts (Alpine, most NAS firmware).
@@ -183,7 +183,7 @@ alloy_access_log_formats:
 # A target on a Docker-published port must be published to loopback
 # ("127.0.0.1:8082:8082", not "8082:8082"). Docker's FORWARD jump precedes
 # UFW's, so a plainly published port is reachable from the internet whatever
-# the firewall says - see the same trap in roles/baseline/defaults/main.yml.
+# the firewall says - see the same trap in roles/baseline/defaults/main/20_firewall.yml.
 alloy_extra_scrape_targets: []
 
 # --- Tuning ---
