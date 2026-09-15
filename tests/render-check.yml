@@ -584,53 +584,78 @@
         route_argv: "{{ route_task.get('ansible.builtin.command', {}).get('argv', []) }}"
 
     # wg-quick applies `DNS =` by piping into `resolvconf` and fails outright
-    # without it, so the role installs a provider. That install has to come
-    # *before* the assert that checks for the command, or the run stops on a
-    # host it was one task away from fixing - the same shape as 20_user.yml
-    # installing the admin keys before asserting the account has one.
+    # without it, so the role installs a provider. Four properties of that, and
+    # every one of them fails quietly in a way a real run only finds on a host
+    # nobody has tried yet:
     #
-    # The gate matters as much as the order: unconditional, this would install
-    # systemd-resolved on every [vpn] host whether or not it set wg_dns, and
-    # that package takes over /etc/resolv.conf.
-    - name: The resolvconf provider must be installed before it is asserted on
+    #   order      the install has to come before the assert that checks for
+    #              the command, or the run stops on a host it was one task away
+    #              from fixing - the same shape as 20_user.yml installing the
+    #              admin keys before asserting the account has one.
+    #   gate       unconditional, this installs a resolver on every [vpn] host
+    #              whether or not it set wg_dns, and on hosts that already have
+    #              a provider - systemd-resolved takes over /etc/resolv.conf,
+    #              so that is not a harmless no-op.
+    #   probed     the package must come from the apt probe, not a literal.
+    #              Hardcoding one is what broke wings-p01: systemd-resolved is
+    #              not a package at all before Ubuntu 23.04.
+    #   (none)     `apt-cache policy` prints "Candidate: (none)" for a package
+    #              it knows but cannot install - universe disabled, wrong
+    #              release. Without that rejection the role picks it anyway and
+    #              apt fails on the next task.
+    - name: The resolvconf provider must be probed and installed before it is asserted on
       ansible.builtin.assert:
         that:
           - install_name in names
           - assert_name in names
-          - install_before_assert
+          - chain_in_order
           - install_when is search('wg_dns')
-          - install_pkg is search('wg_resolvconf_package')
+          - install_when is search('wg_resolvconf_present')
+          - install_pkg is search('wg_resolvconf_chosen')
+          - chosen_expr is search('Candidate:')
+          - chosen_expr is search('rejectattr')
         fail_msg: >-
-          roles/wireguard/tasks/tunnel.yml must install the resolvconf provider
-          before it asserts the command exists, gated on wg_dns and naming
-          wg_resolvconf_package. Found install
-          {{ 'before' if install_before_assert else 'missing or after' }}
-          the assert; when={{ install_when | default('none', true) }};
-          package={{ install_pkg | default('none', true) }}.
-        success_msg: "the resolvconf provider is installed before it is asserted on"
+          roles/wireguard/tasks/tunnel.yml must check for an existing
+          resolvconf, probe apt, settle on a package and install it - in that
+          order, before the assert. Found chain
+          {{ 'in order' if chain_in_order else 'out of order or incomplete' }};
+          when={{ install_when | default('none', true) }};
+          package={{ install_pkg | default('none', true) }};
+          the chosen-package expression
+          {{ 'rejects' if chosen_expr is search('rejectattr') else 'does NOT reject' }}
+          an uninstallable candidate.
+        success_msg: "the resolvconf provider is probed, then installed, then asserted on"
       vars:
         wg_tasks: >-
           {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
              | from_yaml }}
         names: "{{ wg_tasks | map(attribute='name') | list }}"
+        present_name: Check whether a resolvconf implementation is already present
+        probe_name: Ask apt which resolvconf providers it can offer
+        settle_name: Settle on the resolvconf provider to install
         install_name: Install a resolvconf provider for wg_dns
         assert_name: Setting wg_dns needs a resolvconf implementation on the host
         # Ordering read off the file text rather than by slicing the name list
-        # at the assert's index: ansible-lint renders these expressions
-        # statically, where `names` is not yet a real list and a slice index
-        # raises. A search for one task name followed by the other says the
-        # same thing with filters lint can evaluate.
+        # at each index: ansible-lint renders these expressions statically,
+        # where `names` is not yet a real list and a slice index raises.
         tunnel_src: >-
           {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml') }}
-        install_before_assert: >-
-          {{ tunnel_src is search(install_name ~ '[\s\S]*' ~ assert_name) }}
+        chain_in_order: >-
+          {{ tunnel_src is search(present_name ~ '[\s\S]*' ~ probe_name
+             ~ '[\s\S]*' ~ settle_name ~ '[\s\S]*' ~ install_name
+             ~ '[\s\S]*' ~ assert_name) }}
         install_task: >-
           {{ wg_tasks | selectattr('name', 'equalto', install_name)
+             | first | default({}, true) }}
+        settle_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', settle_name)
              | first | default({}, true) }}
         # .get() with the key spelled out, never map(attribute='a.b.c') - Jinja
         # reads the dots as nested access and would quietly find nothing.
         install_pkg: "{{ install_task.get('ansible.builtin.apt', {}).get('name', '') }}"
         install_when: "{{ install_task.get('when', []) | join(' ') }}"
+        chosen_expr: >-
+          {{ settle_task.get('ansible.builtin.set_fact', {}).get('wg_resolvconf_chosen', '') }}
 
     # wg.conf.j2 must read the private key from wg_private_key_resolved, the
     # fact roles/wireguard/tasks/tunnel.yml settles on - never from wg_private_key, which is

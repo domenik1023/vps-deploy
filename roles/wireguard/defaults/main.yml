@@ -76,29 +76,48 @@ wg_mtu: 1420
 # ever run one that way, this needs a unit of its own.
 wg_mss_clamp: true
 
-# The package providing the `resolvconf` command, installed only when wg_dns
-# is set. Empty to install nothing and let the assert in tasks/tunnel.yml stop
+# Candidate packages providing the `resolvconf` command, in preference order.
+# Probed with `apt-cache policy` and the first one apt can actually offer is
+# installed - but only when wg_dns is set *and* the host has no such command
+# already. Empty to install nothing and let the assert in tasks/tunnel.yml stop
 # the run instead.
 #
-# wg-quick applies `DNS =` by piping into `resolvconf` and does nothing else if
-# it is missing - it fails, and the interface never comes up. A minimal cloud
-# image can have no provider at all, which is a stop three tasks before the
-# tunnel for something one apt install fixes.
+# A list rather than one name because the right package is a moving target and
+# naming it wrong fails the run exactly as hard as naming nothing:
 #
-# systemd-resolved rather than openresolv, and the reason is not just that it
-# is the Ubuntu-native stack: on 24.04 it is the only package that `Provides:
-# resolvconf`, and it ships /usr/sbin/resolvconf as a symlink to resolvectl -
-# so wg-quick's DNS ends up scoped to the tunnel interface, which is what a
-# full-tunnel host wants, rather than rewritten globally into /etc/resolv.conf.
+#   systemd-resolved  Ubuntu 23.04 and later only - before that resolved is
+#                     part of systemd and there is no such package, so an
+#                     install dies with "No package matching". Where it does
+#                     exist it is the best answer: on 24.04 it is the only
+#                     package that `Provides: resolvconf`, and it ships
+#                     /usr/sbin/resolvconf as a symlink to resolvectl, so
+#                     wg-quick's DNS ends up scoped to the tunnel interface
+#                     rather than rewritten globally into /etc/resolv.conf.
+#   openresolv        the usual answer on 20.04/22.04. Lives in universe, which
+#                     not every image enables.
+#   resolvconf        the old Debian implementation, last resort.
 #
-# Worth knowing before changing it: installing systemd-resolved takes over
+# Order matters and is not alphabetical: it is "native and interface-scoped
+# first, global rewrite last".
+#
+# Worth knowing before reordering: installing systemd-resolved takes over
 # /etc/resolv.conf (a symlink to its stub). On a host already managing that
-# file another way - a static file, cloud-init, the old resolvconf package -
-# that is a real change to how the host resolves names, and a host that loses
-# DNS mid-run fails the apt work and the Alloy play after it. Set this to
-# openresolv where that applies, or to "" to keep the old behaviour of
-# stopping and letting someone decide by hand.
-wg_resolvconf_package: systemd-resolved
+# file another way that is a real change to how it resolves names, and a host
+# that loses DNS mid-run fails the apt work and the Alloy play after it. The
+# "already present" check above is what keeps this from landing on a host that
+# is already fine.
+wg_resolvconf_packages:
+  - systemd-resolved
+  - openresolv
+  - resolvconf
+
+# Where the command might live. Checked with stat, which reports a symlink as
+# existing - systemd-resolved provides it as a symlink, not a real file.
+wg_resolvconf_paths:
+  - /usr/bin/resolvconf
+  - /usr/sbin/resolvconf
+  - /sbin/resolvconf
+  - /bin/resolvconf
 
 # The interface this host reaches the internet on. Empty to derive it, from
 # the default route in the main routing table.

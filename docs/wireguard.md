@@ -86,6 +86,43 @@ Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
 Setting `wg_dns` pulls in a dependency worth knowing about: `wg-quick` applies
 `DNS =` by piping into the `resolvconf` command, and does nothing else if it is
 missing — it fails, and the interface never comes up. A minimal cloud image can
+have no provider at all.
+
+The role handles it, and does not assume which package to use — that varies by
+release and image, and naming it wrong fails the run just as hard as naming
+nothing. It checks whether the command already exists; only if it does not, it
+runs `apt-cache policy` over `wg_resolvconf_packages` in order and installs the
+first one apt can actually offer:
+
+| package | where it applies |
+| --- | --- |
+| `systemd-resolved` | Ubuntu 23.04+ only. Before that, resolved is part of `systemd` and there is no such package. Preferred where it exists — it scopes the tunnel's DNS to the interface via `resolvectl`. |
+| `openresolv` | the usual answer on 20.04/22.04. In universe. |
+| `resolvconf` | the old Debian implementation, last resort. |
+
+Then it asserts the command exists before going near the tunnel.
+
+If the run stops here saying apt offered none of them, the host is on a release
+or image where none is installable — enable universe, or add a package that
+does exist there to `wg_resolvconf_packages`, or drop `wg_dns` and point the
+host at a resolver another way.
+
+Note that installing `systemd-resolved` takes over `/etc/resolv.conf` (a
+symlink to its stub). The role will not do that to a host that already has a
+working `resolvconf`, which is why the "already present" check comes first.
+
+### 2. Write the host_vars file
+
+Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
+
+| what OPNsense calls it | host_vars |
+| --- | --- |
+| this host's own tunnel address (what you're about to register as Allowed IPs) | `wg_address` |
+| a DNS resolver for the tunnel | `wg_dns` (a list) — a public one; there is no LAN resolver reachable from here |
+
+Setting `wg_dns` pulls in a dependency worth knowing about: `wg-quick` applies
+`DNS =` by piping into the `resolvconf` command, and does nothing else if it is
+missing — it fails, and the interface never comes up. A minimal cloud image can
 have no provider at all. The role installs one for you
 (`wg_resolvconf_package`, default `systemd-resolved`, which on Ubuntu 24.04 is
 the only package that `Provides: resolvconf` and ships

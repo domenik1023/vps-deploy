@@ -111,42 +111,78 @@
     wg_key_on_host: "{{ wg_generate_key | bool and wg_private_key | default('') | length == 0 }}"
 
 # wg-quick applies `DNS =` by piping into `resolvconf`, and does nothing else
-# if it is missing - it fails, and the interface never comes up. Which package
-# provides that command varies (systemd-resolved's compatibility symlink,
-# openresolv, the old resolvconf package), and a minimal cloud image may have
-# none of them.
+# if it is missing - it fails, and the interface never comes up. A minimal
+# cloud image can have no provider at all, which is a stop three tasks short of
+# the tunnel for something one apt install fixes.
 #
-# Install one rather than stopping for it. The old behaviour was to assert and
-# fail, which is a halt three tasks short of the tunnel for something one apt
-# install fixes - and it fires on exactly the minimal cloud image this role is
-# most likely to meet. See wg_resolvconf_package in defaults/main.yml for why
-# systemd-resolved and what installing it changes about the host.
+# So install one - but which package provides that command is genuinely a
+# moving target, and guessing it wrong fails the run just as hard as not
+# installing anything. systemd-resolved only became a separate package in
+# Ubuntu 23.04; before that it is part of systemd and `apt install
+# systemd-resolved` dies with "No package matching". openresolv and the old
+# resolvconf package are in universe, which not every image enables.
 #
-# Before the check below, not after, so the assert is a post-condition on a run
-# that has already tried to fix it - the same shape as 20_user.yml asserting
-# "keys to install, or keys already there".
+# So ask apt what it can actually offer, in preference order, and take the
+# first real answer. See wg_resolvconf_packages in defaults/main.yml.
+- name: Check whether a resolvconf implementation is already present
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ wg_resolvconf_paths }}"
+  register: wg_resolvconf_before
+  when: wg_dns | default([]) | length > 0
+
+# Nothing to install if the host already has one. This is not just an
+# optimisation: without it a host perfectly happy with openresolv would have
+# systemd-resolved installed on top, and that takes over /etc/resolv.conf.
+- name: Note whether a resolvconf implementation is already present
+  ansible.builtin.set_fact:
+    wg_resolvconf_present: >-
+      {{ wg_resolvconf_before.results | default([]) | selectattr('stat', 'defined')
+         | map(attribute='stat') | selectattr('exists') | list | length > 0 }}
+
+- name: Ask apt which resolvconf providers it can offer
+  ansible.builtin.command:
+    argv: [apt-cache, policy, "{{ item }}"]
+  loop: "{{ wg_resolvconf_packages }}"
+  register: wg_resolvconf_policy
+  changed_when: false
+  when:
+    - wg_dns | default([]) | length > 0
+    - not wg_resolvconf_present | bool
+    - wg_resolvconf_packages | length > 0
+
+# A package apt has never heard of prints nothing at all; one that is known but
+# uninstallable here - universe disabled, wrong release - prints
+# "Candidate: (none)". Both have to be rejected, and only the second is
+# obvious.
+- name: Settle on the resolvconf provider to install
+  ansible.builtin.set_fact:
+    wg_resolvconf_chosen: >-
+      {{ wg_resolvconf_policy.results | default([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'search', 'Candidate:')
+         | rejectattr('stdout', 'search', 'Candidate:\s*\(none\)')
+         | map(attribute='item') | list | first | default('', true) }}
+
 - name: Install a resolvconf provider for wg_dns
   ansible.builtin.apt:
-    name: "{{ wg_resolvconf_package }}"
+    name: "{{ wg_resolvconf_chosen }}"
     state: present
   when:
     - wg_dns | default([]) | length > 0
-    - wg_resolvconf_package | default('') | length > 0
+    - not wg_resolvconf_present | bool
+    - wg_resolvconf_chosen | length > 0
 
-# Checked here rather than discovered at `wg-quick up`, where the error is
-# "resolvconf: command not found" from inside a systemd unit, several tasks
-# after the one that could have said so.
+# Re-checked after the install rather than trusting it, so the assert below is
+# a post-condition on a run that has already tried to fix the problem - the
+# same shape as 20_user.yml asserting "keys to install, or keys already there".
 #
 # stat reports a symlink as existing, which matters: systemd-resolved provides
 # the command as /usr/sbin/resolvconf -> ../bin/resolvectl, not a real file.
 - name: Check that wg_dns has something to apply it with
   ansible.builtin.stat:
     path: "{{ item }}"
-  loop:
-    - /usr/bin/resolvconf
-    - /usr/sbin/resolvconf
-    - /sbin/resolvconf
-    - /bin/resolvconf
+  loop: "{{ wg_resolvconf_paths }}"
   register: wg_resolvconf
   when: wg_dns | default([]) | length > 0
 
@@ -160,13 +196,13 @@
       no `resolvconf` command, which is how wg-quick applies it -
       `wg-quick up {{ wg_interface }}` would fail with "resolvconf: command not
       found" and the tunnel would never come up.
-      {% if wg_resolvconf_package | default('') | length > 0 %}The task above
-      installed {{ wg_resolvconf_package }} and it still did not provide the
-      command, so that package is the wrong one for this host - try
-      openresolv.{% else %}wg_resolvconf_package is empty, so nothing was
-      installed. Set it (systemd-resolved on Ubuntu, or openresolv), install a
-      provider by hand, or drop wg_dns and point the host at a resolver another
-      way.{% endif %}
+      {% if wg_resolvconf_chosen | default('') | length > 0 %}Installed
+      {{ wg_resolvconf_chosen }}, which did not provide the command - reorder
+      wg_resolvconf_packages for this host.{% else %}apt offered none of
+      {{ wg_resolvconf_packages | join(', ') }} on this release, so nothing was
+      installed. Enable universe, name a package that exists here in
+      wg_resolvconf_packages, or drop wg_dns and point the host at a resolver
+      another way.{% endif %}
   when: wg_dns | default([]) | length > 0
 
 - name: Install WireGuard

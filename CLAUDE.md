@@ -223,16 +223,31 @@ the internet. `tasks/tunnel.yml` holds the work; `tasks/main.yml` is the
 `wireguard_manage` gate.
 
 Setting `wg_dns` costs a package. `wg-quick` applies `DNS =` by piping into
-`resolvconf` and fails outright without it, so the role installs
-`wg_resolvconf_package` (default `systemd-resolved` — on Ubuntu 24.04 the only
-package that `Provides: resolvconf`, shipping `/usr/sbin/resolvconf` as a
-symlink to `resolvectl`, which scopes the tunnel's DNS to the interface rather
-than rewriting `/etc/resolv.conf` globally). The install is gated on `wg_dns`
-and comes **before** the assert that checks for the command, so the assert is a
-post-condition rather than a stop on a host the run was about to fix —
-`tests/render-check.yml` asserts both the order and the gate. Note that
-installing systemd-resolved takes over `/etc/resolv.conf`, so a host managing
-that file another way wants `openresolv` or `""`.
+`resolvconf` and fails outright without it, so the role installs one — but
+**which** package that is cannot be hardcoded, and getting it wrong fails the
+run exactly as hard as installing nothing. `systemd-resolved` is not a package
+at all before Ubuntu 23.04 (resolved is part of `systemd`), and `openresolv`
+and `resolvconf` live in universe, which not every image enables.
+
+So the role asks: it stats the four paths the command might live at, and only
+if none exists runs `apt-cache policy` over `wg_resolvconf_packages` in
+preference order and installs the first apt can actually offer.
+`Candidate: (none)` — known but uninstallable here — has to be rejected
+explicitly, or the role picks it and apt fails on the next task. The preference
+order is not alphabetical: `systemd-resolved` first because where it exists it
+is the only package that `Provides: resolvconf` and ships
+`/usr/sbin/resolvconf` as a symlink to `resolvectl`, which scopes the tunnel's
+DNS to the interface instead of rewriting `/etc/resolv.conf` globally.
+
+The "already present" check is load-bearing rather than an optimisation: a host
+perfectly happy with `openresolv` would otherwise get `systemd-resolved`
+installed on top, and that takes over `/etc/resolv.conf`. The install is gated
+on `wg_dns` and comes before the assert, so the assert is a post-condition on a
+run that already tried to fix it — the same shape as `20_user.yml` installing
+the admin keys before asserting the account has one.
+`tests/render-check.yml` asserts the order of the whole chain, both gates, that
+the installed name comes from the probe rather than a literal, and that the
+`(none)` rejection is still there.
 
 The role reads `ssh_port` from `roles/baseline` rather than defining its own —
 a kill switch that returns on a different port than sshd listens on is a
