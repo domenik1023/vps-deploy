@@ -1,11 +1,11 @@
-# Managed by Ansible - roles/baseline/templates/wg.conf.j2. Local edits are
+# Managed by Ansible - roles/wireguard/templates/wg.conf.j2. Local edits are
 # overwritten on the next run.
 #
 # No FwMark here on purpose. wg-quick picks its own, at run time: with a /0 in
 # AllowedIPs it takes the first free routing table from 51820 up and sets the
 # interface fwmark to match, overriding whatever this file asked for. The kill
 # switch therefore uses a mark of its own, on a bit wg-quick does not touch -
-# see wg_killswitch_mark in defaults/main/60_wireguard.yml.
+# see wg_killswitch_mark in defaults/main.yml.
 [Interface]
 Address = {{ wg_address }}
 PrivateKey = {{ wg_private_key_resolved }}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Managed by Ansible - roles/baseline/templates/wg-killswitch.j2. Local edits
+# Managed by Ansible - roles/wireguard/templates/wg-killswitch.j2. Local edits
 # are overwritten on the next run.
 #
 #   wg-killswitch on    install the rules
@@ -23,6 +23,13 @@
 #             Docker's own FORWARD jumps run ahead of ufw's, so a rule in
 #             ufw-before-forward would never be reached.
 #
+# It also carries one rule that is not about dropping anything at all: an MSS
+# clamp in mangle FORWARD, which is what stops container traffic black-holing
+# on the tunnel's MTU. It lives here because this script is already idempotent,
+# already does both address families, and is already restarted by Reload UFW -
+# and the same `ufw reload` that flushes the chains above flushes that rule
+# too. See wg_mss_clamp in defaults/main.yml for why it is needed.
+#
 # Every chain here is created by this script and jumped into from a builtin.
 # `ufw reload` flushes the builtins and takes those jumps with it, so the
 # Reload UFW handler restarts this unit - the same reason it restarts the
@@ -34,6 +41,7 @@
 set -euo pipefail
 
 WAN='{{ wg_wan_interface_resolved }}'
+WG_IF='{{ wg_interface }}'
 MARK='{{ wg_killswitch_mark }}'
 PRIO='{{ wg_killswitch_rule_priority }}'
 SSH_PORT='{{ ssh_port }}'
@@ -43,6 +51,7 @@ OUT_CHAIN='WG-KILLSWITCH-OUT'
 FWD_CHAIN='WG-KILLSWITCH-FWD'
 MARK_CHAIN='WG-KILLSWITCH-MARK'
 RESTORE_CHAIN='WG-KILLSWITCH-RESTORE'
+MSS_CHAIN='WG-KILLSWITCH-MSS'
 
 # Create the chain, or empty it if a previous run left it there. Rebuilding
 # from empty is what makes this safe to run repeatedly, including from the
@@ -112,9 +121,44 @@ build() {
     # holds a default route, instead of wg-quick's tunnel table. Priority must
     # be below (checked before) whatever wg-quick actually installs, which is
     # not reliably 32764/32765 - see wg_killswitch_rule_priority in
-    # defaults/main/60_wireguard.yml for what a real deployment showed.
-    ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null || true
+    # defaults/main.yml for what a real deployment showed.
+    #
+    # The delete matches on the mark alone, deliberately, and loops. Pinning it
+    # to "$PRIO" - which is what this did - means a rule this script left at
+    # some *other* priority is never removed: lowering the default from 30000
+    # to 100 then adds the new rule and orphans the old one, and on a host
+    # where the stale number sits above wg-quick's own the wrong rule can still
+    # win. Deleting by mark makes a priority change actually take effect, and
+    # is why `off` leaves nothing behind after one.
+    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
     ip -"$fam" rule add fwmark "$MARK/$MARK" table main priority "$PRIO"
+{% if wg_mss_clamp %}
+
+    # --- mangle FORWARD: MSS clamping for forwarded traffic ---
+    # Containers sit on a 1500-MTU bridge and negotiate MSS from that, because
+    # they cannot see {{ wg_interface }}'s {{ wg_mtu }}. Traffic this host
+    # originates is fine - the kernel sizes the MSS it advertises from the
+    # route - but a router never rewrites the MSS of traffic it forwards, so
+    # the remote end sends segments that do not fit the tunnel. Those die at
+    # OPNsense and the ICMP saying so has to cross the internet back to the
+    # remote, where it is usually filtered. Handshakes complete, ping works,
+    # and every transfer larger than one segment hangs.
+    #
+    # Only -o "$WG_IF". --clamp-mss-to-pmtu clamps against the *outgoing*
+    # route's MTU, so the same rule on the way in would clamp against the
+    # bridge's 1500 and do nothing at all. That direction needs no help: this
+    # host generates the ICMP itself, over a veth, and the container honours
+    # it.
+    #
+    # --tcp-flags SYN,RST SYN matches SYN and SYN/ACK both, so a container
+    # serving an inbound connection over the tunnel is covered by the same
+    # rule. v6 needs no separate value either - the target subtracts 60 rather
+    # than 40 on its own.
+    ensure_chain "$ipt" mangle "$MSS_CHAIN"
+    "$ipt" -t mangle -A "$MSS_CHAIN" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
+    ensure_jump "$ipt" mangle FORWARD -o "$WG_IF" -j "$MSS_CHAIN"
+{% endif %}
 
     # --- filter OUTPUT: the host itself ---
     ensure_chain "$ipt" filter "$OUT_CHAIN"
@@ -185,6 +229,10 @@ teardown() {
 
     remove_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$MARK_CHAIN"
     remove_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
+    # Unconditional, unlike the matching half of build(): turning wg_mss_clamp
+    # off has to remove a rule an earlier run installed, and a restart runs the
+    # new script's `off` before its `on`.
+    remove_jump "$ipt" mangle FORWARD -o "$WG_IF" -j "$MSS_CHAIN"
     remove_jump "$ipt" filter OUTPUT -j "$OUT_CHAIN"
     if has_chain "$ipt" filter DOCKER-USER; then
         remove_jump "$ipt" filter DOCKER-USER -j "$FWD_CHAIN"
@@ -192,10 +240,13 @@ teardown() {
 
     remove_chain "$ipt" mangle "$MARK_CHAIN"
     remove_chain "$ipt" mangle "$RESTORE_CHAIN"
+    remove_chain "$ipt" mangle "$MSS_CHAIN"
     remove_chain "$ipt" filter "$OUT_CHAIN"
     remove_chain "$ipt" filter "$FWD_CHAIN"
 
-    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null; do :; done
+    # By mark, not by priority - same reason as in build(): a rule left at an
+    # earlier value of wg_killswitch_rule_priority has to go too.
+    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
 }
 
 # Within build() the final DROP is the last rule added, so a build that dies

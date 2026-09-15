@@ -6,10 +6,13 @@ exclude_paths:
   - collections/
 
 skip_list:
-  # Wants every variable in the role prefixed `config_`. That convention earns
-  # its keep when roles are shared and their variables can collide; here there
-  # is one role, the names are already domain-prefixed (crowdsec_*, docker_*,
-  # fail2ban_*), and renaming ~50 variables would only add noise. ansible_port
+  # Wants every variable in a role prefixed with that role's name. That
+  # convention earns its keep when roles are shared and their variables can
+  # collide; these four are not shared, the names are already domain-prefixed
+  # (crowdsec_*, docker_*, fail2ban_*, wg_*), and renaming ~50 variables would
+  # only add noise. The prefixes also deliberately do not all match their role:
+  # roles/wireguard uses wg_*, and roles/wireguard reads roles/baseline's
+  # ssh_port on purpose rather than keeping a second copy of it. ansible_port
   # is flagged by the same rule and cannot be renamed at all - it is Ansible's.
   - var-naming[no-role-prefix]
 

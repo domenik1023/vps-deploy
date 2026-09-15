@@ -74,6 +74,13 @@ rather than a misconfigured one:
   release from GitHub through it, so a peer that can reach OPNsense but not
   the internet fails the run at Alloy rather than at WireGuard.
 
+  Registering the peer above and adding this rule are two different pages,
+  and only the second one complains if you forget it by *not existing* rather
+  than by erroring — the tunnel still comes up and handshakes with no access
+  at all. **[docs/opnsense-firewall.md](opnsense-firewall.md)** covers the
+  rule shapes in use, why they go on the WireGuard interface tab rather than
+  WAN, and how to tell which piece is missing from the host.
+
 ### 2. Write the host_vars file
 
 Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
@@ -82,13 +89,75 @@ Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
 | --- | --- |
 | this host's own tunnel address (what you're about to register as Allowed IPs) | `wg_address` |
 | a DNS resolver for the tunnel | `wg_dns` (a list) — a public one; there is no LAN resolver reachable from here |
+
+Setting `wg_dns` pulls in a dependency worth knowing about: `wg-quick` applies
+`DNS =` by piping into the `resolvconf` command, and does nothing else if it is
+missing — it fails, and the interface never comes up. A minimal cloud image can
+have no provider at all.
+
+The role handles it, and does not assume which package to use — that varies by
+release and image, and naming it wrong fails the run just as hard as naming
+nothing. It checks whether the command already exists; only if it does not, it
+runs `apt-cache policy` over `wg_resolvconf_packages` in order and installs the
+first one apt can actually offer:
+
+| package | where it applies |
+| --- | --- |
+| `systemd-resolved` | Ubuntu 23.04+ only. Before that, resolved is part of `systemd` and there is no such package. Preferred where it exists — it scopes the tunnel's DNS to the interface via `resolvectl`. |
+| `openresolv` | the usual answer on 20.04/22.04. In universe. |
+| `resolvconf` | the old Debian implementation, last resort. |
+
+Then it asserts the command exists before going near the tunnel.
+
+If the run stops here saying apt offered none of them, the host is on a release
+or image where none is installable — enable universe, or add a package that
+does exist there to `wg_resolvconf_packages`, or drop `wg_dns` and point the
+host at a resolver another way.
+
+Note that installing `systemd-resolved` takes over `/etc/resolv.conf` (a
+symlink to its stub). The role will not do that to a host that already has a
+working `resolvconf`, which is why the "already present" check comes first.
+
+### 2. Write the host_vars file
+
+Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
+
+| what OPNsense calls it | host_vars |
+| --- | --- |
+| this host's own tunnel address (what you're about to register as Allowed IPs) | `wg_address` |
+| a DNS resolver for the tunnel | `wg_dns` (a list) — a public one; there is no LAN resolver reachable from here |
+
+Setting `wg_dns` pulls in a dependency worth knowing about: `wg-quick` applies
+`DNS =` by piping into the `resolvconf` command, and does nothing else if it is
+missing — it fails, and the interface never comes up. A minimal cloud image can
+have no provider at all. The role installs one for you
+(`wg_resolvconf_package`, default `systemd-resolved`, which on Ubuntu 24.04 is
+the only package that `Provides: resolvconf` and ships
+`/usr/sbin/resolvconf → resolvectl`), and then still asserts the command exists
+before going near the tunnel.
+
+Installing `systemd-resolved` takes over `/etc/resolv.conf`. On a host already
+managing that file another way, set `wg_resolvconf_package: openresolv`, or
+`""` to install nothing and have the run stop so you can decide by hand.
 | OPNsense's **instance** public key | `wg_peer_public_key` |
 | OPNsense's public host:port | `wg_peer_endpoint` |
 | the preshared key, if you generated one on the peer | `wg_preshared_key` |
 
 `wg_peer_public_key` is the trap worth naming: it is **OPNsense's** key, not
-this host's. Putting the host's own public key there produces a tunnel that
-comes up and never handshakes.
+this host's. The two travel in opposite directions and are easy to swap —
+both are base64 of the same shape, and a run prints one of them:
+
+| value | where it belongs |
+| --- | --- |
+| OPNsense's **instance** public key (VPN → WireGuard → Instances) | `wg_peer_public_key` in this host's host_vars. Shared by every peer on that endpoint |
+| this **host's** public key, printed by the generated-key run | the peer entry on OPNsense, as that peer's public key |
+
+Putting the host's own key in `wg_peer_public_key` produces a tunnel that comes
+up and never handshakes, and `sudo wg show wg0` shows no peer at all — the
+kernel refuses a peer whose key is the interface's own. `tasks/tunnel.yml`
+asserts against it before the config is written, and `tests/render-check.yml`
+catches the wider family in CI by requiring every host on one endpoint to name
+one peer key.
 
 Also set:
 
@@ -284,6 +353,55 @@ Both of those restarts are gated on `wireguard_manage` and `crowdsec_manage`
 respectively, because `Reload UFW` also fires on hosts where neither service
 exists.
 
+## Containers and the tunnel's MTU
+
+Symptom, and it does not look like an MTU problem: containers on a `[vpn]` host
+appear to have no working internet. TCP connections open, `ping` works, DNS
+works, and then anything with real payload hangs — `docker pull` stalls,
+`apt update` sits there, HTTPS dies part-way through the certificate exchange.
+The host itself is fine throughout, which is the clue.
+
+The host is fine because the kernel picks the MSS it advertises from the
+outgoing route's MTU. With `AllowedIPs = 0.0.0.0/0` that route is `wg0` at
+`wg_mtu` (1420), so the host asks for 1380 without being told to. A container
+cannot do that: it sits on a 1500-MTU bridge, advertises `MSS 1460` from its
+own view of the world, and **the kernel never rewrites the MSS of traffic it
+forwards** — a router is not supposed to.
+
+The two directions then fail differently:
+
+| direction | what happens | recovers? |
+|---|---|---|
+| container → internet | oversized frame reaches this host, does not fit `wg0`, host drops it and sends ICMP frag-needed back down the veth | yes — same kernel, no middlebox |
+| internet → container | remote sends 1460-byte segments because the container asked for them; they die at OPNsense, which must send ICMP frag-needed back across the public internet to the remote | usually not — that ICMP is widely filtered |
+
+So the second direction black-holes, and nothing ever tells the container to
+ask for less.
+
+`wg_mss_clamp` (on by default) fixes it with one rule in `mangle FORWARD` that
+rewrites the MSS option on SYNs leaving the tunnel. The option means "do not
+send me more than this", so the remote never emits a packet OPNsense cannot
+carry. It is installed by the kill switch script, not by a `PostUp` line —
+`wg-quick`'s hooks only run at tunnel up/down, while `ufw reload` flushes
+`mangle FORWARD` at any time, and the kill switch is already restarted by the
+`Reload UFW` handler.
+
+Check it:
+
+```bash
+sudo iptables -t mangle -S FORWARD | grep MSS     # -o wg0 -j WG-KILLSWITCH-MSS
+sudo iptables -t mangle -S WG-KILLSWITCH-MSS      # TCPMSS --clamp-mss-to-pmtu
+sudo tcpdump -ni wg0 'tcp[tcpflags] & tcp-syn != 0' -vv   # MSS 1380 leaving, not 1460
+docker run --rm alpine wget -qO- https://github.com >/dev/null && echo ok
+```
+
+If you are debugging this on a host that predates the clamp, the give-away is
+that `curl -sS --max-filesize 1000 https://...` succeeds while a full fetch
+hangs, and that lowering the container's own MTU
+(`docker run --network=... --sysctl`, or a compose `driver_opts`) makes it work
+— that is a workaround, not the fix, because it has to be repeated on every
+network anyone creates.
+
 ## Verifying
 
 ```bash
@@ -343,9 +461,11 @@ Common causes, in the order they are worth checking:
 
 | symptom | cause |
 | --- | --- |
-| play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_peer_public_key` is this host's key rather than OPNsense's; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
+| play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
+| `sudo wg show wg0` lists the interface but **no `peer:` block at all** | `wg_peer_public_key` holds this host's own key. WireGuard will not accept a peer whose public key is the interface's own, so it is dropped and the tunnel runs with no peer — every packet vanishes and it never handshakes. The play now refuses this before writing the config; a host configured before that check existed shows it this way |
 | tunnel is up, nothing routes | OPNsense's outbound NAT does not cover the tunnel subnet, or no rule on the WireGuard interface tab permits this peer's traffic out |
 | SSH dies the moment the route moves | the mangle rules did not install — check `iptables -t mangle -S` and `ip rule`, and that `sysctl_rp_filter` is 2 |
+| SSH over the tunnel address works but `ip rule` shows the kill switch's fwmark rule at a number you did not configure | a rule left behind by an older `wg_killswitch_rule_priority`. Until this was fixed, both deletes matched on priority as well as mark, so lowering the default added a new rule and orphaned the old one — and the stale number is typically the one above wg-quick's. `ip rule del fwmark <mark>/<mark> table main` by hand clears a leftover on an already-deployed host; a current run now does it for you |
 | SSH dies, but `iptables -t mangle -L -n -v` shows real, growing packet counters on both KILLSWITCH chains | the mark is being set and restored correctly, but `ip rule` shows wg-quick's own rule at a *lower* number than `wg_killswitch_rule_priority` — it wins the race and the mark is never actually honored. Confirm with `ip route get <ip> mark <wg_killswitch_mark>`: if it still shows `dev wg0` instead of the public interface, this is it. Lower `wg_killswitch_rule_priority` below whatever `ip rule` actually shows, not below the number this doc happens to mention |
 | Alloy fails to install on the first run | same as "nothing routes": its release is fetched through the tunnel |
 | telemetry never arrives | `wg_dns` is not set, so the ingest hostname does not resolve — see `group_vars/vpn.yml` |

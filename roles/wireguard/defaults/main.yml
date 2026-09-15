@@ -32,6 +32,93 @@ wg_persistent_keepalive: 25
 # through the tunnel stalls on large packets while ping stays fine.
 wg_mtu: 1420
 
+# Clamp the TCP MSS of *forwarded* traffic to the tunnel's path MTU.
+#
+# This is what makes Docker containers work on a [vpn] host, and without it
+# they look broken in a way that does not resemble an MTU problem at all:
+# handshakes complete, ping works, DNS works, and every transfer larger than
+# one segment hangs. `docker pull`, `apt update` and any HTTPS with a real
+# certificate chain stall forever.
+#
+# The host's own traffic is fine without this. The kernel sizes the MSS it
+# advertises from the outgoing route's MTU, and with AllowedIPs = 0.0.0.0/0
+# that route is {{ wg_interface }} - so the host asks for 1380 by itself. A
+# container cannot: it sits on a 1500-MTU bridge, advertises MSS 1460 from
+# that, and the kernel never rewrites the MSS of traffic it merely forwards.
+# Routers are not supposed to.
+#
+# The two directions then fail differently, and only one recovers on its own:
+#
+#   container -> internet   self-heals. The oversized frame hits this host,
+#                           does not fit wg0, and this host drops it and sends
+#                           ICMP frag-needed straight back down the veth. Same
+#                           kernel, no middlebox, container caches the PMTU.
+#
+#   internet -> container   black-holes. The remote is sending 1460-byte
+#                           segments because our container asked for them.
+#                           Those die at OPNsense, which has to push them into
+#                           the tunnel and cannot, and the ICMP saying so has
+#                           to cross the public internet back to the remote -
+#                           where it is filtered often enough to be useless.
+#                           Nothing ever tells the container to ask for less.
+#
+# Rewriting the MSS option on the SYN as it *leaves* the tunnel is what fixes
+# the second one: the option means "do not send me more than this", so the
+# remote never emits a packet OPNsense cannot carry. --clamp-mss-to-pmtu
+# rather than a literal --set-mss so it tracks wg_mtu above, including on a
+# host whose provider hands out a 1450-byte underlay.
+#
+# Installed by the kill switch script, because that is the thing here that is
+# already idempotent, already covers both address families, and is already put
+# back by the Reload UFW handler - and `ufw reload` flushes the mangle builtin
+# this rule lives in just as it flushes the ones the kill switch jumps from.
+# That does mean wg_killswitch: false leaves a [vpn] host with no clamp; if you
+# ever run one that way, this needs a unit of its own.
+wg_mss_clamp: true
+
+# Candidate packages providing the `resolvconf` command, in preference order.
+# Probed with `apt-cache policy` and the first one apt can actually offer is
+# installed - but only when wg_dns is set *and* the host has no such command
+# already. Empty to install nothing and let the assert in tasks/tunnel.yml stop
+# the run instead.
+#
+# A list rather than one name because the right package is a moving target and
+# naming it wrong fails the run exactly as hard as naming nothing:
+#
+#   systemd-resolved  Ubuntu 23.04 and later only - before that resolved is
+#                     part of systemd and there is no such package, so an
+#                     install dies with "No package matching". Where it does
+#                     exist it is the best answer: on 24.04 it is the only
+#                     package that `Provides: resolvconf`, and it ships
+#                     /usr/sbin/resolvconf as a symlink to resolvectl, so
+#                     wg-quick's DNS ends up scoped to the tunnel interface
+#                     rather than rewritten globally into /etc/resolv.conf.
+#   openresolv        the usual answer on 20.04/22.04. Lives in universe, which
+#                     not every image enables.
+#   resolvconf        the old Debian implementation, last resort.
+#
+# Order matters and is not alphabetical: it is "native and interface-scoped
+# first, global rewrite last".
+#
+# Worth knowing before reordering: installing systemd-resolved takes over
+# /etc/resolv.conf (a symlink to its stub). On a host already managing that
+# file another way that is a real change to how it resolves names, and a host
+# that loses DNS mid-run fails the apt work and the Alloy play after it. The
+# "already present" check above is what keeps this from landing on a host that
+# is already fine.
+wg_resolvconf_packages:
+  - systemd-resolved
+  - openresolv
+  - resolvconf
+
+# Where the command might live. Checked with stat, which reports a symlink as
+# existing - systemd-resolved provides it as a symlink, not a real file.
+wg_resolvconf_paths:
+  - /usr/bin/resolvconf
+  - /usr/sbin/resolvconf
+  - /sbin/resolvconf
+  - /bin/resolvconf
+
 # The interface this host reaches the internet on. Empty to derive it, from
 # the default route in the main routing table.
 #

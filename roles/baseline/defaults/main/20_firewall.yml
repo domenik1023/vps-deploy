@@ -2,7 +2,7 @@
 # For reading by hand only. CrowdSec does not consume these lines and must not
 # be made to depend on them: at every level below `high`, ufw attaches
 # `-m limit --limit 3/min --limit-burst 10` to its own LOG rules, which starves
-# the port-scan scenario outright (see crowdsec_firewall_log_prefix in 50_crowdsec.yml).
+# the port-scan scenario outright (see crowdsec_firewall_log_prefix in roles/crowdsec/defaults/main.yml).
 # Raising this does not fix that either - explicit `deny` rules log on a
 # separate path with a limit hardcoded in ufw's source. The rule CrowdSec
 # actually reads is installed by crowdsec.yml and carries no limit.

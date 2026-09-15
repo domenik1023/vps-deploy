@@ -1,0 +1,16 @@
+# --- WIREGUARD ---
+# Tunnel + kill switch, for [vpn] hosts only.
+#
+# The gate is one include rather than a `when` on the role in main.yml so that
+# a host that is not in [vpn] reports one skipped task instead of every task in
+# the role, and so the reason sits next to the condition.
+#
+# This role must run last of the three in play one, and that is load-bearing
+# rather than tidy: roles/baseline and roles/crowdsec install packages, and
+# doing that before the default route moves means a bootstrap run never depends
+# on the tunnel or on OPNsense routing this peer to the internet. By the time
+# this role runs there is nothing left to download.
+- name: Include the WireGuard tunnel and kill switch
+  ansible.builtin.include_tasks:
+    file: tunnel.yml
+  when: wireguard_manage | bool

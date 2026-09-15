@@ -16,7 +16,7 @@
 # sshd to ssh_port and then deny ssh_old_port, so set this to 22822 afterwards
 # - and keep using the public address, not the tunnel address: the tunnel is
 # built by the run, so on a bootstrap run it does not exist yet.
-ansible_host: "{{ vpn_ip | default('141.5.102.51') }}"
+ansible_host: "{{ vpn_ip | default('141.5.110.173') }}"
 ansible_port: 22822
 ansible_user: cloud
 
@@ -24,13 +24,13 @@ ansible_user: cloud
 # address above - see docs/wireguard.md. Leave unset for now: the tunnel just
 # went through repeated handshake failures during initial setup, and there is
 # no fallback to the public address if it drops again while this is set.
-# vpn_ip: 10.99.0.10
+# vpn_ip: 10.99.0.11
 
 # --- The tunnel ---
 # Reassigned for the move from the UDM to OPNsense - was 192.168.9.20/32,
 # OPNsense's own addressing (10.99.0.0/24) uses this instead. Must match
 # exactly what gets registered as this peer's Allowed IPs on OPNsense.
-wg_address: 10.99.0.10/32
+wg_address: 10.99.0.11/32
 
 # There is no LAN resolver reachable from here any more - OPNsense does not
 # route this peer to the home LAN, only to the internet. A public resolver,
@@ -38,7 +38,17 @@ wg_address: 10.99.0.10/32
 wg_dns:
   - 9.9.9.9
 
-# OPNsense's WireGuard instance, not the old UDM server.
+# OPNsense's WireGuard *instance* public key - VPN: WireGuard: Instances, not
+# Peers. This is the key this host encrypts to, so it is the same value for
+# every peer pointing at the same wg_peer_endpoint; vpn-gwdg-01 uses it too.
+#
+# Not this host's own public key. That one goes the other way: OPNsense holds
+# it in the peer entry it created for this host. Both are base64 of the same
+# shape and both get printed by a run, which is why they get swapped - and the
+# swap fails silently, because WireGuard will not accept a peer whose key is
+# the interface's own, so the tunnel comes up with no peer and never
+# handshakes. tasks/tunnel.yml now refuses the run rather than letting that
+# happen.
 wg_peer_public_key: "3KkhC/Pdld0zC/BW06uieILyWSd152hZOCseSdVTbwY="
 wg_peer_endpoint: "78.47.74.24:51820"
 

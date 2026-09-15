@@ -50,7 +50,7 @@ crowdsec_acquisitions: {}
 crowdsec_firewall_log_prefix: "[CS NEW] "
 
 # Public source addresses that must never earn a decision. Worth setting: the
-# rule installed by 70_crowdsec.yml logs accepted connections too and the parser treats them as drops,
+# rule installed by roles/crowdsec logs accepted connections too and the parser treats them as drops,
 # while any decision this agent raises is stored on the central LAPI and
 # enforced on every host in the fleet - so a single false positive locks you out
 # everywhere at once. crowdsecurity/whitelists, which crowdsecurity/linux pulls
@@ -80,7 +80,7 @@ crowdsec_firewall_bouncer_mode: "{{ 'nftables' if 'nftables' in crowdsec_firewal
 #
 # It is a variable at all because packagecloud lags Ubuntu: at the time of
 # writing the CrowdSec repository has nothing newer than oracular (24.10), so
-# there is no resolute, questing or plucky. 70_crowdsec.yml asks the repository
+# there is no resolute, questing or plucky. roles/crowdsec asks the repository
 # before adding it, and **skips CrowdSec entirely** on a release it does not
 # carry - no fallback to an older suite, because a host running a release
 # CrowdSec has not shipped for yet is better off without it than carrying a
@@ -90,13 +90,13 @@ crowdsec_firewall_bouncer_mode: "{{ 'nftables' if 'nftables' in crowdsec_firewal
 # decided that is what you want.
 crowdsec_apt_suite: ""
 
-# Whether the repository actually carries a suite for this host. 70_crowdsec.yml
+# Whether the repository actually carries a suite for this host. roles/crowdsec
 # replaces this with what it found; the default is what every other host uses,
 # including one running with --tags where that file never ran.
 #
 # It defaults true rather than false because the handler that reads it restarts
 # the CrowdSec bouncer after a ufw reload, and a false default would silently
-# stop doing that on a converged host whose run did not reach 70_crowdsec.yml -
+# stop doing that on a converged host whose run did not reach roles/crowdsec -
 # leaving the bouncer's chains flushed and the host unprotected, which is worse
 # than the failed handler this guards against.
 crowdsec_suite_available: true

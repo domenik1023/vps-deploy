@@ -1,0 +1,24 @@
+# Notified by `Reload UFW` in roles/baseline: the kill switch's chains are
+# jumped into from OUTPUT, DOCKER-USER and the two mangle builtins, and `ufw
+# reload`'s iptables-restore flushes the builtins those jumps live in. A [vpn]
+# host would be left routing everything into a tunnel with nothing stopping
+# traffic leaving the public interface if the tunnel dropped - which is the
+# failure the kill switch exists to prevent, reintroduced by an unrelated
+# firewall rule change. The same reload takes the MSS clamp with it, which is
+# the other reason this has to be put back rather than left to the next
+# `wg-quick up`.
+#
+# Handlers fire in the play's definition order, and roles/baseline is listed
+# before roles/wireguard in main.yml, so `Reload UFW` is defined - and
+# therefore fires - ahead of this.
+#
+# `Reload UFW` fires on *any* host that changes a ufw rule, LAN boxes included
+# since docker_host_access_cidrs adds one there, so this needs the same guards
+# that decided whether the kill switch was installed at all. Gated rather than
+# swallowed with failed_when, so a unit genuinely missing from a [vpn] host
+# that should have it is still an error.
+- name: Restart WireGuard kill switch
+  ansible.builtin.systemd_service:
+    name: wg-killswitch
+    state: restarted
+  when: wireguard_manage | bool and wg_killswitch | bool

@@ -29,9 +29,11 @@ vps-deploy/
 ├── .ansible-lint                     # Lint profile and the two skipped rules
 ├── .github/workflows/ci.yml          # syntax check, lint, render check
 ├── tests/
-│   └── render-check.yml              # Variable shapes and design invariants
+│   ├── render-check.yml              # Variable shapes and design invariants
+│   └── killswitch-netns.sh           # The kill switch, against a real kernel
 ├── group_vars/
 │   ├── all/
+│   │   ├── 00_classify.yml           # host_class + the switches deciding which roles run
 │   │   └── vault.yml                 # Admin password hash — encrypt with ansible-vault
 │   ├── vps.yml                       # Off-site hosts: the public ingest hostname
 │   ├── vpn.yml                       # Tunnelled hosts: LAN ingest, loose rp_filter
@@ -39,7 +41,8 @@ vps-deploy/
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 │   ├── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
-│   └── wireguard.md                  # Tunnel setup, the kill switch, recovery
+│   ├── wireguard.md                  # Tunnel setup, the kill switch, recovery
+│   └── opnsense-firewall.md          # Firewall rules for WireGuard peers — not automatic
 ├── host_vars/                        # Optional per-host settings, by name
 │   ├── vpn-example.yml.example       # Template for a new [vpn] host
 │   ├── vps-docker.yml                # Address, SSH port, per-host overrides
@@ -55,11 +58,9 @@ vps-deploy/
     │   │   ├── 10_ssh.yml
     │   │   ├── 20_firewall.yml       # UFW, fail2ban
     │   │   ├── 30_system.yml         # Unattended upgrades
-    │   │   ├── 40_docker.yml
-    │   │   ├── 50_crowdsec.yml
-    │   │   └── 60_wireguard.yml
+    │   │   └── 40_docker.yml
     │   ├── handlers/
-    │   │   └── main.yml              # Service restart handlers
+    │   │   └── main.yml              # Reload systemd / Docker / UFW
     │   ├── templates/                # Free-form file bodies (sshd, systemd, sysctl)
     │   └── tasks/
     │       ├── main.yml              # Task orchestration
@@ -73,10 +74,21 @@ vps-deploy/
     │       ├── 50_sysctl.yml         # Kernel parameter hardening
     │       ├── 60_updates.yml        # Unattended upgrades + reboot window
     │       ├── 61_time.yml           # Chrony NTP
-    │       ├── 62_docker.yml         # Docker engine and daemon config
-    │       ├── 70_crowdsec.yml       # CrowdSec agent + firewall bouncer
-    │       ├── 71_crowdsec_credentials.yml  # Automatic LAPI machine/bouncer provisioning
-    │       └── 80_wireguard.yml      # Tunnel + kill switch ([vpn] only)
+    │       └── 62_docker.yml         # Docker engine and daemon config
+    ├── crowdsec/                     # Agent + firewall bouncer ([vps]/[vpn])
+    │   ├── defaults/main.yml         # LAPI, collections, bouncer, log prefix
+    │   ├── handlers/main.yml         # Restart CrowdSec / the bouncer
+    │   └── tasks/
+    │       ├── main.yml              # crowdsec_manage gate
+    │       ├── agent.yml             # Repository, agent, bouncer, iptables rules
+    │       └── credentials.yml       # Automatic LAPI machine/bouncer provisioning
+    ├── wireguard/                    # Tunnel + kill switch ([vpn] only)
+    │   ├── defaults/main.yml         # Tunnel, MTU/MSS, kill switch, rollback
+    │   ├── handlers/main.yml         # Restart the kill switch
+    │   ├── templates/                # wg0.conf, kill switch script + unit
+    │   └── tasks/
+    │       ├── main.yml              # wireguard_manage gate
+    │       └── tunnel.yml            # Keys, tunnel, kill switch, rollback
     └── alloy/
         ├── defaults/
         │   └── main.yml              # Pipelines, endpoints, bind addresses, version pin
@@ -270,7 +282,8 @@ reverseproxy
 
 **Every host must be in exactly one of `[vps]`, `[vpn]` and `[local]`.** That
 membership is the only thing that decides how much of the playbook it gets:
-`roles/baseline` derives `host_class` from it, and `00_classify.yml` fails the
+`group_vars/all/00_classify.yml` derives `host_class` from it, and
+`roles/baseline/tasks/00_classify.yml` fails the
 run — before anything changes — for a host in none of them or in more than one.
 
 | | `local` | `vps` | `vpn` |
@@ -289,7 +302,10 @@ both plays run against `all:!lapi`.
 
 A `[vpn]` host needs its tunnel described in host_vars before its first run;
 `host_vars/vpn-example.yml.example` is the template and
-**[docs/wireguard.md](docs/wireguard.md)** is the procedure.
+**[docs/wireguard.md](docs/wireguard.md)** is the procedure. Registering the
+peer on OPNsense does not by itself grant it any access — that is a separate
+firewall rule, covered in
+**[docs/opnsense-firewall.md](docs/opnsense-firewall.md)**.
 
 ```yaml
 # host_vars/vps-pangolin.yml — only if the name does not resolve on its own
@@ -331,7 +347,9 @@ new name; delete the leftovers on the master with `cscli machines delete` and
 
 ## Configuration
 
-Hardening, Docker and CrowdSec values live in `roles/baseline/defaults/main/`;
+Hardening and Docker values live in `roles/baseline/defaults/main/`, CrowdSec
+values in `roles/crowdsec/defaults/main.yml` and tunnel values in
+`roles/wireguard/defaults/main.yml`;
 Alloy's live in `roles/alloy/defaults/main.yml` and are tabled
 [below](#grafana-alloy-1).
 

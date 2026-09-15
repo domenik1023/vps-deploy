@@ -3,7 +3,7 @@
 #
 # python3-debian is the load-bearing entry: deb822_repository parses and writes
 # .sources files through it, a stock Ubuntu image lacks it, and both
-# 62_docker.yml and 70_crowdsec.yml add a repository that way. Keep this file
+# 62_docker.yml and roles/crowdsec add a repository that way. Keep this file
 # ahead of either.
 
 - name: Update all packages
