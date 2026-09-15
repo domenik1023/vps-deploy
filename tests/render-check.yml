@@ -1119,6 +1119,69 @@
           - wg_peer_public_key
           - wg_peer_endpoint
 
+    # One UDP port is one WireGuard instance, and an instance has exactly one
+    # public key - so every host pointing at the same wg_peer_endpoint must
+    # encrypt to the same wg_peer_public_key. Two different values for one
+    # endpoint means at least one of them is wrong.
+    #
+    # Worth a test rather than a comment because of how it fails: a wrong peer
+    # key is rejected by nothing. The interface comes up, the routes install,
+    # the firewall is fine, and packets go out encrypted to a key nobody holds.
+    # `wg show` then reports a tunnel that has simply never handshaked, which
+    # looks identical to a dozen server-side problems - a disabled peer, a
+    # missing preshared key, a blocked UDP port.
+    #
+    # tasks/tunnel.yml catches the commonest single case, a host's *own* key
+    # pasted into wg_peer_public_key, which it can only do on the host where
+    # that key exists. This catches the rest of the family in CI, before anyone
+    # runs anything.
+    - name: Collect each host's WireGuard endpoint and peer key
+      ansible.builtin.set_fact:
+        wg_peers: >-
+          {{ wg_peers | default([])
+             + [{'host': item | basename,
+                 'endpoint': host_overrides.wg_peer_endpoint,
+                 'key': host_overrides.wg_peer_public_key}] }}
+      when:
+        - host_overrides.wg_peer_endpoint is defined
+        - host_overrides.wg_peer_public_key is defined
+      loop: "{{ query('ansible.builtin.fileglob', '../host_vars/*.yml') | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        host_overrides: "{{ host_vars_of }}"
+
+    - name: Hosts sharing a WireGuard endpoint must share the peer public key
+      ansible.builtin.assert:
+        that:
+          - wg_peers | default([]) | length > 0
+          - endpoints | length == pairs | length
+        fail_msg: >-
+          Two hosts point at one WireGuard endpoint with different
+          wg_peer_public_key values. One UDP port is one WireGuard instance and
+          an instance has one public key, so every host naming the same
+          endpoint encrypts to the same value - on OPNsense that is
+          VPN: WireGuard: Instances, the instance's own key, never a host's own.
+          Saw {{ endpoints | length }} endpoint(s) but
+          {{ pairs | length }} endpoint/key combinations:
+          {{ wg_peers | map(attribute='host') | zip(wg_peers | map(attribute='endpoint'),
+             wg_peers | map(attribute='key')) | list }}
+        success_msg: >-
+          {{ endpoints | length }} WireGuard endpoint(s) across
+          {{ wg_peers | default([]) | length }} host(s), each with one consistent peer key
+      vars:
+        # If every endpoint has exactly one key, the distinct endpoints and the
+        # distinct endpoint/key combinations come to the same number. A second
+        # key for one endpoint adds a combination without adding an endpoint.
+        # Counting beats grouping here: it needs no custom filter and no
+        # tuple-index access, both of which ansible-lint renders statically and
+        # chokes on.
+        endpoints: "{{ wg_peers | default([]) | map(attribute='endpoint') | unique | list }}"
+        pairs: >-
+          {{ wg_peers | default([]) | map(attribute='endpoint')
+             | zip(wg_peers | default([]) | map(attribute='key'))
+             | unique | list }}
+
     - name: The pipeline toggles must actually add and remove pipelines
       # Each toggle exists for a failure it prevents, and a broken conditional
       # fails quietly in the direction that matters: a host without Docker

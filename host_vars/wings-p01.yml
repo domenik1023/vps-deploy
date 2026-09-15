@@ -38,8 +38,18 @@ wg_address: 10.99.0.11/32
 wg_dns:
   - 9.9.9.9
 
-# OPNsense's WireGuard instance, not the old UDM server.
-wg_peer_public_key: "5s+J6ldEy49s6X6giulMtqKJCeTHP8LObhz2KTwyUCQ="
+# OPNsense's WireGuard *instance* public key - VPN: WireGuard: Instances, not
+# Peers. This is the key this host encrypts to, so it is the same value for
+# every peer pointing at the same wg_peer_endpoint; vpn-gwdg-01 uses it too.
+#
+# Not this host's own public key. That one goes the other way: OPNsense holds
+# it in the peer entry it created for this host. Both are base64 of the same
+# shape and both get printed by a run, which is why they get swapped - and the
+# swap fails silently, because WireGuard will not accept a peer whose key is
+# the interface's own, so the tunnel comes up with no peer and never
+# handshakes. tasks/tunnel.yml now refuses the run rather than letting that
+# happen.
+wg_peer_public_key: "3KkhC/Pdld0zC/BW06uieILyWSd152hZOCseSdVTbwY="
 wg_peer_endpoint: "78.47.74.24:51820"
 
 # Secrets. Never in plain text here - encrypt in place:

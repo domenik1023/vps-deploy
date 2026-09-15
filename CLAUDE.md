@@ -249,6 +249,21 @@ the admin keys before asserting the account has one.
 the installed name comes from the probe rather than a literal, and that the
 `(none)` rejection is still there.
 
+**`wg_peer_public_key` is the server's key, and the swap is silent.** It and
+the host's own public key are base64 of the same shape and travel in opposite
+directions — OPNsense's *instance* key goes in host_vars, the *host's* key goes
+in OPNsense's peer entry. Get it backwards and nothing rejects it: the
+interface comes up, routes install, the firewall is fine, and packets go out
+encrypted to a key nobody holds. `wg show` then reports a tunnel that has never
+handshaked, indistinguishable from a disabled peer or a blocked UDP port — and
+`wg show` lists **no peer at all**, because the kernel refuses a peer whose
+public key is the interface's own. `tunnel.yml` asserts
+`wg_peer_public_key != <this host's public key>` before the config is written
+(which is why `wg pubkey` runs on every path, not just the generated-key one),
+and `tests/render-check.yml` requires every host sharing a `wg_peer_endpoint`
+to name the same `wg_peer_public_key` — one UDP port is one instance and an
+instance has one key.
+
 The role reads `ssh_port` from `roles/baseline` rather than defining its own —
 a kill switch that returns on a different port than sshd listens on is a
 serial-console trip, so there is deliberately only one copy. That makes the

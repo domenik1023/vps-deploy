@@ -137,8 +137,20 @@ managing that file another way, set `wg_resolvconf_package: openresolv`, or
 | the preshared key, if you generated one on the peer | `wg_preshared_key` |
 
 `wg_peer_public_key` is the trap worth naming: it is **OPNsense's** key, not
-this host's. Putting the host's own public key there produces a tunnel that
-comes up and never handshakes.
+this host's. The two travel in opposite directions and are easy to swap —
+both are base64 of the same shape, and a run prints one of them:
+
+| value | where it belongs |
+| --- | --- |
+| OPNsense's **instance** public key (VPN → WireGuard → Instances) | `wg_peer_public_key` in this host's host_vars. Shared by every peer on that endpoint |
+| this **host's** public key, printed by the generated-key run | the peer entry on OPNsense, as that peer's public key |
+
+Putting the host's own key in `wg_peer_public_key` produces a tunnel that comes
+up and never handshakes, and `sudo wg show wg0` shows no peer at all — the
+kernel refuses a peer whose key is the interface's own. `tasks/tunnel.yml`
+asserts against it before the config is written, and `tests/render-check.yml`
+catches the wider family in CI by requiring every host on one endpoint to name
+one peer key.
 
 Also set:
 
@@ -442,7 +454,8 @@ Common causes, in the order they are worth checking:
 
 | symptom | cause |
 | --- | --- |
-| play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_peer_public_key` is this host's key rather than OPNsense's; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
+| play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
+| `sudo wg show wg0` lists the interface but **no `peer:` block at all** | `wg_peer_public_key` holds this host's own key. WireGuard will not accept a peer whose public key is the interface's own, so it is dropped and the tunnel runs with no peer — every packet vanishes and it never handshakes. The play now refuses this before writing the config; a host configured before that check existed shows it this way |
 | tunnel is up, nothing routes | OPNsense's outbound NAT does not cover the tunnel subnet, or no rule on the WireGuard interface tab permits this peer's traffic out |
 | SSH dies the moment the route moves | the mangle rules did not install — check `iptables -t mangle -S` and `ip rule`, and that `sysctl_rp_filter` is 2 |
 | SSH dies, but `iptables -t mangle -L -n -v` shows real, growing packet counters on both KILLSWITCH chains | the mark is being set and restored correctly, but `ip rule` shows wg-quick's own rule at a *lower* number than `wg_killswitch_rule_priority` — it wins the race and the mark is never actually honored. Confirm with `ip route get <ip> mark <wg_killswitch_mark>`: if it still shows `dev wg0` instead of the public interface, this is it. Lower `wg_killswitch_rule_priority` below whatever `ip rule` actually shows, not below the number this doc happens to mention |

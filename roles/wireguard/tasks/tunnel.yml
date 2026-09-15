@@ -250,13 +250,39 @@
          else wg_private_key }}
   no_log: true
 
+# Derived on every path, not just the generated-key one: the check below needs
+# this host's own public key to compare against, and a vault-supplied key can
+# be pasted into the wrong field just as easily.
 - name: Derive the public key to register on the WireGuard server
   ansible.builtin.command:
     argv: [wg, pubkey]
     stdin: "{{ wg_private_key_resolved }}"
   register: wg_pubkey
   changed_when: false
-  when: wg_key_on_host
+
+# wg_peer_public_key is the *server's* key. Putting this host's own key there
+# is the single easiest mistake to make here, because both are printed by this
+# play and both are base64 of the same shape - and it fails in the worst way:
+# WireGuard will not accept a peer whose public key is the interface's own, so
+# the interface comes up with no peer at all, every packet vanishes, and
+# `wg show` reports a tunnel that simply never handshakes. Nothing in the
+# config, the routing or the firewall looks wrong.
+#
+# Checked here, before the config is written and long before the default route
+# moves, because the alternative is finding out at the handshake wait - after
+# the rollback has been armed - with an error naming neither key.
+- name: The peer public key must be the server's, not this host's
+  ansible.builtin.assert:
+    that:
+      - wg_peer_public_key | trim != wg_pubkey.stdout | trim
+    fail_msg: >-
+      {{ inventory_hostname }}'s wg_peer_public_key is this host's *own* public
+      key ({{ wg_pubkey.stdout | trim }}). It has to be the WireGuard server's
+      key instead - on OPNsense that is VPN: WireGuard: Instances, the
+      instance's own public key, and every peer pointing at the same
+      {{ wg_peer_endpoint }} shares it. This host's key is what goes on
+      OPNsense as the *peer's* public key, which is the other direction.
+    success_msg: "wg_peer_public_key is not this host's own key"
 
 - name: Report the public key to register on OPNsense
   ansible.builtin.debug:
