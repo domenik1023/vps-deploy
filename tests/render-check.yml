@@ -41,6 +41,17 @@
     alloy_template: ../roles/alloy/templates/config.alloy.j2
     killswitch_template: ../roles/wireguard/templates/wg-killswitch.j2
 
+    # The [lapi] group, read out of the inventory rather than named here, so
+    # adding a second delegation-only host does not need a change below.
+    # crowdsec-master deliberately shares komodo's address - the LAPI runs in
+    # Docker on that box - and it is never configured by the playbook, so it is
+    # the one legitimate exception to the duplicate-target check.
+    inventory_src: "{{ lookup('ansible.builtin.file', '../inventory') }}"
+    lapi_hosts: >-
+      {{ (inventory_src | regex_search('(?s)\[lapi\](.*?)(?=\n\[|\Z)', '\1')
+          | first | default('', true))
+         | regex_findall('(?m)^([a-zA-Z0-9_.-]+)[ \t]*$') }}
+
     # One host_vars file, read as data. Templated lazily, so `item` resolves to
     # whichever file the loop that used it is on.
     #
@@ -1154,6 +1165,65 @@
           - wg_address
           - wg_peer_public_key
           - wg_peer_endpoint
+
+    # Two hosts pointing at one box is a copy-paste that nothing else catches,
+    # and it is expensive: a run against the second name SSHes into the first
+    # box and configures it under the wrong identity. 10_hostname.yml renames
+    # it, which splits its Prometheus series and Loki streams; CrowdSec
+    # registers a second machine and bouncer for it on the shared LAPI; and the
+    # WireGuard key generation is guarded by `creates:`, so it silently reuses
+    # the other host's private key and never stops to say the key is not new.
+    #
+    # That happened here. host_vars/wings-p01.yml was written with
+    # vpn-gwdg-01's address, so every run against it landed on the box already
+    # deployed as vpn-gwdg-01 - which is also where the stale ip rule at the
+    # old wg_killswitch_rule_priority came from.
+    #
+    # Compared as written rather than resolved: these are Jinja expressions
+    # (`{{ vpn_ip | default(...) }}`), and comparing the text is what catches a
+    # duplicated line. Two different expressions that happen to resolve to one
+    # address are out of reach here and would need the hosts themselves.
+    - name: Collect each managed host's connection target
+      ansible.builtin.set_fact:
+        host_targets: >-
+          {{ host_targets | default([])
+             + [{'host': host_name,
+                 'addr': host_overrides.ansible_host,
+                 'port': host_overrides.ansible_port | default(22)}] }}
+      when:
+        - host_overrides.ansible_host is defined
+        - host_name not in lapi_hosts
+      loop: "{{ query('ansible.builtin.fileglob', '../host_vars/*.yml') | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      vars:
+        host_overrides: "{{ host_vars_of }}"
+        host_name: >-
+          {{ item | basename | regex_replace('\.yml$', '') }}
+
+    - name: No two managed hosts may share a connection target
+      ansible.builtin.assert:
+        that:
+          - host_targets | default([]) | length > 0
+          - host_targets | length == targets | length
+        fail_msg: >-
+          Two host_vars files name the same ansible_host and ansible_port, so a
+          run against one of them configures the other box under the wrong
+          name. {{ host_targets | length }} managed host(s) but
+          {{ targets | length }} distinct target(s):
+          {{ host_targets | map(attribute='host')
+             | zip(host_targets | map(attribute='addr'),
+                   host_targets | map(attribute='port')) | list }}
+        success_msg: >-
+          {{ host_targets | default([]) | length }} managed host(s), each with its own target
+      vars:
+        # Same counting trick as the WireGuard endpoint check below: if every
+        # host has its own target, the host count and the distinct
+        # address/port count agree.
+        targets: >-
+          {{ host_targets | default([]) | map(attribute='addr')
+             | zip(host_targets | default([]) | map(attribute='port'))
+             | unique | list }}
 
     # One UDP port is one WireGuard instance, and an instance has exactly one
     # public key - so every host pointing at the same wg_peer_endpoint must

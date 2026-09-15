@@ -175,6 +175,20 @@ Hosts are named in `inventory`; addresses and per-host settings live in
 `crowdsec_bouncer_name` derive from `inventory_hostname`, so renaming a host
 orphans its machine and bouncer registration on the LAPI.
 
+**Two host_vars files must never name the same `ansible_host` and
+`ansible_port`.** A run against the second name SSHes into the first box and
+configures it under the wrong identity, and every part of that is quiet:
+`10_hostname.yml` renames it, which splits its Prometheus series and Loki
+streams; CrowdSec registers a second machine and bouncer for it on the shared
+LAPI; and WireGuard key generation is guarded by `creates:`, so it reuses the
+other host's private key and skips the task that would have stopped to say the
+key is new. `tests/render-check.yml` asserts it, comparing the expressions as
+written — they are Jinja (`{{ vpn_ip | default(…) }}`), so the text is what
+catches a duplicated line. The `[lapi]` group is excluded, read out of the
+inventory rather than named in the test: `crowdsec-master` deliberately shares
+`komodo`'s address because the LAPI runs in Docker on that box, and it is never
+configured by the playbook.
+
 ### The mid-play SSH port switch
 
 `42_ssh.yml` moves sshd off port 22 while Ansible is connected over it:
