@@ -191,15 +191,22 @@ the same trap is waiting there whenever that stops being true.
 
 `80_wireguard.yml` is last in the role, and that is load-bearing: every apt
 install above it then happens over the direct connection, so a bootstrap run
-never depends on the tunnel or on the UDM routing peers to the internet.
+never depends on the tunnel or on OPNsense routing this peer to the internet.
 
 The hard part is not the tunnel, it is keeping SSH reachable on the public
 interface while the default route is `wg0`. `wg-quick` with `0.0.0.0/0` in
-`AllowedIPs` adds `not fwmark <t> table <t>` at priority 32765, so a reply to
-an inbound connection is routed into the tunnel and the session hangs. The kill
-switch marks connections arriving on the public interface (`mangle PREROUTING`),
-restores the mark on the way out (`mangle OUTPUT`) and adds an `ip rule` at
-priority 30000 sending those to the main table.
+`AllowedIPs` adds `not fwmark <t> table <t>` at a priority it picks itself —
+**not reliably 32765**, whatever upstream's docs say. A real deployment
+(`vpn-gwdg-01`) landed at `29999`, which sits *above* this repo's old
+`wg_killswitch_rule_priority` default of `30000` and silently defeated the
+kill switch: `iptables -t mangle -L -n -v` showed the mark being set and
+restored correctly on both chains, and packets still went into the tunnel,
+because `ip rule` is evaluated lowest-number-first and wg-quick's rule won.
+The default is now `100`, chosen to sit below either number rather than trust
+one. Check `ip rule` on any new deployment instead of assuming either value.
+The kill switch marks connections arriving on the public interface (`mangle
+PREROUTING`), restores the mark on the way out (`mangle OUTPUT`) and adds an
+`ip rule` at `wg_killswitch_rule_priority` sending those to the main table.
 
 **The mark is a single bit used as its own mask, and it is not wg-quick's
 fwmark.** wg-quick derives that from the first free routing table counting up
@@ -236,8 +243,15 @@ and `default` move together.
 A rollback is armed with `systemd-run --on-active` before anything moves and
 cancelled only after the host has answered *and* the tunnel has handshaked. It
 retreats to the pre-tunnel state rather than just dropping rules, so a reboot
-cannot re-apply what locked us out. `docs/wireguard.md` has the UDM side and
-the recovery procedure.
+cannot re-apply what locked us out. `docs/wireguard.md` has the OPNsense side
+and the recovery procedure.
+
+**`[vpn]` hosts are isolated peers, not a LAN extension.** OPNsense has no
+route from one of these peers to another, or to the home LAN - the tunnel goes
+to OPNsense and stops there. Reaching the internet still works because
+OPNsense NATs the peer's traffic out its own WAN like anything else, which is
+also why `group_vars/vpn.yml` points Alloy at the public ingest hostname
+rather than the LAN-only one: there is no LAN hop for a `[vpn]` host to take.
 
 ### Alloy
 

@@ -20,11 +20,16 @@
 vps-pangolin
 vps-docker
 
-# Externally hosted, but reachable only through a WireGuard tunnel to the LAN.
-# Same hardening and CrowdSec as [vps], plus the tunnel and a kill switch: the
-# default route is wg0 and nothing leaves the public interface except the
-# tunnel itself and replies to inbound SSH. These exist to run containers that
-# want more RAM than the LAN boxes have, as an extension of the LAN.
+# Externally hosted, but with its entire default route through a WireGuard
+# tunnel to OPNsense rather than its own public address. Same hardening and
+# CrowdSec as [vps], plus the tunnel and a kill switch: the default route is
+# wg0 and nothing leaves the public interface except the tunnel itself and
+# replies to inbound SSH.
+#
+# This is not an extension of the LAN - OPNsense treats each host here as an
+# isolated point-to-point peer, with no route back to the LAN or to any other
+# peer. The point is to hide the host from the network it is actually rented
+# on: everything it originates leaves as OPNsense's public address instead.
 #
 # Every entry needs the wg_* settings in its host_vars - see docs/wireguard.md.
 [vpn]

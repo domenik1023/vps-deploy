@@ -1,8 +1,8 @@
 # --- WIREGUARD TUNNEL + KILL SWITCH ([vpn] hosts only) ---
 # Last in the role, and that is load-bearing rather than tidy: everything above
 # installs packages, and doing that before the default route moves means a
-# bootstrap run never depends on the tunnel or on the UDM routing peers to the
-# internet. By the time this file runs there is nothing left to download.
+# bootstrap run never depends on the tunnel or on OPNsense routing this peer to
+# the internet. By the time this file runs there is nothing left to download.
 #
 # It is also the most dangerous file here. It moves the host's default route
 # while Ansible is connected over the public address, and installs a firewall
@@ -17,7 +17,7 @@
 #   the host has answered on the far side of the change. A run that locks
 #   itself out undoes itself in {{ wg_rollback_delay }}.
 #
-# See docs/wireguard.md for the UDM side and for recovery.
+# See docs/wireguard.md for the OPNsense side and for recovery.
 
 - name: Require the per-host WireGuard settings
   ansible.builtin.assert:
@@ -30,8 +30,9 @@
       {{ inventory_hostname }} is in [vpn] but its host_vars do not describe a
       tunnel. It needs wg_address (a CIDR, e.g. 10.0.2.11/32),
       wg_peer_public_key, wg_peer_endpoint as host:port, and either
-      wg_private_key or wg_generate_key. All of them come from the client
-      config the UniFi WireGuard server generates - see docs/wireguard.md.
+      wg_private_key or wg_generate_key. wg_peer_public_key/wg_peer_endpoint
+      are OPNsense's own, and wg_generate_key should be true for every
+      OPNsense-backed host - see docs/wireguard.md.
 
 # Which interface reaches the internet without the tunnel.
 #
@@ -135,13 +136,11 @@
     group: root
     mode: "0700"
 
-# The keypair never leaves the host. Which half of the exchange you are on
-# depends on the server: some UniFi versions generate the client keypair and
-# hand back a finished config, in which case wg_private_key comes from that and
-# this does nothing; others give you only the server's public key and a
-# preshared key, and expect a client public key back - which is what this is
-# for. `creates:` makes it a one-off, so re-running never rotates a key that
-# the server already knows.
+# The keypair never leaves the host. OPNsense only ever hands you its own
+# public key (and, if you asked for one, a preshared key) and expects a client
+# public key back - it never generates or exposes a client private key - so
+# this is the path every OPNsense-backed host takes. `creates:` makes it a
+# one-off, so re-running never rotates a key that OPNsense already knows.
 - name: Generate a private key on the host
   ansible.builtin.shell:
     cmd: umask 077 && wg genkey > /etc/wireguard/privatekey
@@ -175,7 +174,7 @@
   changed_when: false
   when: wg_key_on_host
 
-- name: Report the public key to register on the WireGuard server
+- name: Report the public key to register on OPNsense
   ansible.builtin.debug:
     msg: >-
       {{ inventory_hostname }}'s WireGuard public key is {{ wg_pubkey.stdout }}
@@ -191,11 +190,11 @@
 #
 # Only on the run that generated it: `creates:` means the next run reports no
 # change and carries straight on.
-- name: Stop so the new public key can be registered on the server
+- name: Stop so the new public key can be registered on OPNsense
   ansible.builtin.fail:
     msg: >-
-      Generated a new WireGuard key for {{ inventory_hostname }}. Add it to the
-      WireGuard server as a client, with public key
+      Generated a new WireGuard key for {{ inventory_hostname }}. Add it to
+      OPNsense as a peer (VPN: WireGuard: Peers), with public key
       {{ wg_pubkey.stdout }}
       and allowed address {{ wg_address }}, then run this play again. Nothing
       has been changed on the host beyond writing the key, and the tunnel has
@@ -325,7 +324,12 @@
   # because Ansible has no `split` filter - `map('split')` looks reasonable and
   # fails at run time, on the host, after the default route has already moved.
   until: wg_handshake.stdout_lines | select('search', '\\s[1-9][0-9]*$') | list | length > 0
-  retries: 12
+  # 60s (12*5) was too tight against a real path: vpn-gwdg-01 consistently
+  # handshaked around 60-70s in, just past the old window, which read as "never
+  # handshaked" and triggered the rollback for a tunnel that was actually about
+  # to come up. 150s keeps comfortable margin under wg_rollback_delay (5min
+  # default), which is the real backstop if a peer genuinely never handshakes.
+  retries: 30
   delay: 5
   failed_when: false
   when: not ansible_check_mode
@@ -336,12 +340,12 @@
       - wg_handshake.stdout_lines | default([]) | select('search', '\\s[1-9][0-9]*$') | list | length > 0
     fail_msg: >-
       {{ wg_interface }} is up on {{ inventory_hostname }} but has never
-      handshaked with {{ wg_peer_endpoint }}. Check, in this order: the client
-      is registered on the WireGuard server and not disabled; wg_peer_public_key
-      is the server's key and not this host's; wg_preshared_key matches; the
-      server's UDP port is reachable from here. The rollback armed above has
-      NOT been cancelled, so this host returns to its pre-tunnel state within
-      {{ wg_rollback_delay }} - fix the server side and re-run.
+      handshaked with {{ wg_peer_endpoint }}. Check, in this order: the peer is
+      registered on OPNsense and not disabled; wg_peer_public_key is
+      OPNsense's key and not this host's; wg_preshared_key matches; OPNsense's
+      WAN allows the tunnel's UDP port in. The rollback armed above has NOT
+      been cancelled, so this host returns to its pre-tunnel state within
+      {{ wg_rollback_delay }} - fix the OPNsense side and re-run.
   when: not ansible_check_mode
 
 # Only now. Everything above has to have worked, including the host answering

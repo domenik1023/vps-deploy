@@ -109,8 +109,10 @@ build() {
     ensure_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
 
     # Marked packets take the main table, where the public interface still
-    # holds a default route, instead of wg-quick's tunnel table. Below
-    # wg-quick's own rules at 32764/32765 so it is consulted first.
+    # holds a default route, instead of wg-quick's tunnel table. Priority must
+    # be below (checked before) whatever wg-quick actually installs, which is
+    # not reliably 32764/32765 - see wg_killswitch_rule_priority in
+    # defaults/main/60_wireguard.yml for what a real deployment showed.
     ip -"$fam" rule del fwmark "$MARK/$MARK" table main priority "$PRIO" 2>/dev/null || true
     ip -"$fam" rule add fwmark "$MARK/$MARK" table main priority "$PRIO"
 

@@ -1,23 +1,22 @@
-# Settings shared by every off-site host that reaches the LAN over WireGuard.
+# Settings shared by every off-site host that routes its default route through
+# OPNsense over WireGuard.
 #
 # The per-host half of the tunnel - address, keys, endpoint - lives in
-# host_vars/<name>.yml, because it comes out of the client config the UniFi
-# WireGuard server generates for that client. See docs/wireguard.md.
+# host_vars/<name>.yml, because it comes out of the peer you register on
+# OPNsense for that host. See docs/wireguard.md.
 
-# The LAN ingest hostname, which is also the role default - stated here anyway,
-# because "the same value as a LAN box" is true for a completely different
-# reason and that reason is worth writing down. A [vpn] host is off-site, so
-# the obvious thing would be group_vars/vps.yml's public ingest.d1023.de. It
-# takes the LAN name instead because its default route is the tunnel: the LAN
-# is one hop away and the public name would leave the tunnel, get proxied back
-# in, and be indistinguishable from a working setup until the tunnel dropped.
+# The public ingest hostname, same as group_vars/vps.yml and for the same
+# reason: a [vpn] host is an isolated point-to-point peer, not an extension of
+# the LAN, so ingest.net.d1023.de (LAN and tunnel only) is not reachable from
+# here - OPNsense has no route from this peer to the home LAN. The public name
+# is reachable because OPNsense NATs this peer's traffic out its own WAN like
+# any other internet-bound connection.
 #
-# Two things have to hold for this, and neither is visible from here. DNS for
-# ingest.net.d1023.de has to resolve on this host, which means wg_dns pointing
-# at the LAN resolver in host_vars. And the UDM has to route the peer to the
-# internet, because the Alloy play runs after the tunnel is up and fetches its
-# release from GitHub through it.
-alloy_ingest_base: "https://ingest.net.d1023.de"
+# The Alloy play runs after the tunnel is up and fetches its release from
+# GitHub through it, so this also depends on OPNsense's outbound NAT actually
+# covering the tunnel subnet, and on a WAN-interface firewall rule permitting
+# this peer's traffic out - see docs/wireguard.md.
+alloy_ingest_base: "https://ingest.d1023.de"
 
 # Loose reverse path filtering. Strict (the role default of 1) drops inbound
 # SSH on the public interface as soon as the default route is the tunnel: the

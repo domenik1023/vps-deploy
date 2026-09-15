@@ -134,21 +134,31 @@
           must sit above 0xffff so it cannot collide with the routing table
           number wg-quick derives its own fwmark from.
 
-    # wg-quick installs its rules at 32764 and 32765. A kill switch rule at or
-    # below those in priority order is never consulted, and the symptom is not
-    # a firewall error - it is an SSH session that hangs the moment the default
-    # route moves, on a host whose console is at the provider.
-    - name: The kill switch ip rule must outrank wg-quick's own
+    # wg-quick's own rules are NOT reliably at 32764/32765 - that was this
+    # repo's original assumption, from upstream's documented default, and a
+    # real deployment (vpn-gwdg-01) showed them installed at 29998/29999
+    # instead. A kill switch rule at or above whatever wg-quick actually picks
+    # is never consulted, and the symptom is not a firewall error - it is an
+    # SSH session that hangs the moment the default route moves, on a host
+    # whose console is at the provider, with the mangle chains showing
+    # correct, nonzero packet counters the whole time (confirmed on that
+    # incident: the mark was being set and restored fine, and still lost the
+    # `ip rule` race). Since there is no fixed number to check against, this
+    # asserts a low ceiling instead - comfortably below both the old
+    # assumption and the observed real value - rather than trusting either.
+    - name: The kill switch ip rule priority stays low, not just below the old assumption
       ansible.builtin.assert:
         that:
           - wg_killswitch_rule_priority | int > 0
-          - wg_killswitch_rule_priority | int < 32764
+          - wg_killswitch_rule_priority | int < 10000
         fail_msg: >-
           wg_killswitch_rule_priority ({{ wg_killswitch_rule_priority }}) must
-          be between 1 and 32763. wg-quick adds `not fwmark <t> table <t>` at
-          32765 and `table main suppress_prefixlength 0` at 32764; a rule
-          numbered above those never gets to send inbound replies back out the
-          public interface.
+          be between 1 and 9999. wg-quick's own rule priority is not fixed and
+          has been observed as low as 29999 in a real deployment - a kill
+          switch rule anywhere near that range risks losing the `ip rule` race
+          and never sending inbound replies back out the public interface.
+          Check `ip rule` on the actual host if you need to verify this rather
+          than trusting a number here.
 
     # The lockout test. Every RETURN in the kill switch's OUTPUT chain has to
     # come before its DROP, because iptables stops at the first match - and the

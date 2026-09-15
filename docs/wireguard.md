@@ -1,13 +1,16 @@
 # WireGuard hosts
 
-Hosts in the `[vpn]` group are rented off-site but belong to the LAN. They join
-it over WireGuard, take their default route from the tunnel, and run a kill
-switch so that a tunnel which drops takes their internet with it rather than
-quietly falling back to the VPS's own public address.
+Hosts in the `[vpn]` group are rented off-site and route their entire default
+route through OPNsense over WireGuard, rather than through their own public
+address. They run a kill switch so that a tunnel which drops takes their
+internet with it rather than quietly falling back to the VPS's own public
+address.
 
-They exist to run containers that want more RAM than the LAN boxes have and do
-not care about a few milliseconds — an extension of the LAN, not a separate
-site.
+This is **not** an extension of the LAN. OPNsense treats each `[vpn]` host as
+an isolated point-to-point peer with no route to the home LAN or to any other
+peer — the tunnel reaches OPNsense and stops there. The point is to hide the
+host from the network it is actually rented on: everything it originates
+leaves as OPNsense's public address instead of its own.
 
 SSH stays reachable from the internet on `ssh_port`. That is deliberate: it is
 the way back in when the tunnel is broken, and restricting where it can be
@@ -22,118 +25,113 @@ It configures the client: installs WireGuard, writes
 `/etc/wireguard/wg0.conf`, brings up `wg-quick@wg0`, installs the kill switch,
 and refuses to finish until the tunnel has actually handshaked.
 
-It does **not** create the peer on the UniFi side. UniFi Network's WireGuard
-VPN server has no supported API for client management — only the controller's
-private REST endpoints, which need a local account, CSRF handling, and change
-shape between Network releases. Create the client in the UDM UI; the steps
-below carry its details into the inventory.
+It does **not** create the peer on OPNsense. OPNsense has a real REST API that
+could do this, but this playbook does not call it — the peer is registered
+once, by hand in the OPNsense UI (or with a short one-off API call), and after
+that this playbook never touches the server side again.
 
-**Which half of the keypair you have to move depends on your UniFi version**,
-and they differ:
-
-- Some hand you a **finished client config**, private key included. Transcribe
-  it — [flow A](#a-the-udm-gave-you-a-private-key).
-- Others give you only the **server's public key and a preshared key**, and
-  expect a client public key back. Then the host generates its own keypair and
-  you paste the public half into the UDM —
-  [flow B](#b-the-udm-wants-a-public-key-from-you).
-
-Flow B is the ordinary WireGuard model and the better one: the private key is
-generated on the host that uses it and never travels.
+OPNsense never hands you a client private key — a peer entry only ever holds
+the **client's public key**, and optionally a preshared key it generates
+itself. So there is only one flow, unlike some WireGuard front-ends: the host
+generates its own keypair, and you register the public half with OPNsense.
+The private key is generated on the host that uses it and never travels.
 
 ## Setting one up
 
-### 1. Create the client on the UDM
+### 1. Create the peer on OPNsense
 
-In the UniFi Network application, under the WireGuard VPN server, add a client
-and download or copy its configuration. It looks like this:
+You need the host's own public key before this step, which means running the
+playbook once first — see step 2, "the generated-key run." Once you have it,
+in OPNsense: **VPN → WireGuard → Peers → + Add**.
 
-```ini
-[Interface]
-PrivateKey = qK5m…
-Address = 10.0.2.11/32
-DNS = 192.168.2.1
+| field | value |
+| --- | --- |
+| Public Key | this host's public key, from the generated-key run |
+| Allowed IPs | this host's tunnel address, as a `/32` — e.g. `10.99.0.10/32` |
+| Preshared Key | optional; generate one if you want it |
 
-[Peer]
-PublicKey = 8Yt2…
-PresharedKey = w1Rr…
-Endpoint = vpn.d1023.de:51820
-AllowedIPs = 0.0.0.0/0
-```
+Keep Allowed IPs to the single `/32`. It is what tells OPNsense which source
+address is legitimately this peer — anything wider would accept traffic
+spoofing another peer's address, and would also make OPNsense try to route
+that wider range back to this host.
 
-Two things to check while you are there, because both fail in ways that look
-like a broken tunnel rather than a misconfigured one:
+After saving, edit the WireGuard **Instance** and add the new peer to it.
 
-- the client is **enabled**, and
-- VPN clients are allowed to reach the internet. The Alloy play runs *after*
-  the tunnel is up and fetches its release from GitHub through it, so a peer
-  that can reach the LAN but not the internet fails the run at Alloy rather
-  than at WireGuard.
+Two things to check, because both fail in ways that look like a broken tunnel
+rather than a misconfigured one:
+
+- the peer is **enabled**, and
+- a firewall rule **on the WireGuard interface tab** (`opt1`/`wg0`, not WAN —
+  OPNsense filters on the interface a packet *enters* the firewall on, and a
+  peer's decrypted traffic enters there, exactly like the narrower admin/game
+  peers this box also hosts) allows this peer's tunnel address out to any
+  destination, and **Outbound NAT is Automatic** (or a manual rule covers the
+  tunnel subnet). Unlike those narrower peers — an admin's own management
+  access, a game server only ever *receiving* forwarded traffic — a
+  full-tunnel `[vpn]` host needs to originate arbitrary outbound connections,
+  and OPNsense's default policy on a WireGuard/OPT interface is to allow
+  nothing at all. The Alloy play runs after the tunnel is up and fetches its
+  release from GitHub through it, so a peer that can reach OPNsense but not
+  the internet fails the run at Alloy rather than at WireGuard.
 
 ### 2. Write the host_vars file
 
-Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`. Both flows
-need these four, whatever the UDM called them:
+Copy `host_vars/vpn-example.yml.example` to `host_vars/<name>.yml`, and set:
 
-| what the UDM shows | host_vars |
+| what OPNsense calls it | host_vars |
 | --- | --- |
-| the client's tunnel address | `wg_address` |
-| the DNS server for the tunnel | `wg_dns` (a list) |
-| the **server's** public key | `wg_peer_public_key` |
-| the server's host:port | `wg_peer_endpoint` |
-| the preshared key, if there is one | `wg_preshared_key` |
+| this host's own tunnel address (what you're about to register as Allowed IPs) | `wg_address` |
+| a DNS resolver for the tunnel | `wg_dns` (a list) — a public one; there is no LAN resolver reachable from here |
+| OPNsense's **instance** public key | `wg_peer_public_key` |
+| OPNsense's public host:port | `wg_peer_endpoint` |
+| the preshared key, if you generated one on the peer | `wg_preshared_key` |
 
-`wg_peer_public_key` is the trap worth naming: it is the *server's* key, not
+`wg_peer_public_key` is the trap worth naming: it is **OPNsense's** key, not
 this host's. Putting the host's own public key there produces a tunnel that
 comes up and never handshakes.
 
-#### A: the UDM gave you a private key
-
-Add it as `wg_private_key`, from the client config's `[Interface] PrivateKey`.
-
-#### B: the UDM wants a public key from you
-
-You have the server's public key, possibly a preshared key, and nothing else.
-Set:
+Also set:
 
 ```yaml
 wg_generate_key: true
 ```
 
-and leave `wg_private_key` out. The first run generates a keypair on the host,
-prints the public half, and **stops before touching routing**:
+and leave `wg_private_key` out — this is the only path OPNsense supports. The
+first run generates a keypair on the host, prints the public half, and
+**stops before touching routing**:
 
 ```
-TASK [Stop so the new public key can be registered on the server]
+TASK [Stop so the new public key can be registered on OPNsense]
 fatal: [vpn-gwdg-01]: FAILED! => Generated a new WireGuard key for
-vpn-gwdg-01. Add it to the WireGuard server as a client, with public key
-kR9v… and allowed address 192.168.9.20/32, then run this play again.
+vpn-gwdg-01. Add it to OPNsense as a peer (VPN: WireGuard: Peers), with public
+key kR9v… and allowed address 10.99.0.10/32, then run this play again.
 ```
 
-Paste that public key into the UDM as the client, with this host's tunnel
-address as its allowed address, then run again. The second run finds the key
-already there — `wg genkey` is guarded by `creates:`, so re-running never
-rotates a key the server has learned — and carries on to build the tunnel.
+Take that public key back to step 1, register the peer, then run again. The
+second run finds the key already there — `wg genkey` is guarded by `creates:`,
+so re-running never rotates a key OPNsense has already learned — and carries
+on to build the tunnel.
 
 Nothing but the key file is written on that first pass. The tunnel is not
 brought up, the default route does not move, and no rollback is armed.
 
-`AllowedIPs` is not transcribed: it comes from `wg_allowed_ips`, which is
-`0.0.0.0/0` for every `[vpn]` host and should stay that way. Anything narrower
-makes the kill switch a lie — traffic outside the range would have no tunnel to
-take and would be dropped rather than routed, which looks exactly like a broken
-tunnel.
+`AllowedIPs` in the *rendered client config* is not the same setting as
+OPNsense's peer Allowed IPs above, and is not transcribed from it — it comes
+from `wg_allowed_ips`, which is `0.0.0.0/0` for every `[vpn]` host and should
+stay that way. Anything narrower makes the kill switch a lie — traffic outside
+the range would have no tunnel to take and would be dropped rather than
+routed, which looks exactly like a broken tunnel.
 
 #### The preshared key
 
-Optional to *this playbook*: leave `wg_preshared_key` out and the `PresharedKey`
-line is simply not rendered. It is **not** optional to the server — if the UDM
-issued one for this client, the tunnel comes up and never handshakes without
-it. Either supply it here or remove it on the UDM side; there is no third
-option that works.
+Optional to *this playbook*: leave `wg_preshared_key` out and the
+`PresharedKey` line is simply not rendered. It is **not** optional to
+OPNsense — if the peer entry has one, the tunnel comes up and never
+handshakes without it. Either supply it here or remove it from the peer on
+OPNsense; there is no third option that works.
 
-Under flow B that is the only secret in the file, since the private key is
-generated on the host and never leaves it.
+Since the private key is generated on the host and never leaves it, this is
+the only secret in the file.
 
 #### Vaulting, or not
 
@@ -141,13 +139,12 @@ Encrypting a secret in place keeps it out of the repository in readable form:
 
 ```bash
 ansible-vault encrypt_string --name wg_preshared_key 'w1Rr…'
-ansible-vault encrypt_string --name wg_private_key   'qK5m…'   # flow A only
 ```
 
-and paste what each prints into the host_vars file. Prefer per-host
+and paste what it prints into the host_vars file. Prefer per-host
 `encrypt_string` over `group_vars/all/vault.yml`, so each host carries its own.
 
-Writing them in plain text works and is a legitimate call for a private
+Writing it in plain text works and is a legitimate call for a private
 repository — but it is worth being clear about what it costs, because the
 tradeoff is not "safe versus convenient":
 
@@ -157,19 +154,28 @@ tradeoff is not "safe versus convenient":
   it regardless.
 - Migrating the repository to a self-hosted forge moves the *future*, not the
   past. The old remote keeps what it already has.
-- Rotating a leaked preshared key means editing the client on the UDM and
-  re-running; rotating a leaked private key means re-registering the peer.
+- Rotating a leaked preshared key means editing the peer on OPNsense and
+  re-running.
 
 So it is a reasonable choice for a key you are willing to rotate, and a poor
 one for a key you are not. Nothing in the playbook enforces either way.
 
-Prefer a bare IP address in `wg_peer_endpoint` if the home connection has a
-static one. A DNS name has to be resolved before the tunnel can come up, which
-is why `wg_killswitch_allow_dns` defaults to on — see
+Prefer a bare IP address in `wg_peer_endpoint` if OPNsense's address is
+static. A DNS name has to be resolved before the tunnel can come up, which is
+why `wg_killswitch_allow_dns` defaults to on — see
 [the kill switch](#what-the-kill-switch-blocks).
 
-`ansible_host` stays the **public** address, not the tunnel address. The tunnel
-is built by the run, so on a first run it does not exist yet.
+`ansible_host` stays the **public** address, not the tunnel address, by
+default - the tunnel is built by the run, so on a first run it does not exist
+yet. `vpn_ip` is an opt-in way to switch every run *after* the first onto the
+tunnel address instead (see the commented-out example in
+`vpn-example.yml.example`): set it once the tunnel is proven stable, and
+`ansible_host` templates onto it automatically. There is no fallback if the
+tunnel is down when you run the play - it just fails to connect - so this
+trades the always-reachable public path for connecting only through the
+tunnel. Direct SSH to the public address still works regardless of whether
+`vpn_ip` is set, since the kill switch's SSH exception does not depend on it;
+only `ansible-playbook` runs are affected.
 
 ### 3. Add it to the inventory and run
 
@@ -186,11 +192,12 @@ Have the provider's serial console open the first time. See
 ## How the routing works
 
 `wg-quick` with `0.0.0.0/0` in `AllowedIPs` does not add a default route to the
-main table. It puts one in a routing table of its own and adds two rules:
+main table. It puts one in a routing table of its own and adds two rules
+matching this shape:
 
 ```
-32764: from all lookup main suppress_prefixlength 0
-32765: from all not fwmark 0xca6c lookup 51820
+<p1>: from all lookup main suppress_prefixlength 0
+<p2>: from all not fwmark 0xca6c lookup 51820
 ```
 
 so everything that is not the tunnel's own traffic goes down the tunnel. That
@@ -198,14 +205,25 @@ breaks inbound connections: a packet arriving on the public interface is
 answered by a reply that gets routed into the tunnel, and the session hangs the
 instant the route moves.
 
-The fix is a mark of our own. The kill switch script:
+**The actual priority numbers wg-quick picks are not fixed.** This repo
+originally assumed `32764`/`32765`, from upstream's documented default — a
+real deployment (`vpn-gwdg-01`) showed wg-quick installing them at
+`29998`/`29999` instead. That is *above* a kill switch rule at `30000`, which
+silently defeats the whole mechanism: the mark gets set and restored
+correctly (visible as nonzero counters on both mangle chains), and the packet
+still goes into the tunnel, because `ip rule` is evaluated lowest-number-first
+and wg-quick's rule wins the race. Check `ip rule` on any new deployment
+rather than trusting either number.
+
+The fix is a mark of our own, at a priority chosen to sit below either number
+rather than trust a fixed assumption. The kill switch script:
 
 - marks every connection arriving on the public interface, in `mangle
   PREROUTING`;
 - restores that mark on outbound packets, in `mangle OUTPUT`;
-- adds `ip rule fwmark <mark> table main priority 30000`, which is consulted
-  before wg-quick's rules and sends those packets back out the public
-  interface.
+- adds `ip rule fwmark <mark> table main priority {{ wg_killswitch_rule_priority }}`
+  (100 by default), which is consulted before wg-quick's rules and sends those
+  packets back out the public interface.
 
 The mark is a single bit (`wg_killswitch_mark`, `0x40000`) used as its own mask.
 That matters: `wg-quick` sets its own fwmark on the encrypted packets it sends,
@@ -220,8 +238,8 @@ number this repo can know. `wg.conf.j2` deliberately does not set `FwMark`.
 `[vpn]` hosts also run with loose reverse path filtering
 (`sysctl_rp_filter: 2`, in `group_vars/vpn.yml`). Strict mode drops inbound SSH
 on the public interface as soon as the default route is the tunnel — the kernel
-looks for a route back to that source, finds it points down `wg0`, and discards
-the packet before any firewall rule is consulted.
+looks for a route back to that source, finds it points down `wg0`, and
+discards the packet before any firewall rule is consulted.
 
 ## What the kill switch blocks
 
@@ -271,7 +289,7 @@ exists.
 ```bash
 sudo wg show                       # a recent handshake, and transfer in both directions
 ip route get 1.1.1.1               # dev wg0
-ip rule                            # the 30000 fwmark rule, above wg-quick's 32764/32765
+ip rule                            # the fwmark rule (wg_killswitch_rule_priority) must sit BELOW whatever wg-quick actually installed - check the numbers, don't assume them
 sudo iptables -S WG-KILLSWITCH-OUT # RETURNs, then one DROP at the end
 sudo iptables -t mangle -S | grep KILLSWITCH
 sudo sysctl net.ipv4.conf.all.rp_filter    # 2 on a [vpn] host
@@ -325,9 +343,10 @@ Common causes, in the order they are worth checking:
 
 | symptom | cause |
 | --- | --- |
-| play fails at "must have handshaked" | the client is not registered or is disabled on the UDM; `wg_peer_public_key` is this host's key rather than the server's; `wg_preshared_key` does not match; the server's UDP port is not reachable |
-| tunnel is up, nothing routes | the UDM is not routing this peer to the internet |
+| play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_peer_public_key` is this host's key rather than OPNsense's; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
+| tunnel is up, nothing routes | OPNsense's outbound NAT does not cover the tunnel subnet, or no rule on the WireGuard interface tab permits this peer's traffic out |
 | SSH dies the moment the route moves | the mangle rules did not install — check `iptables -t mangle -S` and `ip rule`, and that `sysctl_rp_filter` is 2 |
+| SSH dies, but `iptables -t mangle -L -n -v` shows real, growing packet counters on both KILLSWITCH chains | the mark is being set and restored correctly, but `ip rule` shows wg-quick's own rule at a *lower* number than `wg_killswitch_rule_priority` — it wins the race and the mark is never actually honored. Confirm with `ip route get <ip> mark <wg_killswitch_mark>`: if it still shows `dev wg0` instead of the public interface, this is it. Lower `wg_killswitch_rule_priority` below whatever `ip rule` actually shows, not below the number this doc happens to mention |
 | Alloy fails to install on the first run | same as "nothing routes": its release is fetched through the tunnel |
-| telemetry never arrives | `wg_dns` is not set, so `ingest.net.d1023.de` does not resolve — see `group_vars/vpn.yml` |
+| telemetry never arrives | `wg_dns` is not set, so the ingest hostname does not resolve — see `group_vars/vpn.yml` |
 | host loses its address after a day | DHCP is being blocked; check the kill switch's DHCP exceptions survived an edit |

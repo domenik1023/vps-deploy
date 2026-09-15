@@ -1,14 +1,18 @@
 # --- WireGuard ---
 # Applied to [vpn] hosts only; wireguard_manage in 00_identity.yml is what
-# gates it. These boxes are rented off-site but belong to the LAN: the default
-# route is the tunnel, and the kill switch means a tunnel that drops takes the
-# host's internet with it rather than quietly falling back to the VPS's own
-# public address.
+# gates it. These boxes are rented off-site and route their entire default
+# route through OPNsense rather than their own public address: the kill switch
+# means a tunnel that drops takes the host's internet with it rather than
+# quietly falling back to the VPS's own public address.
 #
-# The per-host half - address, keys, endpoint - comes from the client you create
-# on the WireGuard server. See docs/wireguard.md; there is no API to automate
-# that side, and which half of the keypair you have to move depends on the
-# server's version - see wg_generate_key below.
+# This is not an extension of the LAN. OPNsense treats each [vpn] host as an
+# isolated point-to-point peer - it reaches OPNsense and nothing past it.
+#
+# The per-host half - address, keys, endpoint - comes from the peer you create
+# on OPNsense (VPN: WireGuard: Peers). See docs/wireguard.md. OPNsense has a
+# real REST API, unlike the UniFi server this used to point at, but this
+# playbook does not call it - the peer is registered once, by hand or with a
+# short API call, and this playbook never touches the server side after that.
 
 wg_interface: wg0
 
@@ -18,9 +22,9 @@ wg_interface: wg0
 wg_allowed_ips:
   - "0.0.0.0/0"
 
-# The UDM is behind a home connection, so the host has to keep the mapping
-# open from its side. 25s is the WireGuard default recommendation and is below
-# every common NAT timeout.
+# OPNsense may be behind a connection that NATs it too, so the host has to
+# keep the mapping open from its side. 25s is the WireGuard default
+# recommendation and is below every common NAT timeout.
 wg_persistent_keepalive: 25
 
 # 1420 = 1500 - 80 for the WireGuard header over IPv4. Lower it if the VPS's
@@ -48,11 +52,11 @@ wg_wan_interface: ""
 # Generate the keypair on the host instead of taking wg_private_key from the
 # vault, and print the public half to register on the server.
 #
-# Which one you want depends on the server, and UniFi versions differ: some
-# generate the client keypair and hand back a finished config, others give you
-# only the server's public key and a preshared key and expect a client public
-# key back. This is for the second, and it is the better shape - the private
-# key is generated on the host that uses it and never travels.
+# OPNsense never hands out a client private key - a peer entry only ever holds
+# the client's public key - so this is the only shape that applies and every
+# OPNsense-backed [vpn] host sets it true. It is also the better shape on its
+# own terms: the private key is generated on the host that uses it and never
+# travels.
 #
 # The run that mints the key stops right after printing it, because the server
 # cannot know it yet and everything below would fail at the handshake check
@@ -83,10 +87,22 @@ wg_killswitch: true
 # know.
 wg_killswitch_mark: "0x40000"
 
-# Priority of the `ip rule` that acts on that mark. Must be below wg-quick's
-# own rules, which it installs at 32764 and 32765, or the tunnel's default
-# route wins and marked replies never reach the public interface.
-wg_killswitch_rule_priority: 30000
+# Priority of the `ip rule` that acts on that mark. Must be below (checked
+# before) wg-quick's own rules - or the tunnel's default route wins and
+# marked replies never reach the public interface, which looks exactly like a
+# working kill switch that quietly isn't.
+#
+# wg-quick does NOT reliably install those at 32764/32765. That was this
+# repo's original assumption, from upstream's documented default - but a real
+# deployment (vpn-gwdg-01) showed wg-quick installing them at 29998/29999
+# instead, which sits *above* the old default of 30000 and silently defeated
+# the whole mechanism: packets were correctly marked and restored (confirmed
+# with `iptables -t mangle -L -n -v`, nonzero counters on both chains) and
+# still went into the tunnel, because ip rule evaluates lowest-number-first
+# and wg-quick's rule won the race. There is no fixed number wg-quick is
+# guaranteed to use, so this sits far below both the documented default and
+# the observed real one instead of trying to track wherever wg-quick lands.
+wg_killswitch_rule_priority: 100
 
 # Let DNS out of the public interface even when the tunnel is down.
 #
