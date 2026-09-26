@@ -5,10 +5,10 @@
 #
 # tests/render-check.yml can only read the rendered text: that the rules are in
 # the right order, that the script parses as bash. What it cannot tell you is
-# whether the kernel agrees - whether `ip rule` actually sends a marked reply
-# out of the public interface while everything else goes down the tunnel. That
-# is the property the whole design rests on, and getting it wrong costs a trip
-# to the provider's serial console.
+# whether the kernel agrees - whether `ip rule` actually sends SSH's own
+# traffic out of the public interface while everything else goes down the
+# tunnel. That is the property the whole design rests on, and getting it wrong
+# costs a trip to the provider's serial console.
 #
 # So build the situation in a network namespace: a public interface with a
 # default route, a stand-in tunnel, and the two `ip rule` entries wg-quick
@@ -30,7 +30,11 @@ WAN_GW=198.51.100.1
 TUN=wg0
 TUN_ADDR=10.0.2.11
 WG_TABLE=51820
-MARK=0x40000
+SSH_PORT=22822
+# The mark the CONNMARK-based mechanism used before it was replaced by the
+# sport-based ip rule below - only planted here to prove `on` migrates a host
+# that still has it away, never used to route anything in this test itself.
+OLD_MARK=0x40000
 
 skip() { echo "SKIP: $*"; exit 0; }
 
@@ -101,26 +105,41 @@ set +e
 # A rule this script left behind at an older wg_killswitch_rule_priority.
 # Deleting only at the *current* priority orphans it, and on a host where the
 # stale number sits above wg-quick's own the wrong rule still wins.
-ip rule add fwmark $MARK/$MARK table main priority 30000
+ip rule add ipproto tcp sport $SSH_PORT table main priority 30000
+
+# What a host running the CONNMARK-based mechanism this replaced still has:
+# the two mangle chains, their jumps, and the old fwmark ip rule. \`on\` has to
+# clean all of it up, or an upgraded host carries orphaned chains and a stale
+# rule forever - nothing left removes them once this script stops knowing
+# their names.
+iptables -t mangle -N WG-KILLSWITCH-MARK
+iptables -t mangle -A WG-KILLSWITCH-MARK -j CONNMARK --set-xmark $OLD_MARK/$OLD_MARK
+iptables -t mangle -I PREROUTING 1 -i $WAN -j WG-KILLSWITCH-MARK
+iptables -t mangle -N WG-KILLSWITCH-RESTORE
+iptables -t mangle -A WG-KILLSWITCH-RESTORE -j CONNMARK --restore-mark --nfmask $OLD_MARK --ctmask $OLD_MARK
+iptables -t mangle -I OUTPUT 1 -j WG-KILLSWITCH-RESTORE
+ip rule add fwmark $OLD_MARK/$OLD_MARK table main priority 100
 
 $work/wg-killswitch on >/dev/null 2>&1; echo \"ON_EXIT=\$?\"
-echo \"MARK_RULE_COUNT=\$(ip rule show | grep -c $MARK || true)\"
-echo \"MARK_RULE_PRIO=\$(ip rule show | grep $MARK | grep -oE '^[0-9]+' | tr '\\n' ' ')\"
+echo \"SSH_RULE_COUNT=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
+echo \"SSH_RULE_PRIO=\$(ip rule show | grep 'sport $SSH_PORT' | grep -oE '^[0-9]+' | tr '\\n' ' ')\"
+echo \"OLD_MARK_RULE_COUNT=\$(ip rule show | grep -c $OLD_MARK || true)\"
+echo \"OLD_MARK_CHAINS=\$(( \$(iptables -t mangle -S WG-KILLSWITCH-MARK 2>/dev/null | wc -l) + \$(iptables -t mangle -S WG-KILLSWITCH-RESTORE 2>/dev/null | wc -l) ))\"
 echo \"LAST_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | tail -1)\"
-echo \"SSH_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | grep -c -- '--sport 22822')\"
+echo \"SSH_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | grep -c -- '--sport $SSH_PORT')\"
 echo \"UNMARKED=\$(ip route get 203.0.113.99 | head -1)\"
-echo \"MARKED=\$(ip route get 203.0.113.99 mark $MARK | head -1)\"
+echo \"SSH_REPLY=\$(ip route get 203.0.113.99 ipproto tcp sport $SSH_PORT | head -1)\"
 
 # The MSS clamp. Worth asking the kernel rather than the rendered text: the
 # TCPMSS target lives in a module (xt_TCPMSS) that a stripped kernel can be
 # missing, and --clamp-mss-to-pmtu is only valid in some chains. Either way
-# iptables rejects the rule and the script aborts under `set -e`.
+# iptables rejects the rule and the script aborts under \`set -e\`.
 echo \"MSS_JUMP=\$(iptables -t mangle -S FORWARD 2>/dev/null | grep -c -- '-o $TUN -j WG-KILLSWITCH-MSS')\"
 echo \"MSS_RULE=\$(iptables -t mangle -S WG-KILLSWITCH-MSS 2>/dev/null | grep -c -- 'TCPMSS --clamp-mss-to-pmtu')\"
 
 $work/wg-killswitch off >/dev/null 2>&1; echo \"OFF_EXIT=\$?\"
 echo \"LEFTOVER_RULES=\$(( \$(iptables -S | grep -c KILLSWITCH || true) + \$(iptables -t mangle -S | grep -c KILLSWITCH || true) ))\"
-echo \"LEFTOVER_IPRULE=\$(ip rule | grep -c $MARK || true)\"
+echo \"LEFTOVER_IPRULE=\$(( \$(ip rule | grep -c \"sport $SSH_PORT\" || true) + \$(ip rule | grep -c $OLD_MARK || true) ))\"
 " 2>&1)
 
 # Never fails: a missing line means the namespace script died before printing
@@ -137,7 +156,7 @@ check "the chain ends in DROP"                "-j DROP" "$(get LAST_RULE)"
 
 # The property the design rests on.
 check "unmarked traffic takes the tunnel"     "dev $TUN"  "$(get UNMARKED)"
-check "a marked reply takes the public link"  "dev $WAN"  "$(get MARKED)"
+check "SSH's own traffic takes the public link" "dev $WAN"  "$(get SSH_REPLY)"
 
 # Container traffic black-holes on the tunnel MTU without this. The clamp has
 # to be on the way *into* the tunnel: --clamp-mss-to-pmtu reads the outgoing
@@ -146,10 +165,16 @@ check "clamps MSS on traffic forwarded into the tunnel" "1" "$(get MSS_JUMP)"
 check "the clamp follows the tunnel path MTU"           "1" "$(get MSS_RULE)"
 
 # Lowering wg_killswitch_rule_priority has to actually move the rule, not add
-# a second one beside the old. Exactly one rule for this mark, at the
+# a second one beside the old. Exactly one rule for this selector, at the
 # configured priority, with the stale 30000 one gone.
-check "replaces a rule left at an older priority" "1" "$(get MARK_RULE_COUNT)"
-check "and installs it at the configured priority" "100" "$(get MARK_RULE_PRIO)"
+check "replaces a rule left at an older priority" "1" "$(get SSH_RULE_COUNT)"
+check "and installs it at the configured priority" "100" "$(get SSH_RULE_PRIO)"
+
+# A host still running the CONNMARK-based mechanism this replaced must not
+# keep it forever: `on` has to remove the old chains, their jumps and the old
+# fwmark rule, not just add the new sport-based one beside them.
+check "migrates a host off the old CONNMARK mechanism's ip rule" "0" "$(get OLD_MARK_RULE_COUNT)"
+check "migrates a host off the old CONNMARK mechanism's chains"  "0" "$(get OLD_MARK_CHAINS)"
 
 check "removes cleanly and exits 0"           "0"    "$(get OFF_EXIT)"
 check "leaves no iptables rules behind"       "0"    "$(get LEFTOVER_RULES)"

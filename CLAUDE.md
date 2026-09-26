@@ -309,48 +309,56 @@ leaves nothing behind. `tests/killswitch-netns.sh` plants a rule at `30000`
 before running `on` and asserts exactly one remains, at the configured
 priority; `tests/render-check.yml` keeps the shape from regressing where
 namespaces are unavailable.
-The kill switch marks connections arriving on the public interface (`mangle
-PREROUTING`), restores the mark on the way out (`mangle OUTPUT`) and adds an
-`ip rule` at `wg_killswitch_rule_priority` sending those to the main table.
+The kill switch keeps SSH alive by routing its own traffic explicitly: an
+`ip rule` at `wg_killswitch_rule_priority`, matched on `ipproto tcp sport
+<ssh_port>` alone, sends SSH's own traffic to the main table instead of
+wg-quick's. SSH is the only thing on a `[vpn]` host that accepts inbound
+internet connections; anything else that ever needs the same treatment needs
+its own static rule of this same shape, not a return to packet marking (next
+paragraph explains why).
 
-**The mark is a single bit used as its own mask, and it is not wg-quick's
-fwmark.** wg-quick derives that from the first free routing table counting up
-from 51820, at run time, and overrides whatever `FwMark` the config asks for —
-so it is not a number this repo can know, and `wg.conf.j2` deliberately does
-not set one. The mask matters separately: wg-quick sets its fwmark on the
-encrypted packets it sends, and an unmasked `CONNMARK --restore-mark` clears
-it, routing the tunnel's own traffic back into the tunnel.
-
-**Masking stops the mark being cleared, but `wg_killswitch_rule_priority` is
-what stops it mattering, and that also protects traffic the paragraphs above
-don't mention.** wg-quick's `not fwmark <t> table <t>` rule carries no mask of
-its own — it is a plain inequality against the exact value `<t>` it derived at
-startup. WireGuard sets that exact value on every packet its kernel module
-sends, handshake and keepalive traffic included, for as long as no reply has
-been marked yet on that flow. The moment one has — an inbound SSH reply is one
-way, but so is the WireGuard server's own reply during the handshake — every
-later packet on that flow picks up the kill switch's bit via
-`CONNMARK --restore-mark` on top of whatever WireGuard already set, and the
-mark stops being exactly `<t>`. Masking only guarantees that OR does not erase
-wg-quick's bits; it does not stop the *sum* from failing wg-quick's exact
-match, and a sum that fails it is routed into the tunnel exactly like a
-cleared one would be. Confirmed against a real kernel: a packet marked with
-only the kill switch bit and one marked with the kill switch bit OR'd onto
+**An earlier version of this used `CONNMARK` instead of a static rule, and it
+was wrong in a way that took real incidents to find.** It marked every
+connection arriving on the public interface (`mangle PREROUTING`), restored
+that mark on the way out (`mangle OUTPUT`), and matched the mark rather than
+the port. wg-quick's `not fwmark <t> table <t>` rule carries no mask of its
+own — it is a plain inequality against the exact value `<t>` it derived at run
+time (the first free routing table counting up from 51820), and WireGuard sets
+that exact value on every packet its kernel module sends, handshake and
+keepalive traffic included, for as long as nothing on that flow has been
+marked yet. The kill switch's own mark was a single bit, masked so that
+restoring it could not *clear* wg-quick's bits — but masking only protects
+against clearing, not against *adding*: the moment anything on a flow got
+marked (an inbound SSH reply, but also the WireGuard server's own reply during
+the handshake), every later packet on that flow picked up the kill switch's
+bit on top of whatever WireGuard had already set, and the sum stopped being
+exactly `<t>`. A sum that fails an exact match is routed into the tunnel
+exactly like a cleared one would be. Confirmed against a real kernel: a packet
+marked with only the kill switch's bit and one marked with that bit OR'd onto
 wg-quick's own land on the same interface at either priority, because the kill
-switch's rule is a masked bit check and wg-quick's is an unmasked inequality —
-neither inspects the other's bits, so whichever rule sits at the lower
-priority number decides both cases identically. That is why
-`wg_killswitch_rule_priority` sitting below wg-quick's own rule is not only
-about SSH: get it wrong and the tunnel's own re-keys and keepalives loop into
-itself the same way a reply would, and the signature is different enough to
-send you looking at the wrong end of the tunnel — `wg show` reports one
-completed handshake and then nothing, ever again: no rekeys, no keepalives, no
-traffic. That reads exactly like a problem on the WireGuard server, and is not
-one.
+switch's rule was a masked bit check and wg-quick's is an unmasked inequality —
+neither inspects the other's bits, so whichever rule sat at the lower priority
+number decided both cases identically. That made `wg_killswitch_rule_priority`
+not only about SSH: get it wrong and the tunnel's own re-keys and keepalives
+looped into itself the same way a reply would, and the signature was different
+enough to send you looking at the wrong end of the tunnel — `wg show` reporting
+one completed handshake and then nothing, ever again: no rekeys, no
+keepalives, no traffic. That reads exactly like a problem on the WireGuard
+server, and is not one.
+
+The sport-based rule has none of this failure mode, because it never combines
+with anything — it reads the packet's own TCP header, not a mark that has to
+survive being OR'd with something else's. `wg-killswitch.j2`'s
+`remove_old_mark_mechanism()` runs on every `on` and `off` specifically to
+migrate a host still carrying the old chains, jumps and fwmark rule off them;
+`tests/killswitch-netns.sh` plants all of it before running `on` and asserts
+none of it survives.
 
 **There is a second, dumber rule keeping SSH alive**: `tcp --sport <ssh_port>`
-returns before the final `DROP`, matching on port alone with no conntrack and
-no `ip rule` involved. It is what still holds if the mangle half is wrong, and
+returns before the final `DROP` in the filter chain, matching on port alone
+with no conntrack involved — the same selector the routing rule above uses, so
+a packet this rule allows is always one already routed the right way. It is
+what still holds if the routing rule is ever wrong for some other reason, and
 `tests/render-check.yml` asserts both its presence and that every `RETURN`
 precedes the `DROP`. Losing that ordering is a trip to the provider's serial
 console.

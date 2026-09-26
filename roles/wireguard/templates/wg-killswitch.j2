@@ -13,11 +13,11 @@
 #
 # Three places, because one is not enough:
 #
-#   mangle    marks connections arriving on the public interface, restores the
-#             mark on the way out, and an `ip rule` sends those to the main
-#             routing table. Without it, replies to an inbound SSH connection
-#             would be routed into the tunnel and the session would hang the
-#             instant the default route moved.
+#   routing   a plain `ip rule` sends SSH's own traffic to the main routing
+#             table instead of the tunnel's, by source port alone. Without it,
+#             replies to an inbound SSH connection would be routed into the
+#             tunnel and the session would hang the instant the default route
+#             moved.
 #   filter    OUTPUT covers traffic the host originates.
 #   filter    DOCKER-USER covers containers. They are forwarded traffic, and
 #             Docker's own FORWARD jumps run ahead of ufw's, so a rule in
@@ -35,22 +35,37 @@
 # Reload UFW handler restarts this unit - the same reason it restarts the
 # CrowdSec bouncer.
 #
-# The mark is masked to a single bit. wg-quick sets its own fwmark on the
-# encrypted packets it sends, and an unmasked --restore-mark would clear it,
-# routing the tunnel's own traffic back into the tunnel.
+# SSH is the only thing on these hosts that accepts inbound internet
+# connections, so it is handled with a static `ip rule` matched on the SSH
+# port alone - no packet marking, no conntrack, nothing that depends on
+# catching the connection's first inbound packet. An earlier version of this
+# script used CONNMARK to mark inbound-then-reply traffic generically, but
+# that mechanism collides with wg-quick's own fwmark: wg-quick's own
+# `not fwmark <t> table <t>` rule is an *unmasked* exact match, so ANY bit
+# added to a packet already carrying wg-quick's fwmark - correctly masked or
+# not - changes the value away from the one that rule requires, which routes
+# the tunnel's own re-keys and keepalives into itself the moment anything on
+# that flow got marked. See CLAUDE.md's "WireGuard on [vpn] hosts" section.
+# The sport-based rule has none of that: it matches the packet's own header,
+# not a mark that has to survive being combined with something else's.
 set -euo pipefail
 
 WAN='{{ wg_wan_interface_resolved }}'
 WG_IF='{{ wg_interface }}'
-MARK='{{ wg_killswitch_mark }}'
 PRIO='{{ wg_killswitch_rule_priority }}'
 SSH_PORT='{{ ssh_port }}'
 WG_PORT='{{ wg_peer_endpoint.rsplit(":", 1)[1] }}'
 
+# The mark the CONNMARK-based mechanism used before it was replaced by the
+# sport-based ip rule below. Kept only so `on` can clean up the chains, jumps
+# and ip rule a host upgraded from that version still has - a fresh host has
+# never had any of it, and every removal here is a no-op there.
+OLD_MARK='0x40000'
+OLD_MARK_CHAIN='WG-KILLSWITCH-MARK'
+OLD_RESTORE_CHAIN='WG-KILLSWITCH-RESTORE'
+
 OUT_CHAIN='WG-KILLSWITCH-OUT'
 FWD_CHAIN='WG-KILLSWITCH-FWD'
-MARK_CHAIN='WG-KILLSWITCH-MARK'
-RESTORE_CHAIN='WG-KILLSWITCH-RESTORE'
 MSS_CHAIN='WG-KILLSWITCH-MSS'
 
 # Create the chain, or empty it if a previous run left it there. Rebuilding
@@ -104,34 +119,40 @@ family_usable() {
     ip -6 rule show >/dev/null 2>&1 || return 1
 }
 
+# Removes what the CONNMARK-based mechanism this replaced left behind. Called
+# from both build() and teardown() so neither `on` nor `off` leaves an
+# upgraded host carrying orphaned chains or a stale fwmark ip rule.
+remove_old_mark_mechanism() {
+    local ipt=$1 fam=$2
+    remove_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$OLD_MARK_CHAIN"
+    remove_jump "$ipt" mangle OUTPUT -j "$OLD_RESTORE_CHAIN"
+    remove_chain "$ipt" mangle "$OLD_MARK_CHAIN"
+    remove_chain "$ipt" mangle "$OLD_RESTORE_CHAIN"
+    while ip -"$fam" rule del fwmark "$OLD_MARK/$OLD_MARK" table main 2>/dev/null; do :; done
+}
+
 build() {
     local ipt=$1 fam=$2
 
-    # --- mangle: replies leave by the interface the connection arrived on ---
-    ensure_chain "$ipt" mangle "$MARK_CHAIN"
-    "$ipt" -t mangle -A "$MARK_CHAIN" -j CONNMARK --set-xmark "$MARK/$MARK"
-    ensure_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$MARK_CHAIN"
+    remove_old_mark_mechanism "$ipt" "$fam"
 
-    ensure_chain "$ipt" mangle "$RESTORE_CHAIN"
-    "$ipt" -t mangle -A "$RESTORE_CHAIN" \
-        -j CONNMARK --restore-mark --nfmask "$MARK" --ctmask "$MARK"
-    ensure_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
-
-    # Marked packets take the main table, where the public interface still
-    # holds a default route, instead of wg-quick's tunnel table. Priority must
-    # be below (checked before) whatever wg-quick actually installs, which is
-    # not reliably 32764/32765 - see wg_killswitch_rule_priority in
-    # defaults/main.yml for what a real deployment showed.
+    # SSH replies leave via the main routing table, where the public interface
+    # still holds a default route, instead of wg-quick's tunnel table. Matched
+    # on source port alone - no conntrack, no packet mark, so it works for the
+    # very first reply on a brand new connection exactly as well as a
+    # long-lived one, and it cannot be perturbed by anything else that touches
+    # marks. Priority must be below (checked before) whatever wg-quick actually
+    # installs, which is not reliably 32764/32765 - see
+    # wg_killswitch_rule_priority in defaults/main.yml for what a real
+    # deployment showed.
     #
-    # The delete matches on the mark alone, deliberately, and loops. Pinning it
-    # to "$PRIO" - which is what this did - means a rule this script left at
-    # some *other* priority is never removed: lowering the default from 30000
-    # to 100 then adds the new rule and orphans the old one, and on a host
-    # where the stale number sits above wg-quick's own the wrong rule can still
-    # win. Deleting by mark makes a priority change actually take effect, and
-    # is why `off` leaves nothing behind after one.
-    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
-    ip -"$fam" rule add fwmark "$MARK/$MARK" table main priority "$PRIO"
+    # The delete matches on port and protocol alone, deliberately, and loops -
+    # same reasoning as the old mark-based rule this replaced: a rule left at
+    # an *other* priority by an earlier version of this script, or an earlier
+    # wg_killswitch_rule_priority, has to go too, or a priority change does not
+    # actually take effect.
+    while ip -"$fam" rule del ipproto tcp sport "$SSH_PORT" table main 2>/dev/null; do :; done
+    ip -"$fam" rule add ipproto tcp sport "$SSH_PORT" table main priority "$PRIO"
 {% if wg_mss_clamp %}
 
     # --- mangle FORWARD: MSS clamping for forwarded traffic ---
@@ -171,14 +192,10 @@ build() {
     # The tunnel's own packets, or it could never come up.
     "$ipt" -A "$OUT_CHAIN" -p udp --dport "$WG_PORT" -j RETURN
 
-    # Replies to an inbound SSH session, matched on the source port. This one
-    # needs no conntrack mark and no `ip rule`, which is deliberate: it is the
-    # rule that still holds if the mangle half is wrong, and losing SSH here
-    # means a trip to the provider's serial console.
+    # Replies to an inbound SSH session, matched on the source port - the same
+    # selector the ip rule above uses, so a packet allowed out here is always
+    # one the routing decision already sent the right way.
     "$ipt" -A "$OUT_CHAIN" -p tcp --sport "$SSH_PORT" -j RETURN
-
-    # Everything else that was reached from the outside.
-    "$ipt" -A "$OUT_CHAIN" -m connmark --mark "$MARK/$MARK" -j RETURN
 
     # Address configuration. Without these the host loses its own address when
     # the DHCP lease expires, or when a router advertisement goes unanswered -
@@ -227,8 +244,8 @@ build() {
 teardown() {
     local ipt=$1 fam=$2
 
-    remove_jump "$ipt" mangle PREROUTING -i "$WAN" -j "$MARK_CHAIN"
-    remove_jump "$ipt" mangle OUTPUT -j "$RESTORE_CHAIN"
+    remove_old_mark_mechanism "$ipt" "$fam"
+
     # Unconditional, unlike the matching half of build(): turning wg_mss_clamp
     # off has to remove a rule an earlier run installed, and a restart runs the
     # new script's `off` before its `on`.
@@ -238,15 +255,13 @@ teardown() {
         remove_jump "$ipt" filter DOCKER-USER -j "$FWD_CHAIN"
     fi
 
-    remove_chain "$ipt" mangle "$MARK_CHAIN"
-    remove_chain "$ipt" mangle "$RESTORE_CHAIN"
     remove_chain "$ipt" mangle "$MSS_CHAIN"
     remove_chain "$ipt" filter "$OUT_CHAIN"
     remove_chain "$ipt" filter "$FWD_CHAIN"
 
-    # By mark, not by priority - same reason as in build(): a rule left at an
+    # By port, not by priority - same reason as in build(): a rule left at an
     # earlier value of wg_killswitch_rule_priority has to go too.
-    while ip -"$fam" rule del fwmark "$MARK/$MARK" table main 2>/dev/null; do :; done
+    while ip -"$fam" rule del ipproto tcp sport "$SSH_PORT" table main 2>/dev/null; do :; done
 }
 
 # Within build() the final DROP is the last rule added, so a build that dies
