@@ -1,0 +1,59 @@
+#!/bin/bash
+# Managed by Ansible - roles/wireguard/templates/wg-recover.j2. Local edits
+# are overwritten on the next run.
+#
+#   wg-recover
+#
+# The one safe way to bring wg-quick@{{ wg_interface }} and wg-killswitch back
+# up by hand after the automatic rollback has disabled them. Do not run
+# `systemctl enable --now` on these two directly instead of this script:
+#
+#   - wg-killswitch is Type=oneshot, RemainAfterExit=yes. If systemd still
+#     considers it active from an earlier run - including one from before a
+#     rollback, since disabling a unit does not touch its recorded active
+#     state the way stopping it would - `enable --now`/`start` is a no-op: it
+#     does not re-run the script, so anything that drifted since (a stray
+#     `ip rule` added by hand while debugging, say) is never cleaned up. This
+#     uses `restart`, which unconditionally runs off then on.
+#   - bringing the tunnel up with no rollback armed means a tunnel that never
+#     handshakes locks you out with nothing to undo it. This arms one anyway,
+#     the same way roles/wireguard/tasks/tunnel.yml does, and cancels it only
+#     once a real handshake shows up.
+set -euo pipefail
+
+WG_UNIT='wg-quick@{{ wg_interface }}'
+KS_UNIT='wg-killswitch'
+DELAY='{{ wg_rollback_delay }}'
+ROLLBACK_UNIT='wg-manual-recover'
+
+echo "Arming a rollback in $DELAY in case this does not come back."
+systemctl reset-failed "$ROLLBACK_UNIT.timer" "$ROLLBACK_UNIT.service" >/dev/null 2>&1 || true
+systemctl stop "$ROLLBACK_UNIT.timer" >/dev/null 2>&1 || true
+systemd-run --on-active="$DELAY" --unit="$ROLLBACK_UNIT" /bin/bash -c "
+    systemctl disable --now '$WG_UNIT';
+    systemctl disable --now '$KS_UNIT';
+    /usr/local/sbin/wg-killswitch off"
+
+echo "Restarting $KS_UNIT."
+systemctl enable "$KS_UNIT"
+systemctl restart "$KS_UNIT"
+
+echo "Restarting $WG_UNIT."
+systemctl enable "$WG_UNIT"
+systemctl restart "$WG_UNIT"
+
+echo "Waiting for a handshake..."
+for _ in $(seq 1 24); do
+    sleep 5
+    if wg show {{ wg_interface }} latest-handshakes 2>/dev/null | grep -qE '\s[1-9][0-9]*$'; then
+        echo "Handshake confirmed. Cancelling the rollback."
+        systemctl stop "$ROLLBACK_UNIT.timer" >/dev/null 2>&1 || true
+        exit 0
+    fi
+done
+
+echo "No handshake yet after 2 minutes. The rollback armed above will revert" >&2
+echo "this host to its pre-tunnel state within $DELAY unless a handshake" >&2
+echo "completes, or you cancel it yourself:" >&2
+echo "  systemctl stop $ROLLBACK_UNIT.timer" >&2
+exit 1

@@ -466,17 +466,40 @@ recreated — so the host runs for as long as you like and then loses the tunnel
 silently at the next reboot, with nothing in `journalctl -u wg-quick@wg0 -b` to
 say why, because the unit was never asked to start.
 
-Recover with `enable --now` on both, in this order — kill switch first, so the
-mangle rules and the `ip rule` exist before the default route moves again:
+**Recover with `wg-recover`, not raw `systemctl` commands:**
 
 ```bash
-systemctl enable --now wg-killswitch
-systemctl enable --now wg-quick@wg0
+sudo wg-recover
 ```
+
+It arms its own short rollback before touching anything, `restart`s (not
+`start`s) both units, waits for a real handshake, and cancels the rollback
+itself once one shows up — the same shape as the play's own bring-up, so a
+manual recovery gets the same safety net. Do not substitute
+`systemctl enable --now wg-killswitch`: it is `Type=oneshot,
+RemainAfterExit=yes`, so if systemd still considers it *active* from an
+earlier run — which disabling a unit does not change — `enable --now`/`start`
+is a no-op that never re-runs the script. Anything that drifted since (a stray
+`ip rule` added by hand while debugging, say) survives untouched, and you find
+out that "fixing" it did nothing only once the tunnel breaks again.
 
 A re-run of the play also fixes this — it sets `enabled: true` on both units —
 and will say so plainly if it finds either one disabled, rather than
-re-enabling it silently.
+re-enabling it silently. But the play carries every other role's tasks with
+it; `wg-recover` is the one-command version for when you just need the tunnel
+back.
+
+**`wg-tunnel-check.timer` catches the disabled state without anyone having to
+notice a broken tunnel first.** Every `wg_tunnel_check_interval` (5 minutes by
+default) it checks whether both units are enabled and active, and is silent
+when they are. When one is not, it logs to the journal — which Alloy already
+ships in full, so nothing in `roles/alloy` needed to change — and exits
+non-zero, which is what makes `wg-tunnel-check.service` show up as failed in
+`node_systemd_unit_state{name="wg-tunnel-check.service"}`: the systemd
+collector is already enabled in `config.alloy.j2`, so this needs no exporter
+of its own. Alert on that metric, or on the journal line, and a rolled-back
+tunnel gets noticed within one interval instead of at the next scheduled
+reboot.
 
 Common causes, in the order they are worth checking:
 

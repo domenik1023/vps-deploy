@@ -1,0 +1,7 @@
+[Unit]
+Description=Check that the WireGuard tunnel and kill switch are enabled and active ({{ wg_interface }})
+Documentation=file:///usr/local/sbin/wg-tunnel-check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-tunnel-check

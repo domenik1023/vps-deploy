@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically check the WireGuard tunnel and kill switch ({{ wg_interface }})
+
+[Timer]
+OnBootSec={{ wg_tunnel_check_interval }}
+OnUnitActiveSec={{ wg_tunnel_check_interval }}
+Unit=wg-tunnel-check.service
+
+[Install]
+WantedBy=timers.target

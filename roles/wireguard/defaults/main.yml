@@ -228,3 +228,10 @@ wg_killswitch_extra_allow: []
 # the default route moves and cancelled once the host has been confirmed
 # reachable, so it only ever fires on a run that locked itself out.
 wg_rollback_delay: 5min
+
+# How often wg-tunnel-check.timer asks whether wg-quick@<iface> and
+# wg-killswitch are still enabled and active. It only ever reports a problem -
+# see wg-tunnel-check.j2 - so this is a tradeoff between how quickly a rolled
+# back host is noticed and how much journal/systemd noise a passing check
+# produces (none: it is silent unless something is actually wrong).
+wg_tunnel_check_interval: 5min

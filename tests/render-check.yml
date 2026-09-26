@@ -40,6 +40,8 @@
     # variable, so its assertions render it here instead of reading a value.
     alloy_template: ../roles/alloy/templates/config.alloy.j2
     killswitch_template: ../roles/wireguard/templates/wg-killswitch.j2
+    wg_recover_template: ../roles/wireguard/templates/wg-recover.j2
+    wg_tunnel_check_template: ../roles/wireguard/templates/wg-tunnel-check.j2
 
     # The [lapi] group, read out of the inventory rather than named here, so
     # adding a second delegation-only host does not need a change below.
@@ -793,6 +795,103 @@
           check: "{{ names.index(n_check) if n_check in names else -1 }}"
           apply_killswitch: "{{ names.index(n_apply_killswitch) if n_apply_killswitch in names else 9999 }}"
           bring_up: "{{ names.index(n_bring_up) if n_bring_up in names else 9999 }}"
+
+    # wg-killswitch is Type=oneshot, RemainAfterExit=yes, so `systemctl start`
+    # or `enable --now` on a unit systemd still considers active from an
+    # earlier run is a no-op: it never re-runs the script, so anything that
+    # drifted since - a stray `ip rule` added by hand while debugging, say -
+    # is never cleaned up. wg-recover exists specifically to not make that
+    # mistake, so it has to actually use `restart`, not `start`, on both
+    # units, or it is exactly as unsafe as the `systemctl enable --now`
+    # sequence it replaces docs/wireguard.md's advice to run by hand.
+    - name: The recovery script must restart, not start, both units
+      ansible.builtin.assert:
+        that:
+          - recover_rendered is search('systemctl restart "\$KS_UNIT"')
+          - recover_rendered is search('systemctl restart "\$WG_UNIT"')
+          - recover_rendered is not search('enable --now "\$KS_UNIT"')
+          - recover_rendered is not search('enable --now "\$WG_UNIT"')
+          - recover_rendered is search('systemd-run')
+        fail_msg: >-
+          wg-recover.j2 must `systemctl restart` (never `start` or
+          `enable --now`) both wg-killswitch and wg-quick@<iface>, and must
+          arm its own rollback with systemd-run before touching either -
+          otherwise it is no safer than the raw systemctl commands it exists
+          to replace.
+        success_msg: "wg-recover restarts both units and arms its own rollback"
+      vars:
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars=wg_recover_vars) }}
+        wg_recover_vars:
+          wg_interface: wg0
+          wg_rollback_delay: 5min
+
+    # The whole point of this script is to say something instead of letting a
+    # rolled-back tunnel run silent until the next scheduled reboot - so it has
+    # to actually check both units, and it has to fail (exit non-zero) when
+    # either is wrong, which is what makes wg-tunnel-check.service show up as
+    # failed to node_exporter's systemd collector. A version that only checks
+    # one unit, or that always exits 0, would pass every render check that
+    # only looked at its existence rather than its content.
+    - name: The tunnel health check must check both units and fail loudly
+      ansible.builtin.assert:
+        that:
+          - check_rendered is search("KS_UNIT='wg-killswitch'")
+          - check_rendered is search("WG_UNIT='wg-quick@wg0'")
+          - check_rendered is search('is-enabled')
+          - check_rendered is search('is-active')
+          - check_rendered is search('exit 1')
+        fail_msg: >-
+          wg-tunnel-check.j2 must check systemctl is-enabled and is-active for
+          both wg-killswitch and wg-quick@<iface>, and exit non-zero when
+          either is wrong - a version that always exits 0 is silent about the
+          exact failure it exists to catch.
+        success_msg: "wg-tunnel-check checks both units and exits non-zero on a problem"
+      vars:
+        check_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_tunnel_check_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+
+    # These three tasks are what actually deploys the check above; a template
+    # that is correct but never installed, or a timer that is never enabled,
+    # is exactly as silent as having neither.
+    - name: The tunnel health check must be installed, enabled and running on a timer
+      ansible.builtin.assert:
+        that:
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-tunnel-check'
+          - timer_task != {}
+          - timer_task.get('ansible.builtin.template', {}).get('dest', '') == '/etc/systemd/system/wg-tunnel-check.timer'
+          - enable_task != {}
+          - enable_task.get('ansible.builtin.systemd_service', {}).get('name', '') == 'wg-tunnel-check.timer'
+          - enable_task.get('ansible.builtin.systemd_service', {}).get('enabled', false) | bool
+          - recover_task != {}
+          - recover_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-recover'
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must install wg-tunnel-check to
+          /usr/local/sbin/wg-tunnel-check, install and enable
+          wg-tunnel-check.timer, and install wg-recover to
+          /usr/local/sbin/wg-recover. Found install={{ install_task != {} }},
+          timer={{ timer_task != {} }}, enable={{ enable_task != {} }},
+          recover={{ recover_task != {} }}.
+        success_msg: "wg-tunnel-check and wg-recover are installed and the check timer is enabled"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the tunnel health check script')
+             | first | default({}, true) }}
+        timer_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the tunnel health check timer')
+             | first | default({}, true) }}
+        enable_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Enable the tunnel health check timer')
+             | first | default({}, true) }}
+        recover_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the manual recovery script')
+             | first | default({}, true) }}
 
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the

@@ -503,3 +503,62 @@
   changed_when: true
   failed_when: false
   when: not ansible_check_mode
+
+# --- SELF-MONITORING AND MANUAL RECOVERY ---
+# Everything below is day-2 tooling, not part of the risky bring-up sequence
+# above, so it runs after the tunnel is already confirmed working rather than
+# interleaved with it.
+#
+# The rollback disabling both units, rather than stopping them, is correct -
+# see the note on "Arm the automatic rollback". What it does not do on its own
+# is tell anyone: a host recovered with `systemctl start` instead of
+# `enable --now` looks healthy right up until the next scheduled reboot starts
+# neither unit at all, which is how a rolled back tunnel ran silent for two
+# weeks the first time it happened. wg-tunnel-check exists to say so the same
+# day, not two weeks later.
+- name: Install the tunnel health check script
+  ansible.builtin.template:
+    src: wg-tunnel-check.j2
+    dest: /usr/local/sbin/wg-tunnel-check
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the tunnel health check service
+  ansible.builtin.template:
+    src: wg-tunnel-check.service.j2
+    dest: /etc/systemd/system/wg-tunnel-check.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install the tunnel health check timer
+  ansible.builtin.template:
+    src: wg-tunnel-check.timer.j2
+    dest: /etc/systemd/system/wg-tunnel-check.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+  register: wg_tunnel_check_timer
+
+- name: Enable the tunnel health check timer
+  ansible.builtin.systemd_service:
+    name: wg-tunnel-check.timer
+    enabled: true
+    state: "{{ 'restarted' if wg_tunnel_check_timer.changed else 'started' }}"
+    daemon_reload: true
+
+# The safe way to bring the tunnel back up by hand after a rollback -
+# `restart`, not `enable --now`, on wg-killswitch (Type=oneshot,
+# RemainAfterExit=yes means `start` on an already-active unit never re-runs
+# it), and its own rollback armed the same way tasks above do. See
+# wg-recover.j2 and docs/wireguard.md.
+- name: Install the manual recovery script
+  ansible.builtin.template:
+    src: wg-recover.j2
+    dest: /usr/local/sbin/wg-recover
+    owner: root
+    group: root
+    mode: "0755"

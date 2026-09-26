@@ -408,6 +408,21 @@ retreats to the pre-tunnel state rather than just dropping rules, so a reboot
 cannot re-apply what locked us out. `docs/wireguard.md` has the OPNsense side
 and the recovery procedure.
 
+**The rollback disabling both units, rather than stopping them, is invisible
+by design — nothing tells anyone it happened.** `wg-tunnel-check.timer` closes
+that: every `wg_tunnel_check_interval` it checks both units are enabled and
+active, is silent when they are, and logs to the journal and exits non-zero
+when they are not. Alloy already ships the whole journal and already scrapes
+`node_systemd_unit_state` (the systemd collector is on in `config.alloy.j2`),
+so a failed `wg-tunnel-check.service` is visible with no change to
+`roles/alloy` at all. `wg-recover` is the matching one-command manual fix, and
+it is not the same thing as `systemctl enable --now` on both units by hand:
+`wg-killswitch` is `Type=oneshot, RemainAfterExit=yes`, and systemd does not
+re-run a oneshot's `ExecStart` for `start`/`enable --now` on a unit it still
+considers active — which disabling a unit does not change. `wg-recover` uses
+`restart`, which always re-runs it, and arms its own short rollback first, the
+same shape as the play's own bring-up.
+
 **`[vpn]` hosts are isolated peers, not a LAN extension.** OPNsense has no
 route from one of these peers to another, or to the home LAN - the tunnel goes
 to OPNsense and stops there. Reaching the internet still works because
