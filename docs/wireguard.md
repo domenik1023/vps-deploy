@@ -457,6 +457,27 @@ earlier successful run, or the box rebooted into a broken state — use the
 provider's serial console and run those three commands by hand. They are the
 whole rollback; there is no other state to unwind.
 
+**The rollback disables both units — it does not just stop them.** That is
+deliberate: retreating all the way to "disabled" is what stops a reboot from
+re-applying the thing that locked the host out. It also means the recovery is
+not `systemctl start wg-quick@wg0` (or `wg-quick up wg0` by hand). Either of
+those brings the tunnel up, the host looks fine, and the boot symlink is never
+recreated — so the host runs for as long as you like and then loses the tunnel
+silently at the next reboot, with nothing in `journalctl -u wg-quick@wg0 -b` to
+say why, because the unit was never asked to start.
+
+Recover with `enable --now` on both, in this order — kill switch first, so the
+mangle rules and the `ip rule` exist before the default route moves again:
+
+```bash
+systemctl enable --now wg-killswitch
+systemctl enable --now wg-quick@wg0
+```
+
+A re-run of the play also fixes this — it sets `enabled: true` on both units —
+and will say so plainly if it finds either one disabled, rather than
+re-enabling it silently.
+
 Common causes, in the order they are worth checking:
 
 | symptom | cause |

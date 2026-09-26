@@ -343,6 +343,43 @@
   register: wg_killswitch_unit
   notify: Reload systemd
 
+# The rollback below disables both units rather than stopping them, so that a
+# reboot cannot re-apply the thing that locked the host out - see the note on
+# "Arm the automatic rollback". That is also the trap: bringing the tunnel
+# back up by hand with `systemctl start` or `wg-quick up` works fine and never
+# recreates the boot symlink, so the host runs for weeks looking healthy and
+# then loses the tunnel silently at the next reboot, with nothing in
+# `journalctl -u wg-quick@{{ wg_interface }} -b` to explain why - the unit was
+# never asked to start.
+#
+# "Apply the kill switch" and "Bring up the tunnel" below both already set
+# `enabled: true` and will repair this. The point of checking here, first, is
+# to say so - a run against a rolled-back host should be visibly different
+# from an ordinary one, not indistinguishable from it.
+- name: Check whether a rollback previously disabled the tunnel units
+  ansible.builtin.command:
+    argv: [systemctl, is-enabled, "{{ item }}"]
+  loop:
+    - "wg-quick@{{ wg_interface }}"
+    - wg-killswitch
+  register: wg_rollback_check
+  changed_when: false
+  failed_when: false
+
+- name: Report a host that a rollback left disabled
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item }} is disabled on {{ inventory_hostname }}. This run will
+      enable and restart it, but that is what the automatic rollback leaves
+      behind when it fires - see "If it goes wrong" in docs/wireguard.md.
+      Bringing the tunnel up by hand since then (`systemctl start` or
+      `wg-quick up`) would have looked fine while quietly losing the tunnel
+      again at the next reboot.
+  loop: "{{ wg_rollback_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout | trim == 'disabled'
+
 # A run that armed the timer and then failed before cancelling it leaves the
 # unit behind, and systemd-run refuses to reuse a name that is still there -
 # stopped or failed. Clear both, or every subsequent run arms nothing and

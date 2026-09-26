@@ -742,6 +742,58 @@
                     '../roles/wireguard/templates/wg.conf.j2',
                     template_vars=wg_conf_vars) }}
 
+    # A rollback disables wg-quick@<iface> and wg-killswitch on purpose, so a
+    # reboot cannot re-apply what locked the host out - see docs/wireguard.md.
+    # "Apply the kill switch" and "Bring up the tunnel" both already repair
+    # that by setting enabled: true, so this is not about whether the host
+    # ends up correct - it always would. It is about whether a run against a
+    # rolled-back host says so, instead of looking identical to an ordinary
+    # run: that silence is exactly what let a rolled-back tunnel run for two
+    # weeks on both [vpn] hosts before anyone noticed, because bringing it up
+    # by hand with `systemctl start` looks fine and never recreates the boot
+    # symlink.
+    - name: A rollback-disabled tunnel or kill switch must be reported before it is silently re-enabled
+      ansible.builtin.assert:
+        that:
+          - at.check >= 0
+          - check_argv[:2] == ['systemctl', 'is-enabled']
+          - check_loop | select('search', '^wg-quick@') | list | length == 1
+          - check_loop | select('equalto', 'wg-killswitch') | list | length == 1
+          - report_task != {}
+          - report_when is search('disabled')
+          - at.check < at.apply_killswitch
+          - at.check < at.bring_up
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must check `systemctl is-enabled`
+          on both wg-quick@{{ '{{ wg_interface }}' }} and wg-killswitch, and
+          report one that comes back disabled, before either "Apply the kill
+          switch" or "Bring up the tunnel" re-enables it. Task indices
+          (-1/9999 mean missing): check={{ at.check }},
+          apply_killswitch={{ at.apply_killswitch }}, bring_up={{ at.bring_up }}.
+        success_msg: "a rolled-back tunnel or kill switch is detected and reported before either is re-enabled"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        n_check: Check whether a rollback previously disabled the tunnel units
+        n_report: Report a host that a rollback left disabled
+        n_apply_killswitch: Apply the kill switch
+        n_bring_up: Bring up the tunnel
+        check_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', n_check) | first | default({}, true) }}
+        # .get() with the key spelled out, never map(attribute='a.b.c') -
+        # Jinja reads the dots as nested access and would quietly find nothing.
+        check_argv: "{{ check_task.get('ansible.builtin.command', {}).get('argv', []) }}"
+        check_loop: "{{ check_task.get('loop', []) }}"
+        report_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', n_report) | first | default({}, true) }}
+        report_when: "{{ report_task.get('when', '') }}"
+        at:
+          check: "{{ names.index(n_check) if n_check in names else -1 }}"
+          apply_killswitch: "{{ names.index(n_apply_killswitch) if n_apply_killswitch in names else 9999 }}"
+          bring_up: "{{ names.index(n_bring_up) if n_bring_up in names else 9999 }}"
+
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the
       # string "['docker', 'exec', ...]" and every delegated command breaks with
