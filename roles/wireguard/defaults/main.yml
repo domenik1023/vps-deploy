@@ -189,6 +189,17 @@ wg_killswitch_mark: "0x40000"
 # and wg-quick's rule won the race. There is no fixed number wg-quick is
 # guaranteed to use, so this sits far below both the documented default and
 # the observed real one instead of trying to track wherever wg-quick lands.
+#
+# Not only about SSH replies, either. wg-quick's rule is an unmasked
+# inequality against its own exact fwmark, and WireGuard's own re-keys and
+# keepalives carry exactly that mark - until CONNMARK --restore-mark ORs the
+# kill switch's bit onto one of them, once anything on that flow has been
+# marked. The bit is masked so it cannot clear wg-quick's mark, but OR-ing it
+# in still changes the value away from the exact one wg-quick's rule requires,
+# which fails that match the same way clearing would. Get the priority wrong
+# and the symptom is not an SSH hang - it is `wg show` reporting one completed
+# handshake and then nothing ever again, which reads like a problem on the
+# WireGuard server and is not one. See CLAUDE.md.
 wg_killswitch_rule_priority: 100
 
 # Let DNS out of the public interface even when the tunnel is down.

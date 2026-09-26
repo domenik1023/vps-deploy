@@ -321,6 +321,33 @@ not set one. The mask matters separately: wg-quick sets its fwmark on the
 encrypted packets it sends, and an unmasked `CONNMARK --restore-mark` clears
 it, routing the tunnel's own traffic back into the tunnel.
 
+**Masking stops the mark being cleared, but `wg_killswitch_rule_priority` is
+what stops it mattering, and that also protects traffic the paragraphs above
+don't mention.** wg-quick's `not fwmark <t> table <t>` rule carries no mask of
+its own — it is a plain inequality against the exact value `<t>` it derived at
+startup. WireGuard sets that exact value on every packet its kernel module
+sends, handshake and keepalive traffic included, for as long as no reply has
+been marked yet on that flow. The moment one has — an inbound SSH reply is one
+way, but so is the WireGuard server's own reply during the handshake — every
+later packet on that flow picks up the kill switch's bit via
+`CONNMARK --restore-mark` on top of whatever WireGuard already set, and the
+mark stops being exactly `<t>`. Masking only guarantees that OR does not erase
+wg-quick's bits; it does not stop the *sum* from failing wg-quick's exact
+match, and a sum that fails it is routed into the tunnel exactly like a
+cleared one would be. Confirmed against a real kernel: a packet marked with
+only the kill switch bit and one marked with the kill switch bit OR'd onto
+wg-quick's own land on the same interface at either priority, because the kill
+switch's rule is a masked bit check and wg-quick's is an unmasked inequality —
+neither inspects the other's bits, so whichever rule sits at the lower
+priority number decides both cases identically. That is why
+`wg_killswitch_rule_priority` sitting below wg-quick's own rule is not only
+about SSH: get it wrong and the tunnel's own re-keys and keepalives loop into
+itself the same way a reply would, and the signature is different enough to
+send you looking at the wrong end of the tunnel — `wg show` reports one
+completed handshake and then nothing, ever again: no rekeys, no keepalives, no
+traffic. That reads exactly like a problem on the WireGuard server, and is not
+one.
+
 **There is a second, dumber rule keeping SSH alive**: `tcp --sport <ssh_port>`
 returns before the final `DROP`, matching on port alone with no conntrack and
 no `ip rule` involved. It is what still holds if the mangle half is wrong, and
