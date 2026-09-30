@@ -42,6 +42,7 @@
     killswitch_template: ../roles/wireguard/templates/wg-killswitch.j2
     wg_recover_template: ../roles/wireguard/templates/wg-recover.j2
     wg_tunnel_check_template: ../roles/wireguard/templates/wg-tunnel-check.j2
+    wg_rollback_now_template: ../roles/wireguard/templates/wg-rollback-now.j2
 
     # The [lapi] group, read out of the inventory rather than named here, so
     # adding a second delegation-only host does not need a change below.
@@ -842,6 +843,53 @@
           wg_interface: wg0
           wg_rollback_delay: 5min
 
+    # The automatic rollback (tasks/tunnel.yml) and the manual one (wg-recover)
+    # used to each spell out "disable both units, then wg-killswitch off"
+    # inline, and a change to one while forgetting the other would have been
+    # silent until the day it mattered. Both now call the same installed
+    # script, so there is exactly one place that knows what "revert" means.
+    - name: The automatic and manual rollbacks must share one script, not duplicate it
+      ansible.builtin.assert:
+        that:
+          - rollback_now_rendered is search('systemctl disable --now "wg-quick@wg0"')
+          - rollback_now_rendered is search('systemctl disable --now wg-killswitch')
+          - rollback_now_rendered is search('wg-killswitch off')
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-rollback-now'
+          - at.install >= 0
+          - at.install < at.arm
+          - "'/usr/local/sbin/wg-rollback-now' in arm_task.get('ansible.builtin.command', {}).get('argv', [])"
+          - recover_rendered is search('wg-rollback-now')
+          - recover_rendered is not search('disable --now')
+        fail_msg: >-
+          wg-rollback-now must be installed (found
+          {{ 'yes' if install_task != {} else 'NO' }}) before "Arm the
+          automatic rollback" runs it (install at {{ at.install }}, arm at
+          {{ at.arm }}), and wg-recover.j2 must invoke the same script rather
+          than duplicating `disable --now` inline - a fix applied to only one
+          of the two would silently not apply to the other.
+        success_msg: "the automatic and manual rollbacks both call the one shared script"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        rollback_now_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_rollback_now_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the rollback script')
+             | first | default({}, true) }}
+        arm_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Arm the automatic rollback')
+             | first | default({}, true) }}
+        at:
+          install: "{{ names.index('Install the rollback script') if 'Install the rollback script' in names else -1 }}"
+          arm: "{{ names.index('Arm the automatic rollback') if 'Arm the automatic rollback' in names else 9999 }}"
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars={'wg_interface': 'wg0', 'wg_rollback_delay': '5min'}) }}
+
     # The whole point of this script is to say something instead of letting a
     # rolled-back tunnel run silent until the next scheduled reboot - so it has
     # to actually check both units, and it has to fail (exit non-zero) when
@@ -907,6 +955,46 @@
         recover_task: >-
           {{ wg_tasks | selectattr('name', 'equalto', 'Install the manual recovery script')
              | first | default({}, true) }}
+
+    # "Bring up the tunnel" moves the default route as a side effect of the
+    # very systemctl command Ansible is waiting on a reply to, over the
+    # connection that command is about to disrupt - a lost reply then reports
+    # the task failed even when the tunnel came up fine. async + poll: 0 stops
+    # this task waiting for that reply at all; "Wait for the host to answer"
+    # right after it is what actually needs the connection back, and it
+    # already retries a fresh one for up to 60s rather than assuming the one
+    # already open survives.
+    - name: Bring up the tunnel must not wait on the connection it disrupts
+      ansible.builtin.assert:
+        that:
+          - bringup_task != {}
+          - "'async' in bringup_task"
+          - bringup_task.get('async', '') | string | length > 0
+          - bringup_task.get('poll', 1) | int == 0
+          - at.bringup >= 0
+          - at.bringup < at.wait
+        fail_msg: >-
+          "Bring up the tunnel" must set async (a positive number of seconds)
+          and poll: 0, and must come before "Wait for the host to answer with
+          the tunnel up" - found async={{ bringup_task.get('async', 'unset') }}
+          poll={{ bringup_task.get('poll', 'unset') }},
+          bringup at {{ at.bringup }}, wait at {{ at.wait }}. Waiting
+          synchronously on this task's own reply is exactly what let a route
+          change disrupt the SSH connection its own acknowledgement needed.
+        success_msg: "Bring up the tunnel fires async and does not wait on its own disruption"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        bringup_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Bring up the tunnel')
+             | first | default({}, true) }}
+        at:
+          bringup: "{{ names.index('Bring up the tunnel') if 'Bring up the tunnel' in names else -1 }}"
+          wait: >-
+            {{ names.index('Wait for the host to answer with the tunnel up')
+               if 'Wait for the host to answer with the tunnel up' in names else 9999 }}
 
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the

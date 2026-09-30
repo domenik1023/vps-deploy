@@ -343,6 +343,17 @@
   register: wg_killswitch_unit
   notify: Reload systemd
 
+# The one script that knows how to revert to the pre-tunnel state, shared by
+# the automatic rollback armed below and by wg-recover (installed further
+# down) - see wg-rollback-now.j2. Installed here, before either caller can run.
+- name: Install the rollback script
+  ansible.builtin.template:
+    src: wg-rollback-now.j2
+    dest: /usr/local/sbin/wg-rollback-now
+    owner: root
+    group: root
+    mode: "0755"
+
 # The rollback below disables both units rather than stopping them, so that a
 # reboot cannot re-apply the thing that locked the host out - see the note on
 # "Arm the automatic rollback". That is also the trap: bringing the tunnel
@@ -416,12 +427,7 @@
       - systemd-run
       - "--on-active={{ wg_rollback_delay }}"
       - "--unit=wg-rollback"
-      - /bin/bash
-      - -c
-      - >-
-        systemctl disable --now wg-quick@{{ wg_interface }};
-        systemctl disable --now wg-killswitch;
-        /usr/local/sbin/wg-killswitch off
+      - /usr/local/sbin/wg-rollback-now
   changed_when: true
   when: not ansible_check_mode
 
@@ -445,12 +451,31 @@
 # wg-quick's own unit reads the config once, at start. A changed config needs a
 # restart rather than a reload, and restarting it is what moves the default
 # route on the very first run.
+#
+# Fired async, poll: 0 - deliberately not waited on. This command's own side
+# effect is what disrupts the SSH connection carrying it: the moment
+# `systemctl start` moves the default route, the acknowledgement this task is
+# waiting for can be lost in that exact transition, and a synchronous call has
+# no way to tell "the command succeeded but the reply didn't make it back"
+# apart from "the command failed" - so it reports the task failed even when
+# the tunnel came up fine. Firing it and not waiting for a reply over the
+# connection it is about to move sidesteps the race entirely. The task below
+# is what actually needs the connection back, and it already retries a fresh
+# one for up to 60s rather than assuming the one already open survives.
+#
+# This does mean a genuine failure to start - bad config, wg-quick erroring
+# out - is not reported here. It still surfaces: no interface means no
+# handshake, and "The tunnel must have handshaked before the rollback is
+# cancelled" below fails exactly as it would have otherwise, with the rollback
+# already armed either way.
 - name: Bring up the tunnel
   ansible.builtin.systemd_service:
     name: "wg-quick@{{ wg_interface }}"
     enabled: true
     state: "{{ 'restarted' if wg_conf.changed else 'started' }}"
     daemon_reload: true
+  async: "{{ wg_bringup_async_timeout }}"
+  poll: 0
 
 - name: Wait for the host to answer with the tunnel up
   ansible.builtin.wait_for_connection:

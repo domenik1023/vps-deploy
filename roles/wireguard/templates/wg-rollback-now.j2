@@ -1,0 +1,19 @@
+#!/bin/bash
+# Managed by Ansible - roles/wireguard/templates/wg-rollback-now.j2. Local
+# edits are overwritten on the next run.
+#
+# The actual "revert to the pre-tunnel state": disable (not just stop) both
+# units, so a reboot cannot re-apply what locked the host out, then tear down
+# the kill switch's rules. See docs/wireguard.md.
+#
+# Shared so its two callers cannot drift apart - they used to each spell this
+# out inline, and a change to one while forgetting the other would have been
+# silent until the day it mattered:
+#
+#   the automatic rollback armed in roles/wireguard/tasks/tunnel.yml, before
+#   the default route moves, with `systemd-run --on-active`;
+#   wg-recover, which arms the same thing by hand before a manual recovery.
+set -euo pipefail
+systemctl disable --now "wg-quick@{{ wg_interface }}"
+systemctl disable --now wg-killswitch
+/usr/local/sbin/wg-killswitch off

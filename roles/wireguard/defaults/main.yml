@@ -221,3 +221,12 @@ wg_rollback_delay: 5min
 # back host is noticed and how much journal/systemd noise a passing check
 # produces (none: it is silent unless something is actually wrong).
 wg_tunnel_check_interval: 5min
+
+# Ceiling, in seconds, for "Bring up the tunnel" - fired with async/poll: 0,
+# not waited on synchronously, because moving the default route is a side
+# effect of that same command and can disrupt the SSH connection the
+# acknowledgement needs to travel back over. `wg-quick up` normally takes a
+# couple of seconds; this only bounds how long the remote-side job tracking
+# sticks around, since poll: 0 never checks on it. An integer, not a
+# duration string like wg_rollback_delay - Ansible's `async` takes seconds.
+wg_bringup_async_timeout: 60

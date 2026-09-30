@@ -18,7 +18,9 @@
 #   - bringing the tunnel up with no rollback armed means a tunnel that never
 #     handshakes locks you out with nothing to undo it. This arms one anyway,
 #     the same way roles/wireguard/tasks/tunnel.yml does, and cancels it only
-#     once a real handshake shows up.
+#     once a real handshake shows up. It runs /usr/local/sbin/wg-rollback-now,
+#     the same script the automatic rollback uses, so the two cannot drift
+#     apart - see wg-rollback-now.j2.
 set -euo pipefail
 
 WG_UNIT='wg-quick@{{ wg_interface }}'
@@ -29,10 +31,7 @@ ROLLBACK_UNIT='wg-manual-recover'
 echo "Arming a rollback in $DELAY in case this does not come back."
 systemctl reset-failed "$ROLLBACK_UNIT.timer" "$ROLLBACK_UNIT.service" >/dev/null 2>&1 || true
 systemctl stop "$ROLLBACK_UNIT.timer" >/dev/null 2>&1 || true
-systemd-run --on-active="$DELAY" --unit="$ROLLBACK_UNIT" /bin/bash -c "
-    systemctl disable --now '$WG_UNIT';
-    systemctl disable --now '$KS_UNIT';
-    /usr/local/sbin/wg-killswitch off"
+systemd-run --on-active="$DELAY" --unit="$ROLLBACK_UNIT" /usr/local/sbin/wg-rollback-now
 
 echo "Restarting $KS_UNIT."
 systemctl enable "$KS_UNIT"

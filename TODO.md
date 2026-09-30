@@ -32,17 +32,21 @@ Automating it removes the two failure modes that cost the most time — a peer
 saved but never applied, and a peer registered but never granted access by a
 firewall rule. See `docs/opnsense-firewall.md` and `docs/wireguard.md`.
 
-## Make "Bring up the tunnel" resilient
+## ~~Make "Bring up the tunnel" resilient~~ — done
 
 `roles/wireguard/tasks/tunnel.yml`, the `Bring up the tunnel` task. Restarting
 `wg-quick@wg0` moves the default route while Ansible is mid-connection, and the
-privilege escalation prompt can be cut off by the change it is causing:
+privilege escalation prompt (or the task's own acknowledgement) could be cut
+off by the change it is causing:
 
 ```
 [ERROR]: Task failed: Timeout (12s) waiting for privilege escalation prompt:
 Origin: roles/wireguard/tasks/tunnel.yml:411:3
 ```
 
-The rollback timer covers the lockout case, but the run still fails on a tunnel
-that came up correctly. Needs a longer escalation timeout, an async start, or
-both.
+Fixed with `async: {{ wg_bringup_async_timeout }}` / `poll: 0` on that task, so
+it no longer waits synchronously for a reply over the connection its own side
+effect is about to disrupt. "Wait for the host to answer with the tunnel up",
+right after it, is what actually needs the connection back, and it already
+retries a fresh one for up to 60s. `tests/render-check.yml` asserts both
+settings are present and that this task precedes the wait.

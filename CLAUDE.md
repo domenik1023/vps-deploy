@@ -416,6 +416,20 @@ retreats to the pre-tunnel state rather than just dropping rules, so a reboot
 cannot re-apply what locked us out. `docs/wireguard.md` has the OPNsense side
 and the recovery procedure.
 
+**"Bring up the tunnel" does not wait for its own reply.** `systemctl start
+wg-quick@{{ wg_interface }}` moves the default route as a side effect of the
+very command Ansible is waiting on an acknowledgement for, over the connection
+that move is about to disrupt — a lost reply reports the task failed even when
+the tunnel came up fine, indistinguishable from an actual failure without
+digging into `journalctl` by hand. The task is fired with `async:
+{{ wg_bringup_async_timeout }}` / `poll: 0` so it never waits on that reply at
+all; "Wait for the host to answer with the tunnel up", immediately after it,
+is what actually needs the connection back, and it already retries a fresh one
+for up to 60s rather than assuming the one already open survives. A genuine
+failure to start still surfaces downstream: no interface means no handshake,
+and the assert a few tasks later fails exactly as it would have otherwise,
+with the rollback already armed either way.
+
 **The rollback disabling both units, rather than stopping them, is invisible
 by design — nothing tells anyone it happened.** `wg-tunnel-check.timer` closes
 that: every `wg_tunnel_check_interval` it checks both units are enabled and
