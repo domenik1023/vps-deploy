@@ -32,3 +32,4 @@
   notify:
     - Restart CrowdSec bouncer
     - Restart WireGuard kill switch
+    - Re-position the kill switch's SSH rule below the tunnel's own

@@ -452,30 +452,45 @@
 # restart rather than a reload, and restarting it is what moves the default
 # route on the very first run.
 #
-# Fired async, poll: 0 - deliberately not waited on. This command's own side
-# effect is what disrupts the SSH connection carrying it: the moment
-# `systemctl start` moves the default route, the acknowledgement this task is
-# waiting for can be lost in that exact transition, and a synchronous call has
-# no way to tell "the command succeeded but the reply didn't make it back"
-# apart from "the command failed" - so it reports the task failed even when
-# the tunnel came up fine. Firing it and not waiting for a reply over the
-# connection it is about to move sidesteps the race entirely. The task below
-# is what actually needs the connection back, and it already retries a fresh
-# one for up to 60s rather than assuming the one already open survives.
+# Bundled with `wg-killswitch fix-route` in the same remote command,
+# deliberately not two Ansible tasks. wg-quick adds its own two `ip rule`
+# entries with no explicit priority, and the kernel's rule for that is
+# (lowest priority currently in use) - 1 - not a fixed number, and lower than
+# whatever the kill switch's SSH rule already held, every time. See
+# wg-killswitch.j2's header for the full mechanism. The only stable fix is to
+# let wg-quick run first against nothing of ours in its way, then read where
+# it actually landed and sit below that - which has to happen immediately
+# after `systemctl start` succeeds, in the same shell, because a *second*
+# Ansible task here would need its own SSH round trip on a connection that
+# may already be mid-transition.
+#
+# The whole thing is fired async, poll: 0 - deliberately not waited on. The
+# route move is this command's own side effect, and the acknowledgement this
+# task would otherwise wait for can be lost in that exact transition; a
+# synchronous call has no way to tell "it worked but the reply didn't make it
+# back" apart from "it failed", so it would report the task failed even when
+# the tunnel came up fine. The task below is what actually needs the
+# connection back, and it already retries a fresh one for up to 60s rather
+# than assuming the one already open survives.
 #
 # This does mean a genuine failure to start - bad config, wg-quick erroring
 # out - is not reported here. It still surfaces: no interface means no
 # handshake, and "The tunnel must have handshaked before the rollback is
 # cancelled" below fails exactly as it would have otherwise, with the rollback
 # already armed either way.
-- name: Bring up the tunnel
-  ansible.builtin.systemd_service:
-    name: "wg-quick@{{ wg_interface }}"
-    enabled: true
-    state: "{{ 'restarted' if wg_conf.changed else 'started' }}"
-    daemon_reload: true
+- name: Bring up the tunnel and position the kill switch's SSH rule below it
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - >-
+        systemctl daemon-reload &&
+        systemctl enable wg-quick@{{ wg_interface }} &&
+        systemctl {{ 'restart' if wg_conf.changed else 'start' }} wg-quick@{{ wg_interface }} &&
+        /usr/local/sbin/wg-killswitch fix-route
   async: "{{ wg_bringup_async_timeout }}"
   poll: 0
+  changed_when: true
 
 - name: Wait for the host to answer with the tunnel up
   ansible.builtin.wait_for_connection:

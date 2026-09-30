@@ -41,6 +41,13 @@ echo "Restarting $WG_UNIT."
 systemctl enable "$WG_UNIT"
 systemctl restart "$WG_UNIT"
 
+# Must come after the restart above, never before - wg-quick's own ip rules
+# get a kernel-assigned priority of (whatever is currently lowest) - 1, so
+# the kill switch's SSH rule has to be positioned against wg-quick's *actual*
+# result, not a guess made before wg-quick ran. See wg-killswitch.j2.
+echo "Positioning the kill switch's SSH rule below the tunnel's own."
+/usr/local/sbin/wg-killswitch fix-route
+
 echo "Waiting for a handshake..."
 for _ in $(seq 1 24); do
     sleep 5

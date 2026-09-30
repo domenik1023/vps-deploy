@@ -2,8 +2,10 @@
 # Managed by Ansible - roles/wireguard/templates/wg-killswitch.j2. Local edits
 # are overwritten on the next run.
 #
-#   wg-killswitch on    install the rules
-#   wg-killswitch off   remove them
+#   wg-killswitch on          install the filter/DROP rules
+#   wg-killswitch off         remove them
+#   wg-killswitch fix-route   (re)position the SSH routing rule - see below;
+#                             must run after `wg-quick up`, never before
 #
 # Nothing leaves {{ wg_wan_interface_resolved }} except the tunnel's own
 # packets and the exceptions listed under "the host itself" below. Everything
@@ -17,7 +19,8 @@
 #             table instead of the tunnel's, by source port alone. Without it,
 #             replies to an inbound SSH connection would be routed into the
 #             tunnel and the session would hang the instant the default route
-#             moved.
+#             moved. Installed by `fix-route`, not `on` - see below for why
+#             that split is load-bearing, not stylistic.
 #   filter    OUTPUT covers traffic the host originates.
 #   filter    DOCKER-USER covers containers. They are forwarded traffic, and
 #             Docker's own FORWARD jumps run ahead of ufw's, so a rule in
@@ -36,11 +39,11 @@
 # CrowdSec bouncer.
 #
 # SSH is the only thing on these hosts that accepts inbound internet
-# connections, so it is handled with a static `ip rule` matched on the SSH
-# port alone - no packet marking, no conntrack, nothing that depends on
-# catching the connection's first inbound packet. An earlier version of this
-# script used CONNMARK to mark inbound-then-reply traffic generically, but
-# that mechanism collides with wg-quick's own fwmark: wg-quick's own
+# connections, so it is handled with an `ip rule` matched on the SSH port
+# alone - no packet marking, no conntrack, nothing that depends on catching
+# the connection's first inbound packet. An earlier version of this script
+# used CONNMARK to mark inbound-then-reply traffic generically, but that
+# mechanism collides with wg-quick's own fwmark: wg-quick's own
 # `not fwmark <t> table <t>` rule is an *unmasked* exact match, so ANY bit
 # added to a packet already carrying wg-quick's fwmark - correctly masked or
 # not - changes the value away from the one that rule requires, which routes
@@ -48,11 +51,31 @@
 # that flow got marked. See CLAUDE.md's "WireGuard on [vpn] hosts" section.
 # The sport-based rule has none of that: it matches the packet's own header,
 # not a mark that has to survive being combined with something else's.
+#
+# That rule's PRIORITY is not a fixed number, and cannot be. wg-quick adds its
+# own two rules (`not fwmark <t> table <t>` and `table main
+# suppress_prefixlength 0`) with no `priority` argument at all, and the
+# kernel's rule for "no priority given" is not 32764/32765 or any other fixed
+# value - it is (lowest priority currently in use) - 1, for each rule added,
+# in order. That makes a static priority for our own rule inherently racy:
+# whatever number is installed *before* wg-quick runs is exactly what
+# wg-quick's own rules land one (and two) below, every single time. This is
+# not hypothetical - it is what CLAUDE.md's priority history (32764 assumed,
+# then 30000 observed as insufficient, then 100) actually was: every fix was a
+# real number that briefly worked and then got undercut, because the fix
+# itself was what wg-quick was undercutting.
+#
+# The only stable order is to go last: `fix-route` deletes our own rule
+# first - so it cannot be the floor wg-quick reacts to - then, once
+# `wg-quick up` has already run and installed whatever it is going to, reads
+# `ip rule show` and installs our rule one below the actual result. This must
+# never run before `wg-quick up`; roles/wireguard/tasks/tunnel.yml calls it
+# immediately after, in the same command, so there is no gap where SSH's
+# reply has nothing to route it out correctly.
 set -euo pipefail
 
 WAN='{{ wg_wan_interface_resolved }}'
 WG_IF='{{ wg_interface }}'
-PRIO='{{ wg_killswitch_rule_priority }}'
 SSH_PORT='{{ ssh_port }}'
 WG_PORT='{{ wg_peer_endpoint.rsplit(":", 1)[1] }}'
 
@@ -131,28 +154,34 @@ remove_old_mark_mechanism() {
     while ip -"$fam" rule del fwmark "$OLD_MARK/$OLD_MARK" table main 2>/dev/null; do :; done
 }
 
+# (Re)installs the SSH routing rule at a priority one below whatever is
+# currently the lowest `ip rule` entry - see the header comment for why this
+# has to be computed at run time instead of configured as a fixed number, and
+# why this function must only ever be called after `wg-quick up`.
+#
+# Excludes 0 (kernel's own "local"), 32766 ("main") and 32767 ("default") -
+# those are always present and are not what this needs to stay below; the
+# thing that matters is wg-quick's own two rules, whatever priority the
+# kernel gave them.
+fix_route() {
+    local fam=$1
+    while ip -"$fam" rule del ipproto tcp sport "$SSH_PORT" table main 2>/dev/null; do :; done
+    local lowest
+    lowest=$(ip -"$fam" rule show | awk -F: '$1 !~ /^(0|32766|32767)$/ {print $1}' | sort -n | head -1)
+    if [ -z "$lowest" ]; then
+        # Nothing else here yet - wg-quick has not run, or added nothing for
+        # this family (no v6 tunnel). The default route is still the ordinary
+        # one, so SSH does not need help escaping and there is nothing to
+        # position below; a plain host route is enough on its own.
+        return 0
+    fi
+    ip -"$fam" rule add ipproto tcp sport "$SSH_PORT" table main priority "$((lowest - 1))"
+}
+
 build() {
     local ipt=$1 fam=$2
 
     remove_old_mark_mechanism "$ipt" "$fam"
-
-    # SSH replies leave via the main routing table, where the public interface
-    # still holds a default route, instead of wg-quick's tunnel table. Matched
-    # on source port alone - no conntrack, no packet mark, so it works for the
-    # very first reply on a brand new connection exactly as well as a
-    # long-lived one, and it cannot be perturbed by anything else that touches
-    # marks. Priority must be below (checked before) whatever wg-quick actually
-    # installs, which is not reliably 32764/32765 - see
-    # wg_killswitch_rule_priority in defaults/main.yml for what a real
-    # deployment showed.
-    #
-    # The delete matches on port and protocol alone, deliberately, and loops -
-    # same reasoning as the old mark-based rule this replaced: a rule left at
-    # an *other* priority by an earlier version of this script, or an earlier
-    # wg_killswitch_rule_priority, has to go too, or a priority change does not
-    # actually take effect.
-    while ip -"$fam" rule del ipproto tcp sport "$SSH_PORT" table main 2>/dev/null; do :; done
-    ip -"$fam" rule add ipproto tcp sport "$SSH_PORT" table main priority "$PRIO"
 {% if wg_mss_clamp %}
 
     # --- mangle FORWARD: MSS clamping for forwarded traffic ---
@@ -259,8 +288,10 @@ teardown() {
     remove_chain "$ipt" filter "$OUT_CHAIN"
     remove_chain "$ipt" filter "$FWD_CHAIN"
 
-    # By port, not by priority - same reason as in build(): a rule left at an
-    # earlier value of wg_killswitch_rule_priority has to go too.
+    # By selector (protocol and port), not by priority - fix_route() computes
+    # the priority fresh every time it runs, so there is no fixed value to
+    # match against, and a rule from any priority this script has ever used
+    # has to go.
     while ip -"$fam" rule del ipproto tcp sport "$SSH_PORT" table main 2>/dev/null; do :; done
 }
 
@@ -283,8 +314,14 @@ case "${1:-}" in
             teardown ip6tables 6
         fi
         ;;
+    fix-route)
+        fix_route 4
+        if family_usable ip6tables 6; then
+            fix_route 6
+        fi
+        ;;
     *)
-        echo "usage: $(basename "$0") on|off" >&2
+        echo "usage: $(basename "$0") on|off|fix-route" >&2
         exit 2
         ;;
 esac

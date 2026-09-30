@@ -274,45 +274,58 @@ breaks inbound connections: a packet arriving on the public interface is
 answered by a reply that gets routed into the tunnel, and the session hangs the
 instant the route moves.
 
-**The actual priority numbers wg-quick picks are not fixed.** This repo
-originally assumed `32764`/`32765`, from upstream's documented default — a
-real deployment (`vpn-gwdg-01`) showed wg-quick installing them at
-`29998`/`29999` instead. That is *above* a kill switch rule at `30000`, which
-silently defeats the whole mechanism: the mark gets set and restored
-correctly (visible as nonzero counters on both mangle chains), and the packet
-still goes into the tunnel, because `ip rule` is evaluated lowest-number-first
-and wg-quick's rule wins the race. Check `ip rule` on any new deployment
-rather than trusting either number.
+**wg-quick does not pick a priority for those two rules at all - it adds them
+with no `priority` argument, and the kernel decides.** The kernel's rule for
+"no priority given" is `(the lowest priority currently in use) - 1`, computed
+fresh each time. This repo spent three different fixed numbers on the kill
+switch's own rule before finding that out: `32764`/`32765` (upstream's
+documented default, never actually observed), `30000` (a real deployment
+showed wg-quick landing one below it, at `29999`), then `100`. None of those
+were wg-quick "picking" a number near ours by coincidence - each was wg-quick
+undercutting whatever this repo's *own* rule already held, by exactly one,
+because that rule existed before `wg-quick up` ran. This happened again live,
+at the `100` default, on `vpn-gwdg-01`: `ip rule show` mid-incident read
+wg-quick's rules at `98` and `99`, the kill switch's at `100` - one *above*,
+meaning it was never reached. **A fixed priority for the kill switch's own
+rule cannot work, at any value.**
 
-The fix is a rule of our own, at a priority chosen to sit below either number
-rather than trust a fixed assumption:
+The fix inverts the order. `wg-killswitch fix-route` runs *after*
+`wg-quick up`, reads where wg-quick's rules actually landed from `ip rule
+show`, and installs the SSH rule one below the real result:
 
 ```
-ip rule add ipproto tcp sport <ssh_port> table main priority {{ wg_killswitch_rule_priority }}
+ip rule add ipproto tcp sport <ssh_port> table main priority <lowest other rule - 1>
 ```
 
-(100 by default), which is consulted before wg-quick's rules and sends SSH's
-own traffic back out the public interface, matched purely on the packet's
-source port.
+computed at run time, every time - `wg_killswitch_rule_priority` is gone,
+there is nothing left to configure. This only works run *after* wg-quick, and
+`roles/wireguard/tasks/tunnel.yml` calls it in the same remote command as
+`systemctl start wg-quick@…`, immediately after, rather than as a separate
+Ansible task - a second task would need its own SSH round trip on a
+connection that may still be mid-transition. `wg-recover` and the
+`Reload UFW` → kill switch restart handler chain both call it too, for the
+same reason: restarting either unit deletes the SSH rule (`wg-killswitch off`
+runs first either way) and nothing else puts it back.
 
-**An earlier version of this used packet marking instead** — `mangle
-PREROUTING` marked every connection arriving on the public interface, `mangle
-OUTPUT` restored that mark onto replies, and the `ip rule` matched the mark
-rather than the port. It was replaced because it interacted badly with
-wg-quick's own fwmark: wg-quick's rule above is an *unmasked exact match*
-against `0xca6c` (or whatever table number it actually picked), and WireGuard's
-own re-keys and keepalives carry exactly that value — until the connmark
-mechanism OR'd the kill switch's bit onto one of them, at which point the
-value stopped being exactly `0xca6c` and wg-quick's rule swept the tunnel's own
-traffic into itself. Masking the kill switch's bit stopped it from *clearing*
-wg-quick's mark, but did nothing about *adding* one — either way the value
-changes, and either way that rule's exact match fails. The symptom was not an
-SSH hang: `wg show` reported one completed handshake and then silence, forever,
-which reads like a problem on the WireGuard server and is not one. The
-sport-based rule above has no mark to combine with anything — it reads the
-packet's own TCP header, so there is nothing left for wg-quick's fwmark to
-collide with. See CLAUDE.md's "WireGuard on `[vpn]` hosts" section for the
-fuller history.
+**An earlier version of this used packet marking instead of a routing rule at
+all** — `mangle PREROUTING` marked every connection arriving on the public
+interface, `mangle OUTPUT` restored that mark onto replies, and the `ip rule`
+matched the mark rather than the port. It was replaced because it interacted
+badly with wg-quick's own fwmark: wg-quick's rule above is an *unmasked exact
+match* against `0xca6c` (or whatever table number it actually picked), and
+WireGuard's own re-keys and keepalives carry exactly that value — until the
+connmark mechanism OR'd the kill switch's bit onto one of them, at which point
+the value stopped being exactly `0xca6c` and wg-quick's rule swept the
+tunnel's own traffic into itself. Masking the kill switch's bit stopped it
+from *clearing* wg-quick's mark, but did nothing about *adding* one — either
+way the value changes, and either way that rule's exact match fails. The
+symptom was not an SSH hang: `wg show` reported one completed handshake and
+then silence, forever, which reads like a problem on the WireGuard server and
+is not one. The sport-based rule has no mark to combine with anything — it
+reads the packet's own TCP header, so there is nothing left for wg-quick's
+fwmark to collide with. That fixed one failure mode; the priority race above
+was a second, independent one, found only once the first was already gone.
+See CLAUDE.md's "WireGuard on `[vpn]` hosts" section for the fuller history.
 
 `[vpn]` hosts also run with loose reverse path filtering
 (`sysctl_rp_filter: 2`, in `group_vars/vpn.yml`). Strict mode drops inbound SSH
@@ -428,7 +441,7 @@ network anyone creates.
 ```bash
 sudo wg show                       # a recent handshake, and transfer in both directions
 ip route get 1.1.1.1               # dev wg0
-ip rule                            # the sport rule (wg_killswitch_rule_priority) must sit BELOW whatever wg-quick actually installed - check the numbers, don't assume them
+ip rule                            # the sport rule (from fix-route) must have a LOWER number than wg-quick's two rules - it is computed to be one below them, so this should always hold; if it doesn't, fix-route ran before wg-quick, not after
 sudo iptables -S WG-KILLSWITCH-OUT # RETURNs, then one DROP at the end
 sudo iptables -t mangle -S | grep KILLSWITCH
 sudo sysctl net.ipv4.conf.all.rp_filter    # 2 on a [vpn] host
@@ -529,8 +542,8 @@ Common causes, in the order they are worth checking:
 | play fails at "must have handshaked" | the peer is not registered or is disabled on OPNsense; `wg_preshared_key` does not match; OPNsense's WAN does not allow the tunnel's UDP port in |
 | `sudo wg show wg0` lists the interface but **no `peer:` block at all** | `wg_peer_public_key` holds this host's own key. WireGuard will not accept a peer whose public key is the interface's own, so it is dropped and the tunnel runs with no peer — every packet vanishes and it never handshakes. The play now refuses this before writing the config; a host configured before that check existed shows it this way |
 | tunnel is up, nothing routes | OPNsense's outbound NAT does not cover the tunnel subnet, or no rule on the WireGuard interface tab permits this peer's traffic out |
-| SSH dies the moment the route moves | the sport-based `ip rule` did not install — check `ip rule show \| grep sport` for a rule matching `ssh_port` at `wg_killswitch_rule_priority`, and that `sysctl_rp_filter` is 2 |
-| `ip rule` shows a rule matching the SSH port at a number you did not configure | a rule left behind by an older `wg_killswitch_rule_priority`. Both deletes match by selector (protocol and port), not by priority, so a priority change actually moves the rule — but a host running a script from before that fix could still carry a stale one. `ip rule del ipproto tcp sport <ssh_port> table main` by hand clears a leftover; a current run now does it for you |
+| SSH dies the moment the route moves | check `ip rule show \| grep sport` for a rule matching `ssh_port`, and that its priority number is LOWER than wg-quick's two rules (`not fwmark …` / `suppress_prefixlength 0`) - if it's missing, or higher, `fix-route` either didn't run or ran before `wg-quick up`; run `sudo /usr/local/sbin/wg-killswitch fix-route` by hand to fix it immediately, then check why it didn't happen automatically. Also confirm `sysctl_rp_filter` is 2 |
+| `ip rule` shows a rule matching the SSH port that's higher (later) than wg-quick's own | `fix-route` computed against a stale picture - most likely it ran once, then something restarted wg-quick without calling `fix-route` again (wg-quick's rules moved, ours didn't follow). `sudo /usr/local/sbin/wg-killswitch fix-route` re-derives it against current state; if this recurs, something is restarting `wg-quick@<iface>` outside the paths that already call `fix-route` (the play, `wg-recover`) |
 | `wg show` reports exactly one completed handshake and then nothing, ever — no rekeys, no keepalives, no traffic | the signature of the old CONNMARK-based mechanism, if a host is somehow still running a script from before it was replaced (see "How the routing works" above). Confirm with `iptables -t mangle -S`: if `WG-KILLSWITCH-MARK`/`WG-KILLSWITCH-RESTORE` still exist, the host has an outdated script — re-run the play (or `wg-recover`) to deploy the current one, which also cleans those chains up. This reads exactly like a problem on the WireGuard server and is not one |
 | Alloy fails to install on the first run | same as "nothing routes": its release is fetched through the tunnel |
 | telemetry never arrives | `wg_dns` is not set, so the ingest hostname does not resolve — see `group_vars/vpn.yml` |

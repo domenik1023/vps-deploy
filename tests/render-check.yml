@@ -165,59 +165,58 @@
       vars:
         private_cidr: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9./]*$'
 
-    # wg-quick's own rules are NOT reliably at 32764/32765 - that was this
-    # repo's original assumption, from upstream's documented default, and a
-    # real deployment (vpn-gwdg-01) showed them installed at 29998/29999
-    # instead. A kill switch rule at or above whatever wg-quick actually picks
-    # is never consulted, and the symptom is not a firewall error - it is an
-    # SSH session that hangs the moment the default route moves, on a host
-    # whose console is at the provider, with the mangle chains showing
-    # correct, nonzero packet counters the whole time (confirmed on that
-    # incident: the mark was being set and restored fine, and still lost the
-    # `ip rule` race). Since there is no fixed number to check against, this
-    # asserts a low ceiling instead - comfortably below both the old
-    # assumption and the observed real value - rather than trusting either.
-    - name: The kill switch ip rule priority stays low, not just below the old assumption
+    # wg-quick's own rules do not get a fixed priority at all - it adds them
+    # with no `priority` argument, and the kernel's rule for that is
+    # (lowest priority currently in use) - 1. That makes any STATIC priority
+    # for the kill switch's own rule inherently racy: whatever number is
+    # installed before wg-quick runs is exactly what wg-quick's rules land
+    # one below, every time - confirmed against a real kernel (see
+    # tests/killswitch-netns.sh) and, before that, live on vpn-gwdg-01, twice.
+    # So there must be no static priority left to assert a ceiling on; this
+    # asserts the opposite property instead - that the priority is computed
+    # from `ip rule show` at run time, in a function that only ever runs
+    # after `wg-quick up`.
+    - name: The kill switch's SSH rule priority must be computed, not configured
       ansible.builtin.assert:
         that:
-          - wg_killswitch_rule_priority | int > 0
-          - wg_killswitch_rule_priority | int < 10000
+          - "'wg_killswitch_rule_priority' not in role_defaults"
+          - killswitch_rendered is search('fix_route\(\)')
+          - killswitch_rendered is search('ip -"\$fam" rule show')
+          - killswitch_rendered is search('sort -n')
+          - killswitch_rendered is search('lowest - 1')
+          - killswitch_rendered is not search('PRIO=')
         fail_msg: >-
-          wg_killswitch_rule_priority ({{ wg_killswitch_rule_priority }}) must
-          be between 1 and 9999. wg-quick's own rule priority is not fixed and
-          has been observed as low as 29999 in a real deployment - a kill
-          switch rule anywhere near that range risks losing the `ip rule` race
-          and never sending inbound replies back out the public interface.
-          Check `ip rule` on the actual host if you need to verify this rather
-          than trusting a number here.
+          wg-killswitch.j2 must compute the SSH rule's priority at run time
+          from `ip rule show` (one below the current lowest), never from a
+          configured wg_killswitch_rule_priority - a static number is exactly
+          what wg-quick's own kernel-assigned rules undercut, every time.
+        success_msg: "the SSH rule's priority is computed from ip rule show, not configured"
+      vars:
+        role_defaults: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/defaults/main.yml')
+             | from_yaml }}
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
 
-    # Lowering wg_killswitch_rule_priority only helps if the old rule actually
-    # goes away. Both deletes used to pin `priority "$PRIO"`, which meant a rule
-    # this script had left at some *earlier* value was never matched: `on` added
-    # the new rule beside the stale one and `off` removed only the new one. On a
-    # host carrying a stale 30000 from before the default was lowered, that is
-    # the rule sitting above wg-quick's own - so it wins the race and inbound
-    # replies go into the tunnel, which is the whole failure the priority change
-    # was meant to fix. It cost a live debugging session on wings-p01, twice -
-    # the second time because the rule this deletes by, by hand, matched
-    # `sport`/`ipproto` from before this replaced the CONNMARK-based mark.
-    #
-    # tests/killswitch-netns.sh proves the behaviour against a real kernel by
-    # planting a rule at 30000 first; this keeps the shape from regressing in CI
-    # where namespaces may be unavailable.
-    - name: The kill switch must delete its ip rule by selector, not by priority
+    # fix_route() must delete any rule it (or an earlier run) left behind by
+    # selector - protocol and port - not by priority, because it computes a
+    # fresh priority every time it runs and there is no fixed value left to
+    # match a stale rule against.
+    - name: The kill switch must delete its SSH rule by selector, not by priority
       ansible.builtin.assert:
         that:
           - rule_deletes | length == 2
           - rule_deletes | select('search', 'priority') | list | length == 0
-          - killswitch_rendered is search('rule add ipproto tcp sport "\$SSH_PORT" table main priority "\$PRIO"')
         fail_msg: >-
-          The kill switch's `ip rule del` must match on ipproto/sport alone so
-          that a rule left at an earlier wg_killswitch_rule_priority is removed
-          too. Found {{ rule_deletes | length }} delete(s),
+          fix_route()'s `ip rule del` must match on ipproto/sport alone.
+          Found {{ rule_deletes | length }} delete(s),
           {{ rule_deletes | select('search', 'priority') | list | length }} of
           them pinned to a priority: {{ rule_deletes | join(' | ') }}
-        success_msg: "the ip rule is deleted by selector and added at the configured priority"
+        success_msg: "the SSH rule is deleted by selector alone"
       vars:
         killswitch_vars:
           wg_wan_interface_resolved: eth0
@@ -228,6 +227,30 @@
         rule_deletes: >-
           {{ killswitch_rendered.splitlines()
              | select('search', 'rule del ipproto tcp sport') | map('trim') | list }}
+
+    # fix_route() must exclude the kernel's own built-in priorities (0 local,
+    # 32766 main, 32767 default) from what it considers "the current lowest" -
+    # those are always present and never what it needs to stay below; the
+    # thing that matters is wg-quick's own two rules, whatever the kernel gave
+    # them. Including the built-ins would make fix_route() compute against
+    # 32766/32767 forever and never actually react to wg-quick at all.
+    - name: The kill switch must exclude the kernel built-in priorities from its floor
+      ansible.builtin.assert:
+        that:
+          - killswitch_rendered is search("\\(0\\|32766\\|32767\\)")
+        fail_msg: >-
+          fix_route() must exclude priorities 0, 32766 and 32767 when finding
+          the current lowest `ip rule` priority - without that exclusion it
+          would compute against its own permanent floor instead of reacting
+          to wg-quick's actual rules.
+        success_msg: "the kernel's built-in priorities are excluded from the computed floor"
+      vars:
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
 
     # No CONNMARK *command* should survive a render outside the cleanup calls
     # in remove_old_mark_mechanism(), which exist purely to migrate a host
@@ -498,6 +521,72 @@
         # as `- role: x` and not the bare `- x` shorthand precisely so this
         # stays readable as data.
         play_roles: "{{ main_play.roles | map(attribute='role') | list }}"
+
+    # `ufw reload` does not touch `ip rule` itself, but restarting wg-killswitch
+    # does: its `off` deletes the SSH routing rule and `on` no longer re-adds
+    # it (see wg-killswitch.j2 - only fix-route can, since only it can see
+    # wg-quick's already-running rules to stay below). Without a handler that
+    # runs fix-route after the restart, every ufw rule change on a [vpn] host -
+    # LAN boxes included, since docker_host_access_cidrs adds one there - would
+    # silently remove SSH's own escape route and never put it back.
+    - name: Reload UFW must reposition the SSH rule after restarting the kill switch
+      ansible.builtin.assert:
+        that:
+          - reposition_name in ufw_notifies
+          - at.restart >= 0
+          - at.reposition >= 0
+          - at.restart < at.reposition
+          - reposition_handler.get('ansible.builtin.command', {}).get('argv', []) == ['/usr/local/sbin/wg-killswitch', 'fix-route']
+        fail_msg: >-
+          Reload UFW must notify "Re-position the kill switch's SSH rule below
+          the tunnel's own", defined after "Restart WireGuard kill switch" in
+          roles/wireguard/handlers/main.yml, running
+          `wg-killswitch fix-route`. Found restart at {{ at.restart }},
+          reposition at {{ at.reposition }}, notified: {{ ufw_notifies }}.
+        success_msg: "Reload UFW restarts the kill switch, then repositions its SSH rule"
+      vars:
+        baseline_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/handlers/main.yml')
+             | from_yaml }}
+        wg_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/handlers/main.yml')
+             | from_yaml }}
+        reload_ufw: "{{ baseline_handlers | selectattr('name', 'equalto', 'Reload UFW') | first }}"
+        ufw_notifies: >-
+          {{ reload_ufw.notify if reload_ufw.notify is sequence
+             and reload_ufw.notify is not string else [reload_ufw.notify] }}
+        wg_handler_names: "{{ wg_handlers | map(attribute='name') | list }}"
+        reposition_name: "Re-position the kill switch's SSH rule below the tunnel's own"
+        reposition_handler: >-
+          {{ wg_handlers | selectattr('name', 'equalto', reposition_name)
+             | first | default({}, true) }}
+        at:
+          restart: >-
+            {{ wg_handler_names.index('Restart WireGuard kill switch')
+               if 'Restart WireGuard kill switch' in wg_handler_names else -1 }}
+          reposition: >-
+            {{ wg_handler_names.index(reposition_name)
+               if reposition_name in wg_handler_names else -1 }}
+
+    # wg-recover restarts both units by hand - fix-route has to follow the
+    # tunnel restart for the same reason it follows "Bring up the tunnel" in
+    # the play: wg-quick's rules only exist, at their real priority, once it
+    # has actually run.
+    - name: The recovery script must fix the route after restarting the tunnel, not before
+      ansible.builtin.assert:
+        that:
+          - recover_rendered is search('fix-route')
+          - recover_rendered.find('restart "$WG_UNIT"') >= 0
+          - recover_rendered.find('restart "$WG_UNIT"') < recover_rendered.find('fix-route')
+        fail_msg: >-
+          wg-recover.j2 must call `wg-killswitch fix-route` after restarting
+          $WG_UNIT, not before - wg-quick's own ip rules only exist, at their
+          real priority, once it has actually run.
+        success_msg: "wg-recover fixes the route after the tunnel restart"
+      vars:
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars={'wg_interface': 'wg0', 'wg_rollback_delay': '5min'}) }}
 
     # Three tasks in 42_ssh.yml's hardening block have to stay in this order,
     # and the failure is the same each time: the run stops half way through
@@ -957,13 +1046,13 @@
              | first | default({}, true) }}
 
     # "Bring up the tunnel" moves the default route as a side effect of the
-    # very systemctl command Ansible is waiting on a reply to, over the
-    # connection that command is about to disrupt - a lost reply then reports
-    # the task failed even when the tunnel came up fine. async + poll: 0 stops
-    # this task waiting for that reply at all; "Wait for the host to answer"
-    # right after it is what actually needs the connection back, and it
-    # already retries a fresh one for up to 60s rather than assuming the one
-    # already open survives.
+    # very command Ansible is waiting on a reply to, over the connection that
+    # command is about to disrupt - a lost reply then reports the task failed
+    # even when the tunnel came up fine. async + poll: 0 stops this task
+    # waiting for that reply at all; "Wait for the host to answer" right after
+    # it is what actually needs the connection back, and it already retries a
+    # fresh one for up to 60s rather than assuming the one already open
+    # survives.
     - name: Bring up the tunnel must not wait on the connection it disrupts
       ansible.builtin.assert:
         that:
@@ -974,7 +1063,7 @@
           - at.bringup >= 0
           - at.bringup < at.wait
         fail_msg: >-
-          "Bring up the tunnel" must set async (a positive number of seconds)
+          "{{ bringup_name }}" must set async (a positive number of seconds)
           and poll: 0, and must come before "Wait for the host to answer with
           the tunnel up" - found async={{ bringup_task.get('async', 'unset') }}
           poll={{ bringup_task.get('poll', 'unset') }},
@@ -987,14 +1076,45 @@
           {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
              | from_yaml }}
         names: "{{ wg_tasks | map(attribute='name') | list }}"
+        bringup_name: Bring up the tunnel and position the kill switch's SSH rule below it
         bringup_task: >-
-          {{ wg_tasks | selectattr('name', 'equalto', 'Bring up the tunnel')
+          {{ wg_tasks | selectattr('name', 'equalto', bringup_name)
              | first | default({}, true) }}
         at:
-          bringup: "{{ names.index('Bring up the tunnel') if 'Bring up the tunnel' in names else -1 }}"
+          bringup: "{{ names.index(bringup_name) if bringup_name in names else -1 }}"
           wait: >-
             {{ names.index('Wait for the host to answer with the tunnel up')
                if 'Wait for the host to answer with the tunnel up' in names else 9999 }}
+
+    # fix-route has to run after `wg-quick up`, in the exact same remote
+    # command - not a separate Ansible task, which would need its own SSH
+    # round trip on a connection that may already be mid-transition, and not
+    # before, which is the bug that actually broke SSH: wg-quick's own rules
+    # get a kernel-assigned priority of (whatever is currently lowest) - 1, so
+    # fix-route has nothing correct to compute until wg-quick has already run.
+    - name: Bring up the tunnel must start wg-quick before fixing the route, in one command
+      ansible.builtin.assert:
+        that:
+          - bringup_task != {}
+          - bringup_argv is search('systemctl')
+          - bringup_argv is search('wg-quick@')
+          - bringup_argv is search('wg-killswitch fix-route')
+          - bringup_argv.find('wg-quick@') < bringup_argv.find('fix-route')
+        fail_msg: >-
+          "{{ bringup_name }}" must run `systemctl start/restart wg-quick@…`
+          and `wg-killswitch fix-route` in the same command, with the tunnel
+          start strictly first. Rendered argv: {{ bringup_argv }}
+        success_msg: "the tunnel starts before fix-route runs, in one remote command"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        bringup_name: Bring up the tunnel and position the kill switch's SSH rule below it
+        bringup_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', bringup_name)
+             | first | default({}, true) }}
+        bringup_argv: >-
+          {{ bringup_task.get('ansible.builtin.command', {}).get('argv', []) | join(' ') }}
 
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the

@@ -11,9 +11,15 @@
 # costs a trip to the provider's serial console.
 #
 # So build the situation in a network namespace: a public interface with a
-# default route, a stand-in tunnel, and the two `ip rule` entries wg-quick
-# installs for AllowedIPs = 0.0.0.0/0. Then run the real rendered script and
-# ask the kernel where packets would go.
+# default route and a stand-in tunnel. Crucially, wg-quick's own two `ip rule`
+# entries are added here exactly as the real wg-quick does - with NO explicit
+# priority - and left to the kernel to assign. An earlier version of this test
+# hardcoded them at 32765/32764, which is not how the kernel actually behaves:
+# its rule for "no priority given" is (lowest priority currently in use) - 1,
+# confirmed live on vpn-gwdg-01 landing wg-quick's rules at 99 and 98 against a
+# kill switch rule sitting at 100. Hardcoding the "expected" result would have
+# made this test pass while the real mechanism was broken - which is exactly
+# what happened before this rewrite.
 #
 # Everything happens inside `unshare -rn`, so nothing here touches the host's
 # own firewall or routing.
@@ -92,20 +98,10 @@ ip link add $TUN type veth peer name ${TUN}p
 ip addr add $TUN_ADDR/32 dev $TUN
 ip link set $TUN up
 
-# What wg-quick installs for AllowedIPs = 0.0.0.0/0.
-ip route add default dev $TUN table $WG_TABLE
-ip rule add not fwmark $WG_TABLE table $WG_TABLE priority 32765
-ip rule add table main suppress_prefixlength 0 priority 32764
-
 # From here on the point is to observe failures, not to stop at the first one:
 # a run that aborts here reports nothing at all, which is how a broken kill
 # switch would look exactly like a broken test.
 set +e
-
-# A rule this script left behind at an older wg_killswitch_rule_priority.
-# Deleting only at the *current* priority orphans it, and on a host where the
-# stale number sits above wg-quick's own the wrong rule still wins.
-ip rule add ipproto tcp sport $SSH_PORT table main priority 30000
 
 # What a host running the CONNMARK-based mechanism this replaced still has:
 # the two mangle chains, their jumps, and the old fwmark ip rule. \`on\` has to
@@ -121,14 +117,43 @@ iptables -t mangle -I OUTPUT 1 -j WG-KILLSWITCH-RESTORE
 ip rule add fwmark $OLD_MARK/$OLD_MARK table main priority 100
 
 $work/wg-killswitch on >/dev/null 2>&1; echo \"ON_EXIT=\$?\"
-echo \"SSH_RULE_COUNT=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
-echo \"SSH_RULE_PRIO=\$(ip rule show | grep 'sport $SSH_PORT' | grep -oE '^[0-9]+' | tr '\\n' ' ')\"
 echo \"OLD_MARK_RULE_COUNT=\$(ip rule show | grep -c $OLD_MARK || true)\"
 echo \"OLD_MARK_CHAINS=\$(( \$(iptables -t mangle -S WG-KILLSWITCH-MARK 2>/dev/null | wc -l) + \$(iptables -t mangle -S WG-KILLSWITCH-RESTORE 2>/dev/null | wc -l) ))\"
 echo \"LAST_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | tail -1)\"
 echo \"SSH_RULE=\$(iptables -S WG-KILLSWITCH-OUT 2>/dev/null | grep -c -- '--sport $SSH_PORT')\"
+
+# \`on\` must not install the SSH ip rule itself - only fix-route does, and
+# only after wg-quick has run. Installing it here, before the tunnel exists,
+# is exactly the old bug: whatever this puts in place is what wg-quick's own
+# kernel-assigned rules would land one below, every time.
+echo \"RULE_AFTER_ON=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
+
+# --- Simulate wg-quick up, exactly as it really does it: no priority given ---
+ip route add default dev $TUN table $WG_TABLE
+ip rule add not fwmark $WG_TABLE table $WG_TABLE
+ip rule add table main suppress_prefixlength 0
+echo \"WGQUICK_RULES=\$(ip rule show | grep -E '(fwmark $WG_TABLE|suppress_prefixlength)' | grep -oE '^[0-9]+' | tr '\\n' ' ')\"
+
+$work/wg-killswitch fix-route >/dev/null 2>&1; echo \"FIXROUTE_EXIT=\$?\"
+echo \"SSH_RULE_COUNT=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
+echo \"SSH_RULE_PRIO=\$(ip rule show | grep 'sport $SSH_PORT' | grep -oE '^[0-9]+')\"
+echo \"WGQUICK_LOWEST=\$(ip rule show | grep -E '(fwmark $WG_TABLE|suppress_prefixlength)' | grep -oE '^[0-9]+' | sort -n | head -1)\"
 echo \"UNMARKED=\$(ip route get 203.0.113.99 | head -1)\"
 echo \"SSH_REPLY=\$(ip route get 203.0.113.99 ipproto tcp sport $SSH_PORT | head -1)\"
+
+# Idempotency: running fix-route again with nothing changed must not keep
+# decrementing - it deletes its own rule before measuring, so it should land
+# on the exact same priority as last time, not one lower.
+$work/wg-killswitch fix-route >/dev/null 2>&1
+echo \"SSH_RULE_PRIO_AGAIN=\$(ip rule show | grep 'sport $SSH_PORT' | grep -oE '^[0-9]+')\"
+echo \"SSH_RULE_COUNT_AGAIN=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
+
+# A rule left behind at some other priority - by an old run, or by hand while
+# debugging - has to be replaced, not left beside the fresh one.
+ip rule add ipproto tcp sport $SSH_PORT table main priority 50
+$work/wg-killswitch fix-route >/dev/null 2>&1
+echo \"SSH_RULE_COUNT_AFTER_STALE=\$(ip rule show | grep -c 'sport $SSH_PORT' || true)\"
+echo \"SSH_REPLY_AFTER_STALE=\$(ip route get 203.0.113.99 ipproto tcp sport $SSH_PORT | head -1)\"
 
 # The MSS clamp. Worth asking the kernel rather than the rendered text: the
 # TCPMSS target lives in a module (xt_TCPMSS) that a stripped kernel can be
@@ -151,24 +176,47 @@ get() { grep "^$1=" <<<"$out" | cut -d= -f2- || true; }
 # abort half way through under `set -e`, leaving the unit failed and one family
 # unprotected.
 check "installs cleanly and exits 0"          "0"    "$(get ON_EXIT)"
-check "SSH exception is present"              "1"    "$(get SSH_RULE)"
+check "SSH exception is present in the filter chain" "1" "$(get SSH_RULE)"
 check "the chain ends in DROP"                "-j DROP" "$(get LAST_RULE)"
+
+# The bug this whole rewrite exists to catch: `on` must not install the SSH
+# routing rule itself. If it did, wg-quick's own kernel-assigned rules would
+# land one below it a moment later - the exact failure that broke SSH on
+# vpn-gwdg-01, verified against this same kernel behaviour.
+check "'on' installs no SSH routing rule of its own" "0" "$(get RULE_AFTER_ON)"
+
+check "fix-route exits 0"                     "0"    "$(get FIXROUTE_EXIT)"
+
+# The actual property: fix-route's rule sits exactly one below wherever
+# wg-quick's own rules - added with no priority, same as the real thing -
+# actually landed, not a hardcoded assumption about where that is.
+check "fix-route installs exactly one SSH rule" "1"  "$(get SSH_RULE_COUNT)"
+if [ "$(get SSH_RULE_PRIO)" = "$(( $(get WGQUICK_LOWEST) - 1 ))" ]; then
+    echo "  ok    fix-route sits exactly one below wg-quick's actual (kernel-assigned) priority"
+else
+    echo "  FAIL  fix-route sits exactly one below wg-quick's actual (kernel-assigned) priority"
+    echo "        wg-quick's lowest: $(get WGQUICK_LOWEST), SSH rule at: $(get SSH_RULE_PRIO)"
+    fail=1
+fi
 
 # The property the design rests on.
 check "unmarked traffic takes the tunnel"     "dev $TUN"  "$(get UNMARKED)"
 check "SSH's own traffic takes the public link" "dev $WAN"  "$(get SSH_REPLY)"
+
+# Re-running fix-route with nothing changed must not keep undercutting itself.
+check "fix-route is idempotent: same priority on a second run" "$(get SSH_RULE_PRIO)" "$(get SSH_RULE_PRIO_AGAIN)"
+check "fix-route is idempotent: still exactly one rule"         "1" "$(get SSH_RULE_COUNT_AGAIN)"
+
+# A stale rule at any other priority - a leftover run, a hand-added one while
+# debugging - has to be replaced, not left beside the fresh one.
+check "fix-route replaces a rule left at any other priority" "1" "$(get SSH_RULE_COUNT_AFTER_STALE)"
+check "and the replacement still routes SSH out the public link" "dev $WAN" "$(get SSH_REPLY_AFTER_STALE)"
 
 # Container traffic black-holes on the tunnel MTU without this. The clamp has
 # to be on the way *into* the tunnel: --clamp-mss-to-pmtu reads the outgoing
 # route MTU, so the same rule on the public interface would do nothing.
 check "clamps MSS on traffic forwarded into the tunnel" "1" "$(get MSS_JUMP)"
 check "the clamp follows the tunnel path MTU"           "1" "$(get MSS_RULE)"
-
-# Lowering wg_killswitch_rule_priority has to actually move the rule, not add
-# a second one beside the old. Exactly one rule for this selector, at the
-# configured priority, with the stale 30000 one gone.
-check "replaces a rule left at an older priority" "1" "$(get SSH_RULE_COUNT)"
-check "and installs it at the configured priority" "100" "$(get SSH_RULE_PRIO)"
 
 # A host still running the CONNMARK-based mechanism this replaced must not
 # keep it forever: `on` has to remove the old chains, their jumps and the old
