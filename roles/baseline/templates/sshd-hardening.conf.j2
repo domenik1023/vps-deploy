@@ -2,7 +2,7 @@ PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 X11Forwarding no
-AllowUsers {{ admin_user }}
+AllowUsers {{ admin_user }}{{ (' ' ~ agent_user) if agent_user_manage | bool else '' }}
 MaxAuthTries 3
 LoginGraceTime 30
 ClientAliveInterval 300

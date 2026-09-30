@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+# Managed by Ansible - edit roles/baseline/templates/agent-command-log.py.j2.
+#
+# auditd plugin: turns every execve the kernel audits under the key
+# {{ agent_audit_key }} into one JSON line in {{ agent_command_log }}, which
+# Grafana Alloy tails and ships to Loki as job="integrations/agent".
+#
+# auditd starts this itself (/etc/audit/plugins.d/agent-command-log.conf) and
+# writes raw audit records to its stdin. One command is several records - a
+# SYSCALL, one or more EXECVE, a CWD, PATHs, a PROCTITLE - that share a serial
+# number and can interleave with other events, and the arguments are hex
+# encoded whenever they contain a space or a quote. libauparse's feed interface
+# does the reassembly and the decoding, which is why this leans on it rather
+# than splitting lines itself.
+import datetime
+import json
+import os
+import re
+import shlex
+import signal
+import sys
+
+import auparse
+
+LOG_PATH = {{ agent_command_log | to_json }}
+KEY = {{ agent_audit_key | to_json }}
+
+ARG_FIELD = re.compile(r"^a(\d+)(?:\[(\d+)\])?$")
+
+
+class Log:
+    """Append-only writer that follows logrotate.
+
+    The file is reopened whenever the path stops pointing at the inode we hold,
+    so a `create`-style rotation needs no signal and nothing is written into a
+    file that has already been moved away.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.fh = None
+        self.ident = None
+
+    def _current(self):
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def write(self, line):
+        if self.fh is None or self._current() != self.ident:
+            if self.fh is not None:
+                self.fh.close()
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+            self.fh = os.fdopen(fd, "a", encoding="utf-8")
+            st = os.fstat(fd)
+            self.ident = (st.st_dev, st.st_ino)
+        self.fh.write(line + "\n")
+        self.fh.flush()
+
+
+def fields_of(au):
+    """The current record as {name: (raw, interpreted)}."""
+    out = {}
+    if not au.first_field():
+        return out
+    while True:
+        name = au.get_field_name()
+        try:
+            interp = au.interpret_field()
+        except (OSError, RuntimeError):
+            interp = None
+        out[name] = (au.get_field_str(), interp)
+        if not au.next_field():
+            return out
+
+
+def on_event(au, cb_type, log):
+    if cb_type != auparse.AUPARSE_CB_EVENT_READY:
+        return
+    if not au.first_record():
+        return
+
+    syscall = {}
+    cwd = {}
+    # argv index -> list of chunks; a long argument arrives as a1[0], a1[1]...
+    argv = {}
+    while True:
+        rtype = au.get_type_name()
+        fields = fields_of(au)
+        if rtype == "SYSCALL":
+            syscall = fields
+        elif rtype == "CWD":
+            cwd = fields
+        elif rtype == "EXECVE":
+            for name, (_raw, interp) in fields.items():
+                m = ARG_FIELD.match(name)
+                if m:
+                    argv.setdefault(int(m.group(1)), []).append(
+                        (int(m.group(2) or 0), interp or "")
+                    )
+        if not au.next_record():
+            break
+
+    keys = (syscall.get("key", (None, None))[1] or "").split("\x01")
+    if KEY not in keys:
+        return
+
+    def val(name, source=syscall):
+        return source.get(name, (None, None))[1]
+
+    def raw(name, source=syscall):
+        return source.get(name, (None, None))[0]
+
+    args = ["".join(c for _i, c in sorted(argv[i])) for i in sorted(argv)]
+    ts = au.get_timestamp()
+    when = datetime.datetime.fromtimestamp(
+        ts.sec + ts.milli / 1000, tz=datetime.timezone.utc
+    )
+
+    entry = {
+        "ts": when.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "cmd": shlex.join(args) if args else (val("exe") or ""),
+        "argv": args,
+        "exe": val("exe"),
+        "cwd": val("cwd", cwd),
+        # auid is the account that logged in, and survives sudo and su - it is
+        # what ties a command run as root back to the agent. uid/euid are who
+        # the command actually ran as.
+        "auid": val("auid"),
+        "uid": val("uid"),
+        "euid": val("euid"),
+        "tty": raw("tty"),
+        "ses": raw("ses"),
+        "pid": raw("pid"),
+        "ppid": raw("ppid"),
+        "success": raw("success"),
+        "exit": val("exit"),
+    }
+    log.write(json.dumps(entry, ensure_ascii=False))
+
+
+def main():
+    # auditd sends SIGHUP to its plugins when it reloads its own config. The
+    # default action would kill us, and auditd only restarts a plugin a limited
+    # number of times; there is nothing to reload anyway.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    log = Log(LOG_PATH)
+    au = auparse.AuParser(auparse.AUSOURCE_FEED)
+    au.set_escape_mode(auparse.AUPARSE_ESC_RAW)
+    au.add_callback(on_event, log)
+
+    stdin = sys.stdin.buffer
+    while True:
+        line = stdin.readline()
+        if not line:
+            break
+        au.feed(line.decode("utf-8", "replace"))
+    au.flush_feed()
+
+
+if __name__ == "__main__":
+    main()

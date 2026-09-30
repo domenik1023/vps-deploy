@@ -19,12 +19,15 @@
 # default, so nothing would pull it in otherwise: this playbook runs against
 # localhost with no inventory, and group_vars next to *this* file is what
 # Ansible would look for. The host class assertions below read it.
+# group_vars/all/10_agent.yml likewise, and for the same reason: both
+# roles/baseline and the Alloy template read its switch.
 - name: Check that the role's derived variables render to the right shapes
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
     - ../group_vars/all/00_classify.yml
+    - ../group_vars/all/10_agent.yml
     - ../roles/baseline/defaults/main/00_identity.yml
     - ../roles/baseline/defaults/main/10_ssh.yml
     - ../roles/baseline/defaults/main/20_firewall.yml
@@ -1313,7 +1316,7 @@
           # An access log pipeline appears only when a host names one, and
           # naming one has to bring the parser with it: the file tailed without
           # loki.process ships JSON blobs Loki cannot break into fields.
-          - alloy_default is not search('loki.process')
+          - alloy_default is not search('loki.process "access_')
           - alloy_traefik is search('loki.process "access_traefik"')
           - alloy_traefik is search('stage.structured_metadata')
           - alloy_traefik is search('trace_id')
@@ -1365,3 +1368,116 @@
         # is what Alloy reads back as the one the regex needs.
         alloy_escaped_drop: 'expression          = "^/favicon\\.ico$"'
         alloy_traefik_dropping: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'alloy_access_logs': alloy_probe_dropping}) }}"
+
+    # --- The AI agent account (group_vars/all/10_agent.yml, docs/agent.md) ---
+
+    # 42_ssh.yml writes AllowUsers with the agent in it and then restarts sshd;
+    # the account has to exist by then, and auditctl resolves it by name when
+    # it loads the rules, so 31_agent.yml creating it is not optional ordering.
+    - name: The agent account must be created before SSH is hardened
+      ansible.builtin.assert:
+        that:
+          - includes.index('31_agent.yml') < includes.index('42_ssh.yml')
+          - allow_on is search('^AllowUsers ' ~ admin_user ~ ' ' ~ agent_user ~ '$', multiline=true)
+          - allow_off is search('^AllowUsers ' ~ admin_user ~ '$', multiline=true)
+        fail_msg: >-
+          Either 31_agent.yml no longer runs before 42_ssh.yml
+          ({{ includes | join(' -> ') }}), or AllowUsers does not follow
+          agent_user_manage - on: "{{ allow_on | regex_search('AllowUsers.*') }}",
+          off: "{{ allow_off | regex_search('AllowUsers.*') }}".
+      vars:
+        includes: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/tasks/main.yml')
+             | regex_findall('(?m)^[ ]+file: *([^ ]+)$') }}
+        sshd_template: ../roles/baseline/templates/sshd-hardening.conf.j2
+        allow_on: "{{ lookup('ansible.builtin.template', sshd_template, template_vars={'agent_user_manage': true}) }}"
+        allow_off: "{{ lookup('ansible.builtin.template', sshd_template, template_vars={'agent_user_manage': false}) }}"
+
+    # Every rule has to carry the key, or the plugin never sees its events;
+    # and the ENOENT filter, or every $PATH miss of an execvp is a log line.
+    # The b32 pair only exists on x86_64 - elsewhere auditctl may reject it
+    # and the whole rules file fails to load.
+    - name: The agent audit rules must be keyed, filtered and match the architecture
+      ansible.builtin.assert:
+        that:
+          - rules_x86 | length == 4
+          - rules_arm | length == 2
+          - rules_arm | select('search', 'arch=b32') | list | length == 0
+          - (rules_x86 + rules_arm) | reject('search', ' -k ' ~ agent_audit_key ~ '$') | list | length == 0
+          - (rules_x86 + rules_arm) | reject('search', '-F exit!=-ENOENT ') | list | length == 0
+          - rules_x86 | select('search', '-F auid=' ~ agent_user ~ ' ') | list | length == 2
+          - rules_x86 | select('search', '-F euid=' ~ agent_user ~ ' ') | list | length == 2
+        fail_msg: >-
+          The rendered audit rules are wrong. x86_64: {{ rules_x86 | join(' | ') }}
+          -- aarch64: {{ rules_arm | join(' | ') }}
+      vars:
+        rules_template: ../roles/baseline/templates/agent-audit.rules.j2
+        rules_x86: >-
+          {{ lookup('ansible.builtin.template', rules_template,
+                    template_vars={'ansible_facts': {'architecture': 'x86_64'}}).splitlines()
+             | select('match', '^-a ') | list }}
+        rules_arm: >-
+          {{ lookup('ansible.builtin.template', rules_template,
+                    template_vars={'ansible_facts': {'architecture': 'aarch64'}}).splitlines()
+             | select('match', '^-a ') | list }}
+
+    # The plugin is a Python file with two Jinja holes in it. A syntax error
+    # there does not fail the play - auditd starts it, it dies, auditd retries
+    # a few times and gives up, and the log simply stays empty.
+    - name: The agent command log plugin must render to valid Python
+      vars:
+        plugin_rendered_path: "{{ playbook_dir }}/.agent-command-log.rendered.py"
+      block:
+        - name: Write the rendered plugin
+          ansible.builtin.copy:
+            content: "{{ lookup('ansible.builtin.template', '../roles/baseline/templates/agent-command-log.py.j2') }}"
+            dest: "{{ plugin_rendered_path }}"
+            mode: "0600"
+          changed_when: false
+
+        # ast.parse rather than py_compile, which leaves a __pycache__ behind.
+        - name: Parse it
+          ansible.builtin.command:
+            argv: [python3, -c, "import ast, sys; ast.parse(open(sys.argv[1]).read())", "{{ plugin_rendered_path }}"]
+          changed_when: false
+
+        - name: The plugin must write the log Alloy reads, filtered on the rules' key
+          ansible.builtin.assert:
+            that:
+              - plugin_src is search('^LOG_PATH = ' ~ (agent_command_log | to_json | regex_escape) ~ '$', multiline=true)
+              - plugin_src is search('^KEY = ' ~ (agent_audit_key | to_json | regex_escape) ~ '$', multiline=true)
+              - plugin_conf is search('^path = /usr/local/sbin/agent-command-log$', multiline=true)
+              - plugin_task['ansible.builtin.template'].dest == '/usr/local/sbin/agent-command-log'
+          vars:
+            plugin_src: "{{ lookup('ansible.builtin.file', plugin_rendered_path) }}"
+            plugin_conf: "{{ lookup('ansible.builtin.template', '../roles/baseline/templates/agent-command-log.conf.j2') }}"
+            plugin_task: >-
+              {{ (lookup('ansible.builtin.file', '../roles/baseline/tasks/31_agent.yml')
+                  | from_yaml | first).block
+                 | selectattr('name', 'equalto', 'Install the agent command log plugin')
+                 | first }}
+      always:
+        - name: Clean up the rendered plugin
+          ansible.builtin.file:
+            path: "{{ plugin_rendered_path }}"
+            state: absent
+          changed_when: false
+
+    # The Alloy side follows the same switch the account does: a host without
+    # the account must not tail a file nobody writes, and a host with it must
+    # ship it under the integrations/ prefix every dashboard filters on.
+    - name: The agent command log must be shipped exactly where the account exists
+      ansible.builtin.assert:
+        that:
+          - alloy_agent is search('loki.process "agent_commands"')
+          - alloy_agent is search('job = "integrations/agent"')
+          - alloy_agent is search('__path__ = ' ~ (agent_command_log | to_json | regex_escape))
+          - alloy_agent is search('stage.output')
+          - alloy_no_agent is not search('agent_commands')
+          - alloy_no_agent is not search('integrations/agent')
+        fail_msg: >-
+          config.alloy.j2's agent block no longer follows agent_user_manage,
+          or no longer tails {{ agent_command_log }} as integrations/agent.
+      vars:
+        alloy_agent: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'agent_user_manage': true}) }}"
+        alloy_no_agent: "{{ lookup('ansible.builtin.template', alloy_template, template_vars={'agent_user_manage': false}) }}"

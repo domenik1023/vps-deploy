@@ -346,6 +346,85 @@ loki.process "access_{{ job }}" {
 }
 {% endfor %}
 {% endif %}
+{% if agent_user_manage | default(false) | bool %}
+
+// =============================================================================
+// Logs - commands run by the AI agent account
+// =============================================================================
+// One JSON object per program the agent started, written by the auditd plugin
+// roles/baseline installs (see docs/agent.md). Parsed here so each Loki line
+// is the command itself, stamped with when it ran rather than when it was
+// shipped, and the rest - who it ran as, where, whether it worked - is
+// queryable as structured metadata.
+
+local.file_match "agent_commands" {
+  path_targets = [
+    { __path__ = {{ agent_command_log | to_json }}, job = "integrations/agent", instance = constants.hostname },
+  ]
+  sync_period = "5s"
+}
+
+loki.source.file "agent_commands" {
+  targets       = local.file_match.agent_commands.targets
+  forward_to    = [loki.process.agent_commands.receiver]
+  tail_from_end = true
+}
+
+loki.process "agent_commands" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.json {
+    expressions = {
+      ts      = "ts",
+      cmd     = "cmd",
+      exe     = "exe",
+      cwd     = "cwd",
+      auid    = "auid",
+      uid     = "uid",
+      euid    = "euid",
+      tty     = "tty",
+      ses     = "ses",
+      pid     = "pid",
+      ppid    = "ppid",
+      success = "success",
+      exit    = "exit",
+    }
+  }
+
+  stage.timestamp {
+    source            = "ts"
+    format            = "RFC3339Nano"
+    action_on_failure = "fudge"
+  }
+
+  // The one label: who the command ran as. Bounded by the accounts on the
+  // host, and it is the filter that matters - euid="root" is every sudo.
+  stage.labels {
+    values = {
+      euid = "",
+    }
+  }
+
+  stage.structured_metadata {
+    values = {
+      exe     = "",
+      cwd     = "",
+      auid    = "",
+      uid     = "",
+      tty     = "",
+      ses     = "",
+      pid     = "",
+      ppid    = "",
+      success = "",
+      exit    = "",
+    }
+  }
+
+  stage.output {
+    source = "cmd"
+  }
+}
+{% endif %}
 {% if alloy_enable_otlp %}
 
 // =============================================================================

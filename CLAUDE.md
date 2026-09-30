@@ -103,7 +103,7 @@ decides whether a role runs cannot be a default of the role it decides about.
 they are numbered so that order is visible in `ls` rather than only in a
 comment. A new file gets a number that places it, not the next one free:
 
-`10_hostname` → `20_user` → `30_packages` → `40_firewall` → `41_fail2ban` →
+`10_hostname` → `20_user` → `30_packages` → `31_agent` → `40_firewall` → `41_fail2ban` →
 `42_ssh` → `50_sysctl` → `60_updates` → `61_time` → `62_docker`
 
 - `10_hostname.yml` is first because the host's own name is what everything
@@ -112,6 +112,9 @@ comment. A new file gets a number that places it, not the next one free:
 - `20_user.yml` before `42_ssh.yml`, which locks the root account last.
 - `30_packages.yml` installs `python3-debian`, which `deb822_repository` in
   `62_docker.yml` and `roles/crowdsec` need and a stock Ubuntu image lacks.
+- `31_agent.yml` before `42_ssh.yml`, whose `AllowUsers` names the agent
+  account; `auditctl` also resolves the account by name, so it must exist
+  before the rules load.
 - `40_firewall.yml` strictly before `42_ssh.yml`: the bootstrap allow on the
   live session's port and the `limit` on the port sshd is about to move to must
   both exist before it moves. The matching deny on the old port lives in
@@ -388,6 +391,40 @@ OPNsense NATs the peer's traffic out its own WAN like anything else, which is
 also why `group_vars/vpn.yml` points Alloy at the public ingest hostname
 rather than the LAN-only one: there is no LAN hop for a `[vpn]` host to take.
 
+### The AI agent account
+
+`agent_user_manage` (on everywhere by default) creates an `agent` login and
+audits every program it starts. The switch and its settings live in
+**`group_vars/all/10_agent.yml`**, not in a role's defaults, because two plays
+read it: `31_agent.yml` builds the account and the audit trail, and the Alloy
+template in play two decides from the same switch whether to tail the log.
+Baseline's defaults are not visible in play two. See `docs/agent.md`.
+
+The chain is kernel audit → auditd → the plugin
+`templates/agent-command-log.py.j2` → `agent_command_log` (JSON lines) → the
+`agent_commands` pipeline in `config.alloy.j2` → `job="integrations/agent"`.
+Several things in it are load-bearing:
+
+- **Audited by the kernel, not the shell.** An agent sends
+  `ssh agent@host '<cmd>'`, and history, PROMPT_COMMAND and `pam_tty_audit`
+  see no interactive terminal there. Do not "simplify" this into shell hooks.
+- **`auid` and `euid` rules both.** `auid` survives `sudo`, which is what
+  attributes a root command to the agent. `euid` catches `sudo -u agent`.
+- **`-F exit!=-ENOENT`**, or every `$PATH` miss of an `execvp` is a line.
+- **b32 rules only on x86_64**, where i386 binaries use a different syscall
+  number. Elsewhere `auditctl` may reject `arch=b32` and fail the whole file.
+- **The plugin uses libauparse** (`python3-audit`) for event reassembly and
+  hex decoding. A syntax error in it fails nowhere visible: auditd restarts it
+  `max_restarts` times, then gives up, and the log just stays empty.
+  `tests/render-check.yml` parses the rendered plugin for that reason.
+- **The plugin reopens the log by inode**, so logrotate needs no postrotate
+  and no signal. It ignores SIGHUP, which auditd sends on reconfigure.
+- **In Loki the line is the command** (`stage.output`), timestamped from the
+  audit event. `euid` is the only label, and everything else is structured
+  metadata.
+- `Restart auditd` is the only handler. The unit's `ExecStartPost` runs
+  `augenrules --load`, so a restart also reloads changed rules.
+
 ### Alloy
 
 `roles/alloy` is a thin wrapper: it renders `templates/config.alloy.j2` and
@@ -553,11 +590,11 @@ bind-mounts `/var/run/docker.sock` and relocates Docker's data root, hiding
 existing containers and volumes.
 
 **Alloy's `instance` label comes from the system hostname, not the inventory.**
-`constants.hostname` and the journal's `_HOSTNAME` field feed it, in six places
+`constants.hostname` and the journal's `_HOSTNAME` field feed it, in seven places
 across the config — so a host whose local name differs from its inventory name
 ships telemetry no dashboard filtering on the inventory name will match.
 `10_hostname.yml` closes that by setting the system hostname to
-`inventory_hostname`, which is why it fixes all six at once and no relabelling
+`inventory_hostname`, which is why it fixes all seven at once and no relabelling
 is needed. Alloy reads the hostname once at startup and its config carries no
 literal copy, so a rename does not change the config and upstream's handler
 never fires — `roles/alloy` restarts it explicitly on the fact `10_hostname.yml`

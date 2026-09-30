@@ -1,0 +1,22 @@
+## Managed by Ansible - edit roles/baseline/templates/agent-audit.rules.j2.
+##
+## Every program the AI agent account starts, keyed {{ agent_audit_key }} for
+## /usr/local/sbin/agent-command-log to pick out.
+##
+## auid is the login uid pam_loginuid sets at SSH login, and sudo and su leave
+## it alone - so the first pair still attributes a `sudo` command to the agent.
+## The euid pair catches processes running as the agent that did not come from
+## a login of its own (`sudo -u {{ agent_user }}` from the admin account).
+##
+## exit!=-ENOENT drops the failed attempts of a $PATH search: execvp tries each
+## directory in turn, and every miss would otherwise be a line in the log.
+## Other failures - EACCES above all - are kept.
+##
+## b32 exists because an x86_64 kernel still runs i386 binaries, whose execve
+## is a different syscall number the b64 rules never see.
+{% set arches = ['b64', 'b32'] if ansible_facts['architecture'] == 'x86_64' else ['b64'] %}
+{% for field in ['auid', 'euid'] %}
+{% for arch in arches %}
+-a always,exit -F arch={{ arch }} -S execve,execveat -F {{ field }}={{ agent_user }} -F exit!=-ENOENT -k {{ agent_audit_key }}
+{% endfor %}
+{% endfor %}

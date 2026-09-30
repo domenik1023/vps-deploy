@@ -12,6 +12,8 @@
 #                  root out
 #   30 packages    installs python3-debian, which deb822_repository in
 #                  62_docker.yml and roles/crowdsec both need
+#   31 agent       the AI agent account must exist before 42_ssh.yml names it
+#                  in AllowUsers, and auditctl resolves it by name
 #   40 firewall    the bootstrap allow and the limit on the new SSH port must
 #                  exist before 42 moves sshd
 #   42 ssh         moves sshd mid-play and records the new port with set_fact
@@ -48,6 +50,11 @@
   ansible.builtin.include_tasks:
     file: 30_packages.yml
   tags: [packages]
+
+- name: Include AI agent account tasks
+  ansible.builtin.include_tasks:
+    file: 31_agent.yml
+  tags: [agent]
 
 - name: Include firewall tasks
   ansible.builtin.include_tasks:

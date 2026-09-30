@@ -1,0 +1,105 @@
+# --- AI agent account and its command log ---
+# A login for an AI agent, and a record of every program it starts: auditd
+# audits each execve made under the agent's login uid, a small auditd plugin
+# turns those into one JSON line per command in agent_command_log, and the
+# Alloy play ships that file to Loki as job="integrations/agent". See
+# docs/agent.md; the switches are in group_vars/all/10_agent.yml.
+#
+# After 30_packages.yml, which has just refreshed the apt cache, and before
+# 42_ssh.yml, whose AllowUsers names this account - sshd would refuse the
+# agent's key otherwise.
+#
+# Audited in the kernel rather than from the shell, deliberately. An agent
+# rarely has an interactive shell at all: it sends `ssh agent@host '<cmd>'`,
+# and PROMPT_COMMAND, history files and pam_tty_audit all only see
+# interactive terminals. The kernel sees every execve, from any shell, script
+# or interpreter, and the agent cannot opt out of it without root.
+
+- name: AI agent account and command audit
+  when: agent_user_manage | bool
+  block:
+    # python3-audit is libauparse's binding; the plugin uses it to reassemble
+    # the several records one command becomes and to decode hex-encoded
+    # arguments, rather than parsing the audit format itself.
+    - name: Install auditd and the auparse Python bindings
+      ansible.builtin.apt:
+        name:
+          - auditd
+          - python3-audit
+        state: present
+
+    # No password: useradd leaves the account locked, and it logs in by key.
+    - name: Ensure the agent account exists
+      ansible.builtin.user:
+        name: "{{ agent_user }}"
+        shell: /bin/bash
+        create_home: true
+
+    - name: Install the agent's authorized keys
+      ansible.posix.authorized_key:
+        user: "{{ agent_user }}"
+        key: "{{ agent_ssh_keys | join('\n') }}"
+        exclusive: true
+        state: present
+      when: agent_ssh_keys | length > 0
+
+    - name: Allow the agent passwordless sudo
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ agent_user }}"
+        content: "{{ agent_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+      when: agent_sudo | bool
+
+    # Explicitly removed rather than left alone, so turning agent_sudo off
+    # actually takes the privilege away again.
+    - name: Remove the agent's sudo rule
+      ansible.builtin.file:
+        path: "/etc/sudoers.d/{{ agent_user }}"
+        state: absent
+      when: not agent_sudo | bool
+
+    - name: Install the agent command log plugin
+      ansible.builtin.template:
+        src: agent-command-log.py.j2
+        dest: /usr/local/sbin/agent-command-log
+        owner: root
+        group: root
+        mode: "0750"
+      notify: Restart auditd
+
+    - name: Register the plugin with auditd
+      ansible.builtin.template:
+        src: agent-command-log.conf.j2
+        dest: /etc/audit/plugins.d/agent-command-log.conf
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Restart auditd
+
+    # Rules name the account rather than its uid; auditctl resolves the name
+    # when it loads them, which is why the account is created first.
+    - name: Audit every program the agent starts
+      ansible.builtin.template:
+        src: agent-audit.rules.j2
+        dest: /etc/audit/rules.d/60-agent.rules
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Restart auditd
+
+    - name: Rotate the agent command log
+      ansible.builtin.template:
+        src: agent-command-log.logrotate.j2
+        dest: /etc/logrotate.d/agent-commands
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure auditd is running
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true

@@ -10,6 +10,7 @@ Hardens a fresh Ubuntu VPS with:
 - Fail2ban as a local backstop behind CrowdSec (bans after 15 failed attempts)
 - CrowdSec agent (log processor) reporting to a central LAPI server, with firewall bouncer pulling shared ban decisions
 - Grafana Alloy telemetry agent pushing metrics, logs, traces and profiles to the central observability stack
+- An `agent` account for an AI agent, with every program it runs audited by the kernel and shipped to Grafana as `integrations/agent`
 - Root account locked (no password, no login shell)
 - Kernel hardening via sysctl (SYN cookies, ASLR, ICMP filtering, anti-spoofing)
 - WireGuard with a kill switch on `vpn` hosts: the default route is the tunnel, and nothing leaves the public interface if it drops
@@ -34,6 +35,7 @@ vps-deploy/
 ├── group_vars/
 │   ├── all/
 │   │   ├── 00_classify.yml           # host_class + the switches deciding which roles run
+│   │   ├── 10_agent.yml              # The AI agent account and its command log
 │   │   └── vault.yml                 # Admin password hash — encrypt with ansible-vault
 │   ├── vps.yml                       # Off-site hosts: the public ingest hostname
 │   ├── vpn.yml                       # Tunnelled hosts: LAN ingest, loose rp_filter
@@ -41,6 +43,7 @@ vps-deploy/
 ├── docs/
 │   ├── crowdsec.md                   # CrowdSec architecture, log sources, troubleshooting
 │   ├── alloy.md                      # Alloy pipelines, ingest hostnames, troubleshooting
+│   ├── agent.md                      # The AI agent account, its command audit, queries
 │   ├── wireguard.md                  # Tunnel setup, the kill switch, recovery
 │   └── opnsense-firewall.md          # Firewall rules for WireGuard peers — not automatic
 ├── host_vars/                        # Optional per-host settings, by name
@@ -60,7 +63,7 @@ vps-deploy/
     │   │   ├── 30_system.yml         # Unattended upgrades
     │   │   └── 40_docker.yml
     │   ├── handlers/
-    │   │   └── main.yml              # Reload systemd / Docker / UFW
+    │   │   └── main.yml              # Reload systemd / auditd / Docker / UFW
     │   ├── templates/                # Free-form file bodies (sshd, systemd, sysctl)
     │   └── tasks/
     │       ├── main.yml              # Task orchestration
@@ -68,6 +71,7 @@ vps-deploy/
     │       ├── 10_hostname.yml       # System hostname = inventory name
     │       ├── 20_user.yml           # Admin user + sudo setup
     │       ├── 30_packages.yml       # apt upgrade + base packages
+│       ├── 31_agent.yml          # AI agent account + auditd command log
     │       ├── 40_firewall.yml       # UFW enable and allow rules
     │       ├── 41_fail2ban.yml       # sshd jail
     │       ├── 42_ssh.yml            # SSH hardening, port move, root lockdown

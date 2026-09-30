@@ -1,0 +1,36 @@
+# --- AI agent account ---
+# A separate login for an AI agent, with every command it runs written to its
+# own log file, which Grafana Alloy ships to Loki as job="integrations/agent".
+# See docs/agent.md.
+#
+# These live in group_vars rather than in roles/baseline's defaults because two
+# plays read them: roles/baseline creates the account and the audit trail, and
+# roles/alloy - in the second play, where baseline's defaults are not visible -
+# decides from the same switch whether to tail the log.
+
+agent_user_manage: true
+agent_user: agent
+
+# Public keys the agent logs in with, one string per key. The list is
+# exclusive: anything else in the agent's authorized_keys is removed, because
+# this account exists only for the agent and nobody should be adding a key to
+# it by hand. Empty means the account exists but nothing can log in to it yet.
+agent_ssh_keys: []
+
+# Passwordless sudo for the agent. Off by default. Commands run through sudo
+# are still logged and still attributed to the agent (the audit rule matches
+# the login uid, which sudo does not change) - but root can also stop auditd
+# and edit the log, so with this on the log is a record of an honest agent,
+# not a tamper-proof one.
+agent_sudo: false
+
+# The file the auditd plugin writes, one JSON object per command. Root-owned
+# and 0640, so the agent itself can neither read nor rewrite its own trail.
+agent_command_log: /var/log/agent-commands.log
+
+# Days of rotated logs kept on the host. Loki holds the long-term copy.
+agent_command_log_retention: 30
+
+# The audit rule key the plugin filters on. Only needs changing if it collides
+# with a rule some other tool installs.
+agent_audit_key: agent_cmd

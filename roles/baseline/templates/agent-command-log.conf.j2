@@ -1,0 +1,8 @@
+# Managed by Ansible - edit roles/baseline/templates/agent-command-log.conf.j2.
+# auditd starts the plugin and feeds it every audit record; it keeps only the
+# ones keyed {{ agent_audit_key }} and writes them to {{ agent_command_log }}.
+active = yes
+direction = out
+path = /usr/local/sbin/agent-command-log
+type = always
+format = string

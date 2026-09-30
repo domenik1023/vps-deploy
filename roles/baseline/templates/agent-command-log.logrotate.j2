@@ -1,0 +1,12 @@
+# Managed by Ansible - edit roles/baseline/templates/agent-command-log.logrotate.j2.
+# No postrotate: the plugin reopens the path by itself once it points at a new
+# inode, and Alloy follows the rotation on its own.
+{{ agent_command_log }} {
+    daily
+    rotate {{ agent_command_log_retention }}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root root
+}
