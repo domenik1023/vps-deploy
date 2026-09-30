@@ -1100,11 +1100,18 @@
           - bringup_argv is search('wg-quick@')
           - bringup_argv is search('wg-killswitch fix-route')
           - bringup_argv.find('wg-quick@') < bringup_argv.find('fix-route')
+          - bringup_task.get('when', '') is search('not ansible_check_mode')
         fail_msg: >-
           "{{ bringup_name }}" must run `systemctl start/restart wg-quick@…`
           and `wg-killswitch fix-route` in the same command, with the tunnel
-          start strictly first. Rendered argv: {{ bringup_argv }}
-        success_msg: "the tunnel starts before fix-route runs, in one remote command"
+          start strictly first, and must skip itself in check mode -
+          `ansible.builtin.command` has no built-in check-mode simulation
+          unlike `systemd_service`, so without `when: not ansible_check_mode`
+          a `--check` run actually moves the default route for real (found
+          the hard way, running `--check` against vpn-gwdg-01 while validating
+          this fix). Rendered argv: {{ bringup_argv }}; when:
+          {{ bringup_task.get('when', 'MISSING') }}
+        success_msg: "the tunnel starts before fix-route runs, in one remote command, and skips itself in --check"
       vars:
         wg_tasks: >-
           {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
