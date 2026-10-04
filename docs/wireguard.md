@@ -333,6 +333,51 @@ on the public interface as soon as the default route is the tunnel — the kerne
 looks for a route back to that source, finds it points down `wg0`, and
 discards the packet before any firewall rule is consulted.
 
+### systemd-networkd will delete wg-quick's rules unless told not to
+
+`systemd-networkd` tracks every `ip rule` and route, and by default deletes
+any it did not create itself — on every reconciliation it runs for a managed
+link. wg-quick's own two `ip rule` entries are exactly that kind of "foreign"
+state. "Every reconciliation" is not rare: any veth going up or down - a
+Docker container restarting - is enough to trigger one, and a single
+crash-looping container does it repeatedly, fast.
+
+Confirmed live on `vpn-gwdg-01`: a crash-looping container's veth churn
+stripped both of wg-quick's rules within minutes of a reboot, while the
+tunnel stayed up and kept handshaking the whole time. That is a silent, total
+defeat of the kill switch - general traffic quietly stops going through the
+tunnel at all and leaves the public interface in the clear, while `wg show`,
+the interface state and the handshake age all keep looking healthy, because
+none of them reflect routing policy.
+
+The fix: `/etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf` sets
+
+```
+[Network]
+ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
+```
+
+and the play restarts `systemd-networkd` to apply it, before `wg-quick` or
+anything else runs on the same play - not deferred to a handler, because it
+has to be in effect before the very first `wg-quick up`, not merely by the
+next run.
+
+### A plain reboot needs its own trigger for fix-route
+
+Only the play, `wg-recover` and the `Reload UFW` handler chain call
+`wg-killswitch fix-route` - none of those run at a plain reboot, and
+`wg-killswitch.service`'s own `on` deliberately does not install the SSH
+routing rule (see above). Confirmed live: a reboot of `vpn-gwdg-01` left no
+SSH `ip rule` at all, because nothing had asked for one since the tunnel came
+up again.
+
+`wg-quick@<iface>.service` gets its own drop-in with
+`ExecStartPost=/usr/local/sbin/wg-killswitch fix-route`, which systemd runs
+strictly after that unit's own `ExecStart` (`wg-quick up`) succeeds - on
+every path that starts or restarts it, boot included, regardless of what else
+happens to be running.
+
 ## What the kill switch blocks
 
 `/usr/local/sbin/wg-killswitch`, run by `wg-killswitch.service`. Nothing leaves
@@ -440,11 +485,13 @@ network anyone creates.
 
 ```bash
 sudo wg show                       # a recent handshake, and transfer in both directions
-ip route get 1.1.1.1               # dev wg0
-ip rule                            # the sport rule (from fix-route) must have a LOWER number than wg-quick's two rules - it is computed to be one below them, so this should always hold; if it doesn't, fix-route ran before wg-quick, not after
+ip route get 1.1.1.1               # dev wg0 - if this names the public interface instead, wg-quick's own rules are gone (see systemd-networkd below), not just the kill switch's
+ip rule                            # must show wg-quick's two rules (not fwmark / suppress_prefixlength) AND the sport rule one below them - missing wg-quick's own is the networkd issue, missing just the sport one is the fix-route issue
 sudo iptables -S WG-KILLSWITCH-OUT # RETURNs, then one DROP at the end
 sudo iptables -t mangle -S | grep KILLSWITCH
 sudo sysctl net.ipv4.conf.all.rp_filter    # 2 on a [vpn] host
+systemctl cat systemd-networkd.conf.d/99-wireguard-foreign-rules.conf   # ManageForeignRoutingPolicyRules=no, ManageForeignRoutes=no
+systemctl cat wg-quick@wg0.service | grep ExecStartPost                 # the fix-route drop-in
 ```
 
 From a container, that its egress goes through the tunnel and not around it:
@@ -545,6 +592,9 @@ Common causes, in the order they are worth checking:
 | SSH dies the moment the route moves | check `ip rule show \| grep sport` for a rule matching `ssh_port`, and that its priority number is LOWER than wg-quick's two rules (`not fwmark …` / `suppress_prefixlength 0`) - if it's missing, or higher, `fix-route` either didn't run or ran before `wg-quick up`; run `sudo /usr/local/sbin/wg-killswitch fix-route` by hand to fix it immediately, then check why it didn't happen automatically. Also confirm `sysctl_rp_filter` is 2 |
 | `ip rule` shows a rule matching the SSH port that's higher (later) than wg-quick's own | `fix-route` computed against a stale picture - most likely it ran once, then something restarted wg-quick without calling `fix-route` again (wg-quick's rules moved, ours didn't follow). `sudo /usr/local/sbin/wg-killswitch fix-route` re-derives it against current state; if this recurs, something is restarting `wg-quick@<iface>` outside the paths that already call `fix-route` (the play, `wg-recover`) |
 | `wg show` reports exactly one completed handshake and then nothing, ever — no rekeys, no keepalives, no traffic | the signature of the old CONNMARK-based mechanism, if a host is somehow still running a script from before it was replaced (see "How the routing works" above). Confirm with `iptables -t mangle -S`: if `WG-KILLSWITCH-MARK`/`WG-KILLSWITCH-RESTORE` still exist, the host has an outdated script — re-run the play (or `wg-recover`) to deploy the current one, which also cleans those chains up. This reads exactly like a problem on the WireGuard server and is not one |
+| tunnel up, handshaking fine, traffic just isn't going through it — `ping`/anything general fails or goes straight out the public interface instead | `ip rule show` is probably missing wg-quick's own two rules (`not fwmark …` / `suppress_prefixlength 0`), not just the kill switch's. `systemd-networkd` deletes any `ip rule`/route it did not create itself on every link reconciliation — any container restarting is enough to trigger one — unless told not to; confirm `systemctl cat systemd-networkd.conf.d/99-wireguard-foreign-rules.conf` shows `ManageForeignRoutingPolicyRules=no` and `ManageForeignRoutes=no`, and that `systemctl status systemd-networkd` shows it active since that config was written. If the override is missing or was never applied, the kill switch's whole point — forcing everything through the tunnel — is silently not happening, while every other signal (interface state, handshake age, transfer counters) keeps looking healthy, because none of them reflect routing policy at all. Re-run the play to install and apply it |
+| after a reboot, SSH to the public address hangs even though `wg show` looks fine | nothing calls `wg-killswitch fix-route` on a plain reboot except the drop-in on `wg-quick@<iface>.service` (`ExecStartPost=`) — if that drop-in is missing (`systemctl cat wg-quick@<iface>.service` should show it under `# /etc/systemd/system/wg-quick@<iface>.service.d/override.conf`), re-run the play to install it. Until then, `sudo /usr/local/sbin/wg-killswitch fix-route` by hand restores it immediately |
+| `journalctl -b` shows `Found ordering cycle: ... after wg-killswitch.service/start after docker.service/start ...` | an outdated `wg-killswitch.service` still combining `Before=network-pre.target` with `After=docker.service` — contradictory, and systemd silently drops one of the two on every boot rather than erroring. Re-run the play to deploy the current unit file, which drops `After=docker.service` (safe: `DOCKER-USER` is never flushed by dockerd after its first creation, so nothing here actually depended on strict Docker ordering) |
 | Alloy fails to install on the first run | same as "nothing routes": its release is fetched through the tunnel |
 | telemetry never arrives | `wg_dns` is not set, so the ingest hostname does not resolve — see `group_vars/vpn.yml` |
 | host loses its address after a day | DHCP is being blocked; check the kill switch's DHCP exceptions survived an edit |

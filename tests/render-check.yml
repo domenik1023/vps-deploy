@@ -43,6 +43,9 @@
     wg_recover_template: ../roles/wireguard/templates/wg-recover.j2
     wg_tunnel_check_template: ../roles/wireguard/templates/wg-tunnel-check.j2
     wg_rollback_now_template: ../roles/wireguard/templates/wg-rollback-now.j2
+    killswitch_service_template: ../roles/wireguard/templates/wg-killswitch.service.j2
+    wg_quick_fixroute_template: ../roles/wireguard/templates/wg-quick-fixroute.conf.j2
+    wg_networkd_override_template: ../roles/wireguard/templates/wg-networkd-foreign-rules.conf.j2
 
     # The [lapi] group, read out of the inventory rather than named here, so
     # adding a second delegation-only host does not need a change below.
@@ -1044,6 +1047,130 @@
         recover_task: >-
           {{ wg_tasks | selectattr('name', 'equalto', 'Install the manual recovery script')
              | first | default({}, true) }}
+
+    # Nothing calls `wg-killswitch fix-route` on a plain reboot otherwise -
+    # only the play, wg-recover and the Reload UFW handler chain do, and none
+    # of those run at boot. ExecStartPost on wg-quick@<iface>.service's own
+    # drop-in is what closes that gap: it is strictly ordered after this
+    # unit's ExecStart (wg-quick up) succeeds, on every path that starts or
+    # restarts it, boot included. Confirmed missing live: a reboot of
+    # vpn-gwdg-01 left no SSH routing rule at all, because nothing had called
+    # fix-route since the tunnel came up.
+    - name: The wg-quick unit must get a fix-route drop-in so a plain reboot positions the SSH rule too
+      ansible.builtin.assert:
+        that:
+          - dir_task != {}
+          - dir_task.get('ansible.builtin.file', {}).get('path', '') is search('wg-quick@.*\.service\.d$')
+          - dir_task.get('ansible.builtin.file', {}).get('state', '') == 'directory'
+          - dropin_task != {}
+          - dropin_task.get('ansible.builtin.template', {}).get('dest', '') is search('wg-quick@.*\.service\.d/override\.conf$')
+          - fixroute_rendered is search('ExecStartPost=/usr/local/sbin/wg-killswitch fix-route')
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must create
+          /etc/systemd/system/wg-quick@<iface>.service.d and install an
+          override.conf there whose ExecStartPost runs
+          `wg-killswitch fix-route` - without it, only Ansible-driven paths
+          ever position the SSH routing rule, and a plain reboot does not.
+          Found dir={{ dir_task != {} }}, dropin={{ dropin_task != {} }}.
+        success_msg: "wg-quick@<iface>.service.d/override.conf runs fix-route via ExecStartPost"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        dir_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Ensure the wg-quick drop-in directory exists')
+             | first | default({}, true) }}
+        dropin_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the automatic fix-route drop-in on wg-quick')
+             | first | default({}, true) }}
+        fixroute_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_quick_fixroute_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+
+    # systemd-networkd deletes any `ip rule`/route it did not create itself,
+    # by default, on every reconciliation - and wg-quick's own two `ip rule`
+    # entries are exactly that kind of "foreign" state. Confirmed live:
+    # vpn-gwdg-01's crash-looping container triggered this repeatedly via its
+    # veth churn, stripping wg-quick's rules within minutes while the tunnel
+    # stayed up and kept handshaking the whole time - a silent, total defeat
+    # of the kill switch with every surface signal still looking healthy.
+    # Must be applied - restarted, not just written to disk - before
+    # wg-quick ever runs on this same play, which is why the restart task is
+    # unconditional on the write having changed, not deferred to a handler
+    # that would only fire at the very end of the play.
+    - name: Networkd must be told not to delete wg-quick's foreign ip rules and routes
+      ansible.builtin.assert:
+        that:
+          - override_rendered is search('ManageForeignRoutingPolicyRules=no')
+          - override_rendered is search('ManageForeignRoutes=no')
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf'
+          - restart_task != {}
+          - restart_task.get('ansible.builtin.systemd_service', {}).get('name', '') == 'systemd-networkd'
+          - restart_task.get('ansible.builtin.systemd_service', {}).get('state', '') == 'restarted'
+          - at.install >= 0
+          - at.restart >= 0
+          - at.install < at.restart
+          - at.restart < at.wireguard_install
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must install
+          /etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf with
+          both ManageForeignRoutingPolicyRules=no and
+          ManageForeignRoutes=no, then restart systemd-networkd, strictly
+          before "Install WireGuard" (or any earlier use of wg-quick) runs on
+          this same play - found install={{ at.install }},
+          restart={{ at.restart }}, wireguard install={{ at.wireguard_install }}.
+        success_msg: "systemd-networkd's foreign-rule management is disabled before wg-quick ever runs"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        override_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_networkd_override_template, template_vars={}) }}
+        install_name: "Stop systemd-networkd from deleting wg-quick's foreign ip rules and routes"
+        restart_name: "Restart systemd-networkd to apply the foreign-rule override"
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', install_name)
+             | first | default({}, true) }}
+        restart_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', restart_name)
+             | first | default({}, true) }}
+        at:
+          install: "{{ names.index(install_name) if install_name in names else -1 }}"
+          restart: "{{ names.index(restart_name) if restart_name in names else -1 }}"
+          wireguard_install: >-
+            {{ names.index('Install WireGuard') if 'Install WireGuard' in names else -1 }}
+
+    # The ordering cycle itself: Before=network-pre.target (very early boot)
+    # and After=docker.service (which transitively wants
+    # network-online.target) are contradictory, and systemd silently breaks
+    # the cycle by dropping one of the two constraints - unpredictably, so
+    # the Docker ordering this used to promise never reliably held. Removing
+    # After=docker.service is safe because DOCKER-USER is a hook chain
+    # dockerd creates once and never flushes again - see
+    # wg-killswitch.service.j2's header - so nothing here actually depended
+    # on strict ordering relative to Docker in the first place.
+    - name: The kill switch unit must not create an ordering cycle with Docker
+      ansible.builtin.assert:
+        that:
+          - directive_lines | select('match', '^After=docker\.service$') | list | length == 0
+          - service_rendered is search('Before=network-pre.target')
+        fail_msg: >-
+          wg-killswitch.service.j2 must not combine
+          Before=network-pre.target with After=docker.service - that
+          combination is a real systemd ordering cycle (logged at every
+          boot as "Found ordering cycle: ... after wg-killswitch.service/start
+          after docker.service/start ... after network-online.target"), which
+          systemd resolves by silently and unpredictably dropping one
+          constraint. Before=network-pre.target must stay, for the
+          fail-closed guarantee; After=docker.service must not come back.
+        success_msg: "no ordering cycle between the kill switch and Docker"
+      vars:
+        service_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_service_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+        directive_lines: "{{ service_rendered.splitlines() | map('trim') | list }}"
 
     # "Bring up the tunnel" moves the default route as a side effect of the
     # very command Ansible is waiting on a reply to, over the connection that

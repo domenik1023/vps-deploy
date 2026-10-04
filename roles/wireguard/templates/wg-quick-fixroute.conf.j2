@@ -1,0 +1,18 @@
+# Managed by Ansible - roles/wireguard/templates/wg-quick-fixroute.conf.j2.
+# Drop-in on wg-quick@{{ wg_interface }}.service.
+#
+# Without this, nothing calls `wg-killswitch fix-route` on a plain reboot -
+# only the play, wg-recover and the Reload UFW handler chain do, and none of
+# those run at boot. A cold boot would bring wg-quick up with its own
+# kernel-assigned ip rule priorities and never position the kill switch's SSH
+# rule below them at all - see wg-killswitch.j2's header for why that
+# priority cannot be a fixed number and has to be computed after wg-quick has
+# already run.
+#
+# ExecStartPost runs as part of this unit's own start sequence, strictly
+# after ExecStart (wg-quick up) succeeds and before systemd reports the unit
+# active - so this is correctly ordered on every path that starts or restarts
+# wg-quick@{{ wg_interface }}.service, boot included, with no dependency on
+# which other units or Ansible tasks happen to run around it.
+[Service]
+ExecStartPost=/usr/local/sbin/wg-killswitch fix-route

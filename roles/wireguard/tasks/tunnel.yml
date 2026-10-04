@@ -57,6 +57,45 @@
       are OPNsense's own, and wg_generate_key should be true for every
       OPNsense-backed host - see docs/wireguard.md.
 
+# --- KEEP SYSTEMD-NETWORKD FROM UNDOING WG-QUICK'S ROUTING ---
+# Before anything else in this file, and before wg-quick ever runs for the
+# first time on this run: systemd-networkd deletes any `ip rule`/route it did
+# not create itself by default, on every reconciliation it runs for a managed
+# link - and a container restarting (any veth going up or down) is enough to
+# trigger one. wg-quick's own two `ip rule` entries are exactly the kind of
+# "foreign" state that gets stripped. Confirmed live: on vpn-gwdg-01, a
+# crash-looping container's veth churn stripped both of wg-quick's rules
+# within minutes of boot while the tunnel stayed up and kept handshaking the
+# whole time - every signal looked healthy while general traffic quietly
+# stopped going through the tunnel at all. See wg-networkd-foreign-rules.conf.j2.
+- name: Ensure the networkd.conf.d directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/networkd.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stop systemd-networkd from deleting wg-quick's foreign ip rules and routes
+  ansible.builtin.template:
+    src: wg-networkd-foreign-rules.conf.j2
+    dest: /etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: wg_networkd_override
+
+# Applied immediately, not deferred to a handler at the end of the play: the
+# whole point is that this must be in effect before wg-quick first runs below
+# on this run, not just by the next run or the next reboot. A plain daemon
+# restart does not drop existing links/addresses; it only changes which
+# future reconciliations networkd performs.
+- name: Restart systemd-networkd to apply the foreign-rule override
+  ansible.builtin.systemd_service:
+    name: systemd-networkd
+    state: restarted
+  when: wg_networkd_override.changed
+
 # Which interface reaches the internet without the tunnel.
 #
 # Read from the default route in the **main** routing table, and every word of
@@ -353,6 +392,29 @@
     owner: root
     group: root
     mode: "0755"
+
+# Makes `wg-killswitch fix-route` run automatically after every start of
+# wg-quick@{{ wg_interface }}.service - boot included, where nothing else
+# calls it at all (only the play, wg-recover and the Reload UFW handler
+# chain do, and none of those run at boot). ExecStartPost is strictly ordered
+# after this unit's own ExecStart (wg-quick up), so it is correct regardless
+# of what else happens to be running. See wg-quick-fixroute.conf.j2.
+- name: Ensure the wg-quick drop-in directory exists
+  ansible.builtin.file:
+    path: "/etc/systemd/system/wg-quick@{{ wg_interface }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the automatic fix-route drop-in on wg-quick
+  ansible.builtin.template:
+    src: wg-quick-fixroute.conf.j2
+    dest: "/etc/systemd/system/wg-quick@{{ wg_interface }}.service.d/override.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
 
 # The rollback below disables both units rather than stopping them, so that a
 # reboot cannot re-apply the thing that locked the host out - see the note on

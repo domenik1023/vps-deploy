@@ -430,6 +430,56 @@ points down `wg0` and discards the packet before any firewall rule is
 consulted. The kernel takes `max(all, <iface>)` for this, which is why `all`
 and `default` move together.
 
+**`systemd-networkd` deletes any `ip rule`/route it did not create itself, by
+default, on every reconciliation it runs for a managed link.** wg-quick's own
+two `ip rule` entries are exactly that kind of "foreign" state, and "every
+reconciliation" is not rare: any veth going up or down - a container
+restarting - is enough to trigger one. Confirmed live on `vpn-gwdg-01`: a
+single crash-looping container's veth churn stripped both of wg-quick's rules
+within minutes of boot, while the tunnel stayed up and kept handshaking the
+whole time. The result is a silent, total defeat of the kill switch - general
+traffic quietly stops going through the tunnel at all and leaves the public
+interface in the clear, while `wg show`, the interface state and the handshake
+age all keep looking healthy, because none of them reflect routing policy at
+all. `tunnel.yml` installs
+`/etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf`
+(`ManageForeignRoutingPolicyRules=no`, `ManageForeignRoutes=no`) and restarts
+`systemd-networkd` to apply it - both before `wg-quick` or anything else runs
+on the same play, not deferred to a handler, because the whole point is that
+it has to be in effect before the first `wg-quick up` on this run, not merely
+by the next one.
+
+**Nothing calls `wg-killswitch fix-route` on a plain reboot otherwise.** Only
+the play, `wg-recover` and the `Reload UFW` handler chain call it, and none of
+those run at boot - `wg-killswitch.service`'s own `on` only installs the
+filter/DROP/MSS-clamp rules, deliberately not the SSH routing rule (see
+above). Confirmed live: a reboot of `vpn-gwdg-01` left no SSH `ip rule` at all,
+because nothing had asked for one since the tunnel last came up.
+`wg-quick@{{ wg_interface }}.service` gets its own drop-in
+(`wg-quick-fixroute.conf.j2`) with `ExecStartPost=.../wg-killswitch fix-route`,
+which systemd runs strictly after this unit's own `ExecStart` (`wg-quick up`)
+succeeds, on every path that starts or restarts it - boot included, and
+regardless of what else is running, since it is part of the unit's own start
+sequence rather than a separate trigger that has to be ordered against it.
+
+**`wg-killswitch.service`'s own unit file used to combine
+`Before=network-pre.target` with `After=docker.service`, and that is a real
+ordering cycle** - `network-pre.target` is very early boot,
+`docker.service` transitively wants `network-online.target`, which wants
+`network.target`, which wants `systemd-networkd.service`, which wants
+`network-pre.target` - closing the loop. systemd detects this at every boot
+(`Found ordering cycle: network-online.target/start after ... after
+wg-killswitch.service/start after docker.service/start ... after
+network-online.target`) and silently breaks it by dropping one of the two
+constraints, which one is not guaranteed - meaning the Docker ordering this
+used to promise never actually held, on any boot. Removing
+`After=docker.service` is safe: `DOCKER-USER` is a hook chain dockerd creates
+once and is documented to never flush again on later starts, and the script
+already creates the chain itself if Docker has not run yet
+(`-N DOCKER-USER 2>/dev/null || true`) and re-inserts its own jump at position
+1 every time it runs (`ensure_jump`'s delete-then-insert-at-top) - so whichever
+of the two starts first, the result is identical.
+
 A rollback is armed with `systemd-run --on-active` before anything moves and
 cancelled only after the host has answered *and* the tunnel has handshaked. It
 retreats to the pre-tunnel state rather than just dropping rules, so a reboot
