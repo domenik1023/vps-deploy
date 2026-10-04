@@ -6,11 +6,25 @@ Documentation=file:///usr/local/sbin/wg-killswitch
 DefaultDependencies=no
 Before=network-pre.target
 Wants=network-pre.target
-# DOCKER-USER is where container traffic is filtered, and it only exists once
-# dockerd has built its rules. The script creates the chain if it is missing so
-# that boot ordering cannot leave a gap, but running after Docker when Docker
-# is there keeps the rule out of Docker's way.
-After=docker.service
+# No After=docker.service here on purpose - it used to be here, and it was
+# wrong: Before=network-pre.target (very early boot) and After=docker.service
+# (which transitively wants network-online.target) are contradictory, and
+# systemd detects the resulting ordering cycle at every boot
+# ("Found ordering cycle: network-online.target/start after ... after
+# wg-killswitch.service/start after docker.service/start - after
+# network-online.target") and silently breaks it by dropping one of the two
+# constraints - which one is not guaranteed, so the ordering this used to
+# promise never actually held.
+#
+# It is not needed anyway. DOCKER-USER is a hook chain dockerd creates once
+# and is documented to never flush again on later starts - that stability is
+# the entire reason tools like this one are safe adding rules to it at all,
+# regardless of boot order. The script creates the chain itself if Docker
+# has not run yet (`-N DOCKER-USER 2>/dev/null || true`) and inserts its own
+# jump at position 1 every time (`ensure_jump`'s delete-then-insert-at-top),
+# so whichever of the two starts first, the result is the same: our jump ends
+# up at the top of DOCKER-USER, regardless of what either side added before
+# or after.
 Conflicts=shutdown.target
 
 [Service]

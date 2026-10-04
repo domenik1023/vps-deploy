@@ -4,8 +4,8 @@
 # No FwMark here on purpose. wg-quick picks its own, at run time: with a /0 in
 # AllowedIPs it takes the first free routing table from 51820 up and sets the
 # interface fwmark to match, overriding whatever this file asked for. The kill
-# switch therefore uses a mark of its own, on a bit wg-quick does not touch -
-# see wg_killswitch_mark in defaults/main.yml.
+# switch does not need a mark of its own at all - see wg-killswitch.j2, which
+# routes SSH's own traffic by source port instead.
 [Interface]
 Address = {{ wg_address }}
 PrivateKey = {{ wg_private_key_resolved }}

@@ -22,3 +22,18 @@
     name: wg-killswitch
     state: restarted
   when: wireguard_manage | bool and wg_killswitch | bool
+
+# `ufw reload` itself does not touch `ip rule` - iptables-restore only flushes
+# iptables chains - but the restart above does: wg-killswitch's `off` deletes
+# the SSH routing rule and `on` does not re-add it any more (see
+# wg-killswitch.j2 - only `fix-route` does, and only because it can see
+# wg-quick's actual, already-running rules to stay below). Without this, every
+# ufw rule change on a [vpn] host - LAN boxes included, since
+# docker_host_access_cidrs adds one there - would silently remove SSH's own
+# escape route and never put it back. wg-quick is not being restarted here,
+# so its rules have not moved; fix-route only needs to reassert against them.
+- name: Re-position the kill switch's SSH rule below the tunnel's own
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/wg-killswitch, fix-route]
+  changed_when: true
+  when: wireguard_manage | bool and wg_killswitch | bool

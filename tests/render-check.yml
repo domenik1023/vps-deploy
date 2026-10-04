@@ -40,6 +40,12 @@
     # variable, so its assertions render it here instead of reading a value.
     alloy_template: ../roles/alloy/templates/config.alloy.j2
     killswitch_template: ../roles/wireguard/templates/wg-killswitch.j2
+    wg_recover_template: ../roles/wireguard/templates/wg-recover.j2
+    wg_tunnel_check_template: ../roles/wireguard/templates/wg-tunnel-check.j2
+    wg_rollback_now_template: ../roles/wireguard/templates/wg-rollback-now.j2
+    killswitch_service_template: ../roles/wireguard/templates/wg-killswitch.service.j2
+    wg_quick_fixroute_template: ../roles/wireguard/templates/wg-quick-fixroute.conf.j2
+    wg_networkd_override_template: ../roles/wireguard/templates/wg-networkd-foreign-rules.conf.j2
 
     # The [lapi] group, read out of the inventory rather than named here, so
     # adding a second delegation-only host does not need a change below.
@@ -162,75 +168,58 @@
       vars:
         private_cidr: '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9./]*$'
 
-    # The mark is used as its own mask, in `--set-xmark M/M`,
-    # `--restore-mark --nfmask M --ctmask M` and `ip rule fwmark M/M`. A value
-    # with more than one bit set still works there, but the point of the mask
-    # is to leave every other bit alone - wg-quick sets its own fwmark on the
-    # encrypted packets it sends, and clearing that routes the tunnel's traffic
-    # back into the tunnel. One bit, and above any routing table number
-    # wg-quick would pick (it counts up from 51820 = 0xca6c).
-    - name: The kill switch mark must be a single bit clear of wg-quick's fwmark
+    # wg-quick's own rules do not get a fixed priority at all - it adds them
+    # with no `priority` argument, and the kernel's rule for that is
+    # (lowest priority currently in use) - 1. That makes any STATIC priority
+    # for the kill switch's own rule inherently racy: whatever number is
+    # installed before wg-quick runs is exactly what wg-quick's rules land
+    # one below, every time - confirmed against a real kernel (see
+    # tests/killswitch-netns.sh) and, before that, live on vpn-gwdg-01, twice.
+    # So there must be no static priority left to assert a ceiling on; this
+    # asserts the opposite property instead - that the priority is computed
+    # from `ip rule show` at run time, in a function that only ever runs
+    # after `wg-quick up`.
+    - name: The kill switch's SSH rule priority must be computed, not configured
       ansible.builtin.assert:
         that:
-          - wg_killswitch_mark is match('^0x[1248]0*$')
-          - wg_killswitch_mark | int(base=16) > 65535
+          - "'wg_killswitch_rule_priority' not in role_defaults"
+          - killswitch_rendered is search('fix_route\(\)')
+          - killswitch_rendered is search('ip -"\$fam" rule show')
+          - killswitch_rendered is search('sort -n')
+          - killswitch_rendered is search('lowest - 1')
+          - killswitch_rendered is not search('PRIO=')
         fail_msg: >-
-          wg_killswitch_mark ({{ wg_killswitch_mark }}) must be a single bit
-          written in hex - 0x1, 0x2, 0x4, 0x8 and those followed by zeros - and
-          must sit above 0xffff so it cannot collide with the routing table
-          number wg-quick derives its own fwmark from.
+          wg-killswitch.j2 must compute the SSH rule's priority at run time
+          from `ip rule show` (one below the current lowest), never from a
+          configured wg_killswitch_rule_priority - a static number is exactly
+          what wg-quick's own kernel-assigned rules undercut, every time.
+        success_msg: "the SSH rule's priority is computed from ip rule show, not configured"
+      vars:
+        role_defaults: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/defaults/main.yml')
+             | from_yaml }}
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
 
-    # wg-quick's own rules are NOT reliably at 32764/32765 - that was this
-    # repo's original assumption, from upstream's documented default, and a
-    # real deployment (vpn-gwdg-01) showed them installed at 29998/29999
-    # instead. A kill switch rule at or above whatever wg-quick actually picks
-    # is never consulted, and the symptom is not a firewall error - it is an
-    # SSH session that hangs the moment the default route moves, on a host
-    # whose console is at the provider, with the mangle chains showing
-    # correct, nonzero packet counters the whole time (confirmed on that
-    # incident: the mark was being set and restored fine, and still lost the
-    # `ip rule` race). Since there is no fixed number to check against, this
-    # asserts a low ceiling instead - comfortably below both the old
-    # assumption and the observed real value - rather than trusting either.
-    - name: The kill switch ip rule priority stays low, not just below the old assumption
-      ansible.builtin.assert:
-        that:
-          - wg_killswitch_rule_priority | int > 0
-          - wg_killswitch_rule_priority | int < 10000
-        fail_msg: >-
-          wg_killswitch_rule_priority ({{ wg_killswitch_rule_priority }}) must
-          be between 1 and 9999. wg-quick's own rule priority is not fixed and
-          has been observed as low as 29999 in a real deployment - a kill
-          switch rule anywhere near that range risks losing the `ip rule` race
-          and never sending inbound replies back out the public interface.
-          Check `ip rule` on the actual host if you need to verify this rather
-          than trusting a number here.
-
-    # Lowering wg_killswitch_rule_priority only helps if the old rule actually
-    # goes away. Both deletes used to pin `priority "$PRIO"`, which meant a rule
-    # this script had left at some *earlier* value was never matched: `on` added
-    # the new rule beside the stale one and `off` removed only the new one. On a
-    # host carrying a stale 30000 from before the default was lowered, that is
-    # the rule sitting above wg-quick's own - so it wins the race and inbound
-    # replies go into the tunnel, which is the whole failure the priority change
-    # was meant to fix. It cost a live debugging session on wings-p01.
-    #
-    # tests/killswitch-netns.sh proves the behaviour against a real kernel by
-    # planting a rule at 30000 first; this keeps the shape from regressing in CI
-    # where namespaces may be unavailable.
-    - name: The kill switch must delete its ip rule by mark, not by priority
+    # fix_route() must delete any rule it (or an earlier run) left behind by
+    # selector - protocol and port - not by priority, because it computes a
+    # fresh priority every time it runs and there is no fixed value left to
+    # match a stale rule against.
+    - name: The kill switch must delete its SSH rule by selector, not by priority
       ansible.builtin.assert:
         that:
           - rule_deletes | length == 2
           - rule_deletes | select('search', 'priority') | list | length == 0
-          - killswitch_rendered is search('rule add fwmark "\$MARK/\$MARK" table main priority "\$PRIO"')
         fail_msg: >-
-          The kill switch's `ip rule del` must match on the mark alone so that
-          a rule left at an earlier wg_killswitch_rule_priority is removed too.
+          fix_route()'s `ip rule del` must match on ipproto/sport alone.
           Found {{ rule_deletes | length }} delete(s),
           {{ rule_deletes | select('search', 'priority') | list | length }} of
           them pinned to a priority: {{ rule_deletes | join(' | ') }}
-        success_msg: "the ip rule is deleted by mark and added at the configured priority"
+        success_msg: "the SSH rule is deleted by selector alone"
       vars:
         killswitch_vars:
           wg_wan_interface_resolved: eth0
@@ -240,14 +229,69 @@
                     template_vars=killswitch_vars) }}
         rule_deletes: >-
           {{ killswitch_rendered.splitlines()
-             | select('search', 'rule del fwmark') | map('trim') | list }}
+             | select('search', 'rule del ipproto tcp sport') | map('trim') | list }}
+
+    # fix_route() must exclude the kernel's own built-in priorities (0 local,
+    # 32766 main, 32767 default) from what it considers "the current lowest" -
+    # those are always present and never what it needs to stay below; the
+    # thing that matters is wg-quick's own two rules, whatever the kernel gave
+    # them. Including the built-ins would make fix_route() compute against
+    # 32766/32767 forever and never actually react to wg-quick at all.
+    - name: The kill switch must exclude the kernel built-in priorities from its floor
+      ansible.builtin.assert:
+        that:
+          - killswitch_rendered is search("\\(0\\|32766\\|32767\\)")
+        fail_msg: >-
+          fix_route() must exclude priorities 0, 32766 and 32767 when finding
+          the current lowest `ip rule` priority - without that exclusion it
+          would compute against its own permanent floor instead of reacting
+          to wg-quick's actual rules.
+        success_msg: "the kernel's built-in priorities are excluded from the computed floor"
+      vars:
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
+
+    # No CONNMARK *command* should survive a render outside the cleanup calls
+    # in remove_old_mark_mechanism(), which exist purely to migrate a host
+    # that still has the old chains/rule off them - only that function's
+    # remove_jump/remove_chain calls should be touching them. Matched on the
+    # actual iptables invocation (`-j CONNMARK`), not the bare word, since the
+    # header comments legitimately explain the CONNMARK-based mechanism this
+    # replaced and would otherwise make this assertion vacuous the moment
+    # anyone wrote history down in prose.
+    - name: Nothing may build a CONNMARK rule any more
+      ansible.builtin.assert:
+        that:
+          - connmark_commands | length == 0
+          - killswitch_rendered is search('remove_old_mark_mechanism')
+        fail_msg: >-
+          killswitch_rendered runs `-j CONNMARK`, which means the CONNMARK-based
+          mechanism (replaced by the sport-based ip rule - see CLAUDE.md) has
+          come back: {{ connmark_commands | join(' | ') }}
+        success_msg: "no CONNMARK command is built any more; only its migration cleanup remains"
+      vars:
+        killswitch_vars:
+          wg_wan_interface_resolved: eth0
+          wg_peer_endpoint: "vpn.example.com:51820"
+        killswitch_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_template,
+                    template_vars=killswitch_vars) }}
+        connmark_commands: >-
+          {{ killswitch_rendered.splitlines()
+             | select('search', '-j CONNMARK') | map('trim') | list }}
 
     # The lockout test. Every RETURN in the kill switch's OUTPUT chain has to
     # come before its DROP, because iptables stops at the first match - and the
     # two rules that matter most are the tunnel's own port (without it the
     # tunnel can never come up) and tcp --sport <ssh_port> (which is what keeps
-    # an SSH session alive if the conntrack marking is wrong). Reordering or
-    # dropping either is a trip to the provider's serial console.
+    # an SSH session alive - it is matched on the source port alone, the same
+    # selector the routing rule above uses, with nothing stateful in between to
+    # get out of sync). Reordering or dropping either is a trip to the
+    # provider's serial console.
     - name: The kill switch must let the tunnel and SSH out before it drops
       ansible.builtin.assert:
         that:
@@ -480,6 +524,72 @@
         # as `- role: x` and not the bare `- x` shorthand precisely so this
         # stays readable as data.
         play_roles: "{{ main_play.roles | map(attribute='role') | list }}"
+
+    # `ufw reload` does not touch `ip rule` itself, but restarting wg-killswitch
+    # does: its `off` deletes the SSH routing rule and `on` no longer re-adds
+    # it (see wg-killswitch.j2 - only fix-route can, since only it can see
+    # wg-quick's already-running rules to stay below). Without a handler that
+    # runs fix-route after the restart, every ufw rule change on a [vpn] host -
+    # LAN boxes included, since docker_host_access_cidrs adds one there - would
+    # silently remove SSH's own escape route and never put it back.
+    - name: Reload UFW must reposition the SSH rule after restarting the kill switch
+      ansible.builtin.assert:
+        that:
+          - reposition_name in ufw_notifies
+          - at.restart >= 0
+          - at.reposition >= 0
+          - at.restart < at.reposition
+          - reposition_handler.get('ansible.builtin.command', {}).get('argv', []) == ['/usr/local/sbin/wg-killswitch', 'fix-route']
+        fail_msg: >-
+          Reload UFW must notify "Re-position the kill switch's SSH rule below
+          the tunnel's own", defined after "Restart WireGuard kill switch" in
+          roles/wireguard/handlers/main.yml, running
+          `wg-killswitch fix-route`. Found restart at {{ at.restart }},
+          reposition at {{ at.reposition }}, notified: {{ ufw_notifies }}.
+        success_msg: "Reload UFW restarts the kill switch, then repositions its SSH rule"
+      vars:
+        baseline_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/baseline/handlers/main.yml')
+             | from_yaml }}
+        wg_handlers: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/handlers/main.yml')
+             | from_yaml }}
+        reload_ufw: "{{ baseline_handlers | selectattr('name', 'equalto', 'Reload UFW') | first }}"
+        ufw_notifies: >-
+          {{ reload_ufw.notify if reload_ufw.notify is sequence
+             and reload_ufw.notify is not string else [reload_ufw.notify] }}
+        wg_handler_names: "{{ wg_handlers | map(attribute='name') | list }}"
+        reposition_name: "Re-position the kill switch's SSH rule below the tunnel's own"
+        reposition_handler: >-
+          {{ wg_handlers | selectattr('name', 'equalto', reposition_name)
+             | first | default({}, true) }}
+        at:
+          restart: >-
+            {{ wg_handler_names.index('Restart WireGuard kill switch')
+               if 'Restart WireGuard kill switch' in wg_handler_names else -1 }}
+          reposition: >-
+            {{ wg_handler_names.index(reposition_name)
+               if reposition_name in wg_handler_names else -1 }}
+
+    # wg-recover restarts both units by hand - fix-route has to follow the
+    # tunnel restart for the same reason it follows "Bring up the tunnel" in
+    # the play: wg-quick's rules only exist, at their real priority, once it
+    # has actually run.
+    - name: The recovery script must fix the route after restarting the tunnel, not before
+      ansible.builtin.assert:
+        that:
+          - recover_rendered is search('fix-route')
+          - recover_rendered.find('restart "$WG_UNIT"') >= 0
+          - recover_rendered.find('restart "$WG_UNIT"') < recover_rendered.find('fix-route')
+        fail_msg: >-
+          wg-recover.j2 must call `wg-killswitch fix-route` after restarting
+          $WG_UNIT, not before - wg-quick's own ip rules only exist, at their
+          real priority, once it has actually run.
+        success_msg: "wg-recover fixes the route after the tunnel restart"
+      vars:
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars={'wg_interface': 'wg0', 'wg_rollback_delay': '5min'}) }}
 
     # Three tasks in 42_ssh.yml's hardening block have to stay in this order,
     # and the failure is the same each time: the run stops half way through
@@ -741,6 +851,404 @@
           {{ lookup('ansible.builtin.template',
                     '../roles/wireguard/templates/wg.conf.j2',
                     template_vars=wg_conf_vars) }}
+
+    # A rollback disables wg-quick@<iface> and wg-killswitch on purpose, so a
+    # reboot cannot re-apply what locked the host out - see docs/wireguard.md.
+    # "Apply the kill switch" and "Bring up the tunnel" both already repair
+    # that by setting enabled: true, so this is not about whether the host
+    # ends up correct - it always would. It is about whether a run against a
+    # rolled-back host says so, instead of looking identical to an ordinary
+    # run: that silence is exactly what let a rolled-back tunnel run for two
+    # weeks on both [vpn] hosts before anyone noticed, because bringing it up
+    # by hand with `systemctl start` looks fine and never recreates the boot
+    # symlink.
+    - name: A rollback-disabled tunnel or kill switch must be reported before it is silently re-enabled
+      ansible.builtin.assert:
+        that:
+          - at.check >= 0
+          - check_argv[:2] == ['systemctl', 'is-enabled']
+          - check_loop | select('search', '^wg-quick@') | list | length == 1
+          - check_loop | select('equalto', 'wg-killswitch') | list | length == 1
+          - report_task != {}
+          - report_when is search('disabled')
+          - at.check < at.apply_killswitch
+          - at.check < at.bring_up
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must check `systemctl is-enabled`
+          on both wg-quick@{{ '{{ wg_interface }}' }} and wg-killswitch, and
+          report one that comes back disabled, before either "Apply the kill
+          switch" or "Bring up the tunnel" re-enables it. Task indices
+          (-1/9999 mean missing): check={{ at.check }},
+          apply_killswitch={{ at.apply_killswitch }}, bring_up={{ at.bring_up }}.
+        success_msg: "a rolled-back tunnel or kill switch is detected and reported before either is re-enabled"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        n_check: Check whether a rollback previously disabled the tunnel units
+        n_report: Report a host that a rollback left disabled
+        n_apply_killswitch: Apply the kill switch
+        n_bring_up: Bring up the tunnel
+        check_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', n_check) | first | default({}, true) }}
+        # .get() with the key spelled out, never map(attribute='a.b.c') -
+        # Jinja reads the dots as nested access and would quietly find nothing.
+        check_argv: "{{ check_task.get('ansible.builtin.command', {}).get('argv', []) }}"
+        check_loop: "{{ check_task.get('loop', []) }}"
+        report_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', n_report) | first | default({}, true) }}
+        report_when: "{{ report_task.get('when', '') }}"
+        at:
+          check: "{{ names.index(n_check) if n_check in names else -1 }}"
+          apply_killswitch: "{{ names.index(n_apply_killswitch) if n_apply_killswitch in names else 9999 }}"
+          bring_up: "{{ names.index(n_bring_up) if n_bring_up in names else 9999 }}"
+
+    # wg-killswitch is Type=oneshot, RemainAfterExit=yes, so `systemctl start`
+    # or `enable --now` on a unit systemd still considers active from an
+    # earlier run is a no-op: it never re-runs the script, so anything that
+    # drifted since - a stray `ip rule` added by hand while debugging, say -
+    # is never cleaned up. wg-recover exists specifically to not make that
+    # mistake, so it has to actually use `restart`, not `start`, on both
+    # units, or it is exactly as unsafe as the `systemctl enable --now`
+    # sequence it replaces docs/wireguard.md's advice to run by hand.
+    - name: The recovery script must restart, not start, both units
+      ansible.builtin.assert:
+        that:
+          - recover_rendered is search('systemctl restart "\$KS_UNIT"')
+          - recover_rendered is search('systemctl restart "\$WG_UNIT"')
+          - recover_rendered is not search('enable --now "\$KS_UNIT"')
+          - recover_rendered is not search('enable --now "\$WG_UNIT"')
+          - recover_rendered is search('systemd-run')
+        fail_msg: >-
+          wg-recover.j2 must `systemctl restart` (never `start` or
+          `enable --now`) both wg-killswitch and wg-quick@<iface>, and must
+          arm its own rollback with systemd-run before touching either -
+          otherwise it is no safer than the raw systemctl commands it exists
+          to replace.
+        success_msg: "wg-recover restarts both units and arms its own rollback"
+      vars:
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars=wg_recover_vars) }}
+        wg_recover_vars:
+          wg_interface: wg0
+          wg_rollback_delay: 5min
+
+    # The automatic rollback (tasks/tunnel.yml) and the manual one (wg-recover)
+    # used to each spell out "disable both units, then wg-killswitch off"
+    # inline, and a change to one while forgetting the other would have been
+    # silent until the day it mattered. Both now call the same installed
+    # script, so there is exactly one place that knows what "revert" means.
+    - name: The automatic and manual rollbacks must share one script, not duplicate it
+      ansible.builtin.assert:
+        that:
+          - rollback_now_rendered is search('systemctl disable --now "wg-quick@wg0"')
+          - rollback_now_rendered is search('systemctl disable --now wg-killswitch')
+          - rollback_now_rendered is search('wg-killswitch off')
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-rollback-now'
+          - at.install >= 0
+          - at.install < at.arm
+          - "'/usr/local/sbin/wg-rollback-now' in arm_task.get('ansible.builtin.command', {}).get('argv', [])"
+          - recover_rendered is search('wg-rollback-now')
+          - recover_rendered is not search('disable --now')
+        fail_msg: >-
+          wg-rollback-now must be installed (found
+          {{ 'yes' if install_task != {} else 'NO' }}) before "Arm the
+          automatic rollback" runs it (install at {{ at.install }}, arm at
+          {{ at.arm }}), and wg-recover.j2 must invoke the same script rather
+          than duplicating `disable --now` inline - a fix applied to only one
+          of the two would silently not apply to the other.
+        success_msg: "the automatic and manual rollbacks both call the one shared script"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        rollback_now_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_rollback_now_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the rollback script')
+             | first | default({}, true) }}
+        arm_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Arm the automatic rollback')
+             | first | default({}, true) }}
+        at:
+          install: "{{ names.index('Install the rollback script') if 'Install the rollback script' in names else -1 }}"
+          arm: "{{ names.index('Arm the automatic rollback') if 'Arm the automatic rollback' in names else 9999 }}"
+        recover_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_recover_template,
+                    template_vars={'wg_interface': 'wg0', 'wg_rollback_delay': '5min'}) }}
+
+    # The whole point of this script is to say something instead of letting a
+    # rolled-back tunnel run silent until the next scheduled reboot - so it has
+    # to actually check both units, and it has to fail (exit non-zero) when
+    # either is wrong, which is what makes wg-tunnel-check.service show up as
+    # failed to node_exporter's systemd collector. A version that only checks
+    # one unit, or that always exits 0, would pass every render check that
+    # only looked at its existence rather than its content.
+    - name: The tunnel health check must check both units and fail loudly
+      ansible.builtin.assert:
+        that:
+          - check_rendered is search("KS_UNIT='wg-killswitch'")
+          - check_rendered is search("WG_UNIT='wg-quick@wg0'")
+          - check_rendered is search('is-enabled')
+          - check_rendered is search('is-active')
+          - check_rendered is search('exit 1')
+        fail_msg: >-
+          wg-tunnel-check.j2 must check systemctl is-enabled and is-active for
+          both wg-killswitch and wg-quick@<iface>, and exit non-zero when
+          either is wrong - a version that always exits 0 is silent about the
+          exact failure it exists to catch.
+        success_msg: "wg-tunnel-check checks both units and exits non-zero on a problem"
+      vars:
+        check_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_tunnel_check_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+
+    # These three tasks are what actually deploys the check above; a template
+    # that is correct but never installed, or a timer that is never enabled,
+    # is exactly as silent as having neither.
+    - name: The tunnel health check must be installed, enabled and running on a timer
+      ansible.builtin.assert:
+        that:
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-tunnel-check'
+          - timer_task != {}
+          - timer_task.get('ansible.builtin.template', {}).get('dest', '') == '/etc/systemd/system/wg-tunnel-check.timer'
+          - enable_task != {}
+          - enable_task.get('ansible.builtin.systemd_service', {}).get('name', '') == 'wg-tunnel-check.timer'
+          - enable_task.get('ansible.builtin.systemd_service', {}).get('enabled', false) | bool
+          - recover_task != {}
+          - recover_task.get('ansible.builtin.template', {}).get('dest', '') == '/usr/local/sbin/wg-recover'
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must install wg-tunnel-check to
+          /usr/local/sbin/wg-tunnel-check, install and enable
+          wg-tunnel-check.timer, and install wg-recover to
+          /usr/local/sbin/wg-recover. Found install={{ install_task != {} }},
+          timer={{ timer_task != {} }}, enable={{ enable_task != {} }},
+          recover={{ recover_task != {} }}.
+        success_msg: "wg-tunnel-check and wg-recover are installed and the check timer is enabled"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the tunnel health check script')
+             | first | default({}, true) }}
+        timer_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the tunnel health check timer')
+             | first | default({}, true) }}
+        enable_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Enable the tunnel health check timer')
+             | first | default({}, true) }}
+        recover_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the manual recovery script')
+             | first | default({}, true) }}
+
+    # Nothing calls `wg-killswitch fix-route` on a plain reboot otherwise -
+    # only the play, wg-recover and the Reload UFW handler chain do, and none
+    # of those run at boot. ExecStartPost on wg-quick@<iface>.service's own
+    # drop-in is what closes that gap: it is strictly ordered after this
+    # unit's ExecStart (wg-quick up) succeeds, on every path that starts or
+    # restarts it, boot included. Confirmed missing live: a reboot of
+    # vpn-gwdg-01 left no SSH routing rule at all, because nothing had called
+    # fix-route since the tunnel came up.
+    - name: The wg-quick unit must get a fix-route drop-in so a plain reboot positions the SSH rule too
+      ansible.builtin.assert:
+        that:
+          - dir_task != {}
+          - dir_task.get('ansible.builtin.file', {}).get('path', '') is search('wg-quick@.*\.service\.d$')
+          - dir_task.get('ansible.builtin.file', {}).get('state', '') == 'directory'
+          - dropin_task != {}
+          - dropin_task.get('ansible.builtin.template', {}).get('dest', '') is search('wg-quick@.*\.service\.d/override\.conf$')
+          - fixroute_rendered is search('ExecStartPost=/usr/local/sbin/wg-killswitch fix-route')
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must create
+          /etc/systemd/system/wg-quick@<iface>.service.d and install an
+          override.conf there whose ExecStartPost runs
+          `wg-killswitch fix-route` - without it, only Ansible-driven paths
+          ever position the SSH routing rule, and a plain reboot does not.
+          Found dir={{ dir_task != {} }}, dropin={{ dropin_task != {} }}.
+        success_msg: "wg-quick@<iface>.service.d/override.conf runs fix-route via ExecStartPost"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        dir_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Ensure the wg-quick drop-in directory exists')
+             | first | default({}, true) }}
+        dropin_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', 'Install the automatic fix-route drop-in on wg-quick')
+             | first | default({}, true) }}
+        fixroute_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_quick_fixroute_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+
+    # systemd-networkd deletes any `ip rule`/route it did not create itself,
+    # by default, on every reconciliation - and wg-quick's own two `ip rule`
+    # entries are exactly that kind of "foreign" state. Confirmed live:
+    # vpn-gwdg-01's crash-looping container triggered this repeatedly via its
+    # veth churn, stripping wg-quick's rules within minutes while the tunnel
+    # stayed up and kept handshaking the whole time - a silent, total defeat
+    # of the kill switch with every surface signal still looking healthy.
+    # Must be applied - restarted, not just written to disk - before
+    # wg-quick ever runs on this same play, which is why the restart task is
+    # unconditional on the write having changed, not deferred to a handler
+    # that would only fire at the very end of the play.
+    - name: Networkd must be told not to delete wg-quick's foreign ip rules and routes
+      ansible.builtin.assert:
+        that:
+          - override_rendered is search('ManageForeignRoutingPolicyRules=no')
+          - override_rendered is search('ManageForeignRoutes=no')
+          - install_task != {}
+          - install_task.get('ansible.builtin.template', {}).get('dest', '') == '/etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf'
+          - restart_task != {}
+          - restart_task.get('ansible.builtin.systemd_service', {}).get('name', '') == 'systemd-networkd'
+          - restart_task.get('ansible.builtin.systemd_service', {}).get('state', '') == 'restarted'
+          - at.install >= 0
+          - at.restart >= 0
+          - at.install < at.restart
+          - at.restart < at.wireguard_install
+        fail_msg: >-
+          roles/wireguard/tasks/tunnel.yml must install
+          /etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf with
+          both ManageForeignRoutingPolicyRules=no and
+          ManageForeignRoutes=no, then restart systemd-networkd, strictly
+          before "Install WireGuard" (or any earlier use of wg-quick) runs on
+          this same play - found install={{ at.install }},
+          restart={{ at.restart }}, wireguard install={{ at.wireguard_install }}.
+        success_msg: "systemd-networkd's foreign-rule management is disabled before wg-quick ever runs"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        override_rendered: >-
+          {{ lookup('ansible.builtin.template', wg_networkd_override_template, template_vars={}) }}
+        install_name: "Stop systemd-networkd from deleting wg-quick's foreign ip rules and routes"
+        restart_name: "Restart systemd-networkd to apply the foreign-rule override"
+        install_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', install_name)
+             | first | default({}, true) }}
+        restart_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', restart_name)
+             | first | default({}, true) }}
+        at:
+          install: "{{ names.index(install_name) if install_name in names else -1 }}"
+          restart: "{{ names.index(restart_name) if restart_name in names else -1 }}"
+          wireguard_install: >-
+            {{ names.index('Install WireGuard') if 'Install WireGuard' in names else -1 }}
+
+    # The ordering cycle itself: Before=network-pre.target (very early boot)
+    # and After=docker.service (which transitively wants
+    # network-online.target) are contradictory, and systemd silently breaks
+    # the cycle by dropping one of the two constraints - unpredictably, so
+    # the Docker ordering this used to promise never reliably held. Removing
+    # After=docker.service is safe because DOCKER-USER is a hook chain
+    # dockerd creates once and never flushes again - see
+    # wg-killswitch.service.j2's header - so nothing here actually depended
+    # on strict ordering relative to Docker in the first place.
+    - name: The kill switch unit must not create an ordering cycle with Docker
+      ansible.builtin.assert:
+        that:
+          - directive_lines | select('match', '^After=docker\.service$') | list | length == 0
+          - service_rendered is search('Before=network-pre.target')
+        fail_msg: >-
+          wg-killswitch.service.j2 must not combine
+          Before=network-pre.target with After=docker.service - that
+          combination is a real systemd ordering cycle (logged at every
+          boot as "Found ordering cycle: ... after wg-killswitch.service/start
+          after docker.service/start ... after network-online.target"), which
+          systemd resolves by silently and unpredictably dropping one
+          constraint. Before=network-pre.target must stay, for the
+          fail-closed guarantee; After=docker.service must not come back.
+        success_msg: "no ordering cycle between the kill switch and Docker"
+      vars:
+        service_rendered: >-
+          {{ lookup('ansible.builtin.template', killswitch_service_template,
+                    template_vars={'wg_interface': 'wg0'}) }}
+        directive_lines: "{{ service_rendered.splitlines() | map('trim') | list }}"
+
+    # "Bring up the tunnel" moves the default route as a side effect of the
+    # very command Ansible is waiting on a reply to, over the connection that
+    # command is about to disrupt - a lost reply then reports the task failed
+    # even when the tunnel came up fine. async + poll: 0 stops this task
+    # waiting for that reply at all; "Wait for the host to answer" right after
+    # it is what actually needs the connection back, and it already retries a
+    # fresh one for up to 60s rather than assuming the one already open
+    # survives.
+    - name: Bring up the tunnel must not wait on the connection it disrupts
+      ansible.builtin.assert:
+        that:
+          - bringup_task != {}
+          - "'async' in bringup_task"
+          - bringup_task.get('async', '') | string | length > 0
+          - bringup_task.get('poll', 1) | int == 0
+          - at.bringup >= 0
+          - at.bringup < at.wait
+        fail_msg: >-
+          "{{ bringup_name }}" must set async (a positive number of seconds)
+          and poll: 0, and must come before "Wait for the host to answer with
+          the tunnel up" - found async={{ bringup_task.get('async', 'unset') }}
+          poll={{ bringup_task.get('poll', 'unset') }},
+          bringup at {{ at.bringup }}, wait at {{ at.wait }}. Waiting
+          synchronously on this task's own reply is exactly what let a route
+          change disrupt the SSH connection its own acknowledgement needed.
+        success_msg: "Bring up the tunnel fires async and does not wait on its own disruption"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        names: "{{ wg_tasks | map(attribute='name') | list }}"
+        bringup_name: Bring up the tunnel and position the kill switch's SSH rule below it
+        bringup_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', bringup_name)
+             | first | default({}, true) }}
+        at:
+          bringup: "{{ names.index(bringup_name) if bringup_name in names else -1 }}"
+          wait: >-
+            {{ names.index('Wait for the host to answer with the tunnel up')
+               if 'Wait for the host to answer with the tunnel up' in names else 9999 }}
+
+    # fix-route has to run after `wg-quick up`, in the exact same remote
+    # command - not a separate Ansible task, which would need its own SSH
+    # round trip on a connection that may already be mid-transition, and not
+    # before, which is the bug that actually broke SSH: wg-quick's own rules
+    # get a kernel-assigned priority of (whatever is currently lowest) - 1, so
+    # fix-route has nothing correct to compute until wg-quick has already run.
+    - name: Bring up the tunnel must start wg-quick before fixing the route, in one command
+      ansible.builtin.assert:
+        that:
+          - bringup_task != {}
+          - bringup_argv is search('systemctl')
+          - bringup_argv is search('wg-quick@')
+          - bringup_argv is search('wg-killswitch fix-route')
+          - bringup_argv.find('wg-quick@') < bringup_argv.find('fix-route')
+          - bringup_task.get('when', '') is search('not ansible_check_mode')
+        fail_msg: >-
+          "{{ bringup_name }}" must run `systemctl start/restart wg-quick@…`
+          and `wg-killswitch fix-route` in the same command, with the tunnel
+          start strictly first, and must skip itself in check mode -
+          `ansible.builtin.command` has no built-in check-mode simulation
+          unlike `systemd_service`, so without `when: not ansible_check_mode`
+          a `--check` run actually moves the default route for real (found
+          the hard way, running `--check` against vpn-gwdg-01 while validating
+          this fix). Rendered argv: {{ bringup_argv }}; when:
+          {{ bringup_task.get('when', 'MISSING') }}
+        success_msg: "the tunnel starts before fix-route runs, in one remote command, and skips itself in --check"
+      vars:
+        wg_tasks: >-
+          {{ lookup('ansible.builtin.file', '../roles/wireguard/tasks/tunnel.yml')
+             | from_yaml }}
+        bringup_name: Bring up the tunnel and position the kill switch's SSH rule below it
+        bringup_task: >-
+          {{ wg_tasks | selectattr('name', 'equalto', bringup_name)
+             | first | default({}, true) }}
+        bringup_argv: >-
+          {{ bringup_task.get('ansible.builtin.command', {}).get('argv', []) | join(' ') }}
 
     - name: The cscli prefix must stay a list
       # If Ansible ever stops preserving the native type here, this becomes the

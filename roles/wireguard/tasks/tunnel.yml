@@ -57,6 +57,45 @@
       are OPNsense's own, and wg_generate_key should be true for every
       OPNsense-backed host - see docs/wireguard.md.
 
+# --- KEEP SYSTEMD-NETWORKD FROM UNDOING WG-QUICK'S ROUTING ---
+# Before anything else in this file, and before wg-quick ever runs for the
+# first time on this run: systemd-networkd deletes any `ip rule`/route it did
+# not create itself by default, on every reconciliation it runs for a managed
+# link - and a container restarting (any veth going up or down) is enough to
+# trigger one. wg-quick's own two `ip rule` entries are exactly the kind of
+# "foreign" state that gets stripped. Confirmed live: on vpn-gwdg-01, a
+# crash-looping container's veth churn stripped both of wg-quick's rules
+# within minutes of boot while the tunnel stayed up and kept handshaking the
+# whole time - every signal looked healthy while general traffic quietly
+# stopped going through the tunnel at all. See wg-networkd-foreign-rules.conf.j2.
+- name: Ensure the networkd.conf.d directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/networkd.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Stop systemd-networkd from deleting wg-quick's foreign ip rules and routes
+  ansible.builtin.template:
+    src: wg-networkd-foreign-rules.conf.j2
+    dest: /etc/systemd/networkd.conf.d/99-wireguard-foreign-rules.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: wg_networkd_override
+
+# Applied immediately, not deferred to a handler at the end of the play: the
+# whole point is that this must be in effect before wg-quick first runs below
+# on this run, not just by the next run or the next reboot. A plain daemon
+# restart does not drop existing links/addresses; it only changes which
+# future reconciliations networkd performs.
+- name: Restart systemd-networkd to apply the foreign-rule override
+  ansible.builtin.systemd_service:
+    name: systemd-networkd
+    state: restarted
+  when: wg_networkd_override.changed
+
 # Which interface reaches the internet without the tunnel.
 #
 # Read from the default route in the **main** routing table, and every word of
@@ -343,6 +382,77 @@
   register: wg_killswitch_unit
   notify: Reload systemd
 
+# The one script that knows how to revert to the pre-tunnel state, shared by
+# the automatic rollback armed below and by wg-recover (installed further
+# down) - see wg-rollback-now.j2. Installed here, before either caller can run.
+- name: Install the rollback script
+  ansible.builtin.template:
+    src: wg-rollback-now.j2
+    dest: /usr/local/sbin/wg-rollback-now
+    owner: root
+    group: root
+    mode: "0755"
+
+# Makes `wg-killswitch fix-route` run automatically after every start of
+# wg-quick@{{ wg_interface }}.service - boot included, where nothing else
+# calls it at all (only the play, wg-recover and the Reload UFW handler
+# chain do, and none of those run at boot). ExecStartPost is strictly ordered
+# after this unit's own ExecStart (wg-quick up), so it is correct regardless
+# of what else happens to be running. See wg-quick-fixroute.conf.j2.
+- name: Ensure the wg-quick drop-in directory exists
+  ansible.builtin.file:
+    path: "/etc/systemd/system/wg-quick@{{ wg_interface }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the automatic fix-route drop-in on wg-quick
+  ansible.builtin.template:
+    src: wg-quick-fixroute.conf.j2
+    dest: "/etc/systemd/system/wg-quick@{{ wg_interface }}.service.d/override.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+# The rollback below disables both units rather than stopping them, so that a
+# reboot cannot re-apply the thing that locked the host out - see the note on
+# "Arm the automatic rollback". That is also the trap: bringing the tunnel
+# back up by hand with `systemctl start` or `wg-quick up` works fine and never
+# recreates the boot symlink, so the host runs for weeks looking healthy and
+# then loses the tunnel silently at the next reboot, with nothing in
+# `journalctl -u wg-quick@{{ wg_interface }} -b` to explain why - the unit was
+# never asked to start.
+#
+# "Apply the kill switch" and "Bring up the tunnel" below both already set
+# `enabled: true` and will repair this. The point of checking here, first, is
+# to say so - a run against a rolled-back host should be visibly different
+# from an ordinary one, not indistinguishable from it.
+- name: Check whether a rollback previously disabled the tunnel units
+  ansible.builtin.command:
+    argv: [systemctl, is-enabled, "{{ item }}"]
+  loop:
+    - "wg-quick@{{ wg_interface }}"
+    - wg-killswitch
+  register: wg_rollback_check
+  changed_when: false
+  failed_when: false
+
+- name: Report a host that a rollback left disabled
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item }} is disabled on {{ inventory_hostname }}. This run will
+      enable and restart it, but that is what the automatic rollback leaves
+      behind when it fires - see "If it goes wrong" in docs/wireguard.md.
+      Bringing the tunnel up by hand since then (`systemctl start` or
+      `wg-quick up`) would have looked fine while quietly losing the tunnel
+      again at the next reboot.
+  loop: "{{ wg_rollback_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout | trim == 'disabled'
+
 # A run that armed the timer and then failed before cancelling it leaves the
 # unit behind, and systemd-run refuses to reuse a name that is still there -
 # stopped or failed. Clear both, or every subsequent run arms nothing and
@@ -379,12 +489,7 @@
       - systemd-run
       - "--on-active={{ wg_rollback_delay }}"
       - "--unit=wg-rollback"
-      - /bin/bash
-      - -c
-      - >-
-        systemctl disable --now wg-quick@{{ wg_interface }};
-        systemctl disable --now wg-killswitch;
-        /usr/local/sbin/wg-killswitch off
+      - /usr/local/sbin/wg-rollback-now
   changed_when: true
   when: not ansible_check_mode
 
@@ -408,12 +513,54 @@
 # wg-quick's own unit reads the config once, at start. A changed config needs a
 # restart rather than a reload, and restarting it is what moves the default
 # route on the very first run.
-- name: Bring up the tunnel
-  ansible.builtin.systemd_service:
-    name: "wg-quick@{{ wg_interface }}"
-    enabled: true
-    state: "{{ 'restarted' if wg_conf.changed else 'started' }}"
-    daemon_reload: true
+#
+# Bundled with `wg-killswitch fix-route` in the same remote command,
+# deliberately not two Ansible tasks. wg-quick adds its own two `ip rule`
+# entries with no explicit priority, and the kernel's rule for that is
+# (lowest priority currently in use) - 1 - not a fixed number, and lower than
+# whatever the kill switch's SSH rule already held, every time. See
+# wg-killswitch.j2's header for the full mechanism. The only stable fix is to
+# let wg-quick run first against nothing of ours in its way, then read where
+# it actually landed and sit below that - which has to happen immediately
+# after `systemctl start` succeeds, in the same shell, because a *second*
+# Ansible task here would need its own SSH round trip on a connection that
+# may already be mid-transition.
+#
+# The whole thing is fired async, poll: 0 - deliberately not waited on. The
+# route move is this command's own side effect, and the acknowledgement this
+# task would otherwise wait for can be lost in that exact transition; a
+# synchronous call has no way to tell "it worked but the reply didn't make it
+# back" apart from "it failed", so it would report the task failed even when
+# the tunnel came up fine. The task below is what actually needs the
+# connection back, and it already retries a fresh one for up to 60s rather
+# than assuming the one already open survives.
+#
+# This does mean a genuine failure to start - bad config, wg-quick erroring
+# out - is not reported here. It still surfaces: no interface means no
+# handshake, and "The tunnel must have handshaked before the rollback is
+# cancelled" below fails exactly as it would have otherwise, with the rollback
+# already armed either way.
+# check_mode: false on `systemd_service` tasks makes them safely report what
+# they would do without acting; `command` has no such simulation - it either
+# runs for real or is skipped outright. Skipped here, deliberately: this is
+# the task that moves the default route, and --check is supposed to be a
+# dry run, not a real cutover. Confirmed the hard way, against the real
+# host, while validating this fix - a --check run with no guard here actually
+# restarted the tunnel.
+- name: Bring up the tunnel and position the kill switch's SSH rule below it
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - >-
+        systemctl daemon-reload &&
+        systemctl enable wg-quick@{{ wg_interface }} &&
+        systemctl {{ 'restart' if wg_conf.changed else 'start' }} wg-quick@{{ wg_interface }} &&
+        /usr/local/sbin/wg-killswitch fix-route
+  async: "{{ wg_bringup_async_timeout }}"
+  poll: 0
+  changed_when: true
+  when: not ansible_check_mode
 
 - name: Wait for the host to answer with the tunnel up
   ansible.builtin.wait_for_connection:
@@ -466,3 +613,62 @@
   changed_when: true
   failed_when: false
   when: not ansible_check_mode
+
+# --- SELF-MONITORING AND MANUAL RECOVERY ---
+# Everything below is day-2 tooling, not part of the risky bring-up sequence
+# above, so it runs after the tunnel is already confirmed working rather than
+# interleaved with it.
+#
+# The rollback disabling both units, rather than stopping them, is correct -
+# see the note on "Arm the automatic rollback". What it does not do on its own
+# is tell anyone: a host recovered with `systemctl start` instead of
+# `enable --now` looks healthy right up until the next scheduled reboot starts
+# neither unit at all, which is how a rolled back tunnel ran silent for two
+# weeks the first time it happened. wg-tunnel-check exists to say so the same
+# day, not two weeks later.
+- name: Install the tunnel health check script
+  ansible.builtin.template:
+    src: wg-tunnel-check.j2
+    dest: /usr/local/sbin/wg-tunnel-check
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the tunnel health check service
+  ansible.builtin.template:
+    src: wg-tunnel-check.service.j2
+    dest: /etc/systemd/system/wg-tunnel-check.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install the tunnel health check timer
+  ansible.builtin.template:
+    src: wg-tunnel-check.timer.j2
+    dest: /etc/systemd/system/wg-tunnel-check.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+  register: wg_tunnel_check_timer
+
+- name: Enable the tunnel health check timer
+  ansible.builtin.systemd_service:
+    name: wg-tunnel-check.timer
+    enabled: true
+    state: "{{ 'restarted' if wg_tunnel_check_timer.changed else 'started' }}"
+    daemon_reload: true
+
+# The safe way to bring the tunnel back up by hand after a rollback -
+# `restart`, not `enable --now`, on wg-killswitch (Type=oneshot,
+# RemainAfterExit=yes means `start` on an already-active unit never re-runs
+# it), and its own rollback armed the same way tasks above do. See
+# wg-recover.j2 and docs/wireguard.md.
+- name: Install the manual recovery script
+  ansible.builtin.template:
+    src: wg-recover.j2
+    dest: /usr/local/sbin/wg-recover
+    owner: root
+    group: root
+    mode: "0755"

@@ -1,0 +1,51 @@
+#!/bin/bash
+# Managed by Ansible - roles/wireguard/templates/wg-tunnel-check.j2. Local
+# edits are overwritten on the next run.
+#
+# Run periodically by wg-tunnel-check.timer. Fixes nothing - it only makes a
+# silently broken tunnel loud, on this box, instead of waiting for someone to
+# notice at the next scheduled reboot.
+#
+# "Disabled" is the specific failure this exists to catch. The automatic
+# rollback in roles/wireguard/tasks/tunnel.yml disables both units on purpose,
+# so a reboot cannot re-apply a lockout - see docs/wireguard.md. That is
+# correct, but it also means a host recovered with `systemctl start` instead
+# of `enable --now` looks perfectly healthy right up until the next scheduled
+# reboot, when nothing starts either unit at all. This is what turned a rolled
+# back tunnel into two weeks of silence the first time it happened.
+#
+# Exits non-zero when something is wrong, which is the point: this unit then
+# shows up as failed in `systemctl status` and in
+# node_systemd_unit_state{name="wg-tunnel-check.service"} - already scraped,
+# since roles/alloy enables the systemd collector - with no change to the
+# Alloy config needed.
+set -euo pipefail
+
+WG_UNIT='wg-quick@{{ wg_interface }}'
+KS_UNIT='wg-killswitch'
+
+problems=0
+
+check_unit() {
+    local unit=$1 enabled active
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    active=$(systemctl is-active "$unit" 2>/dev/null || true)
+    if [ "$enabled" != "enabled" ]; then
+        logger -t wg-tunnel-check -p daemon.err \
+            "$unit is ${enabled:-absent}, not enabled - a rollback likely fired and was never re-enabled. Run wg-recover, or see docs/wireguard.md 'If it goes wrong'."
+        problems=$((problems + 1))
+    elif [ "$active" != "active" ]; then
+        logger -t wg-tunnel-check -p daemon.err \
+            "$unit is enabled but ${active:-absent}, not active."
+        problems=$((problems + 1))
+    fi
+}
+
+check_unit "$WG_UNIT"
+check_unit "$KS_UNIT"
+
+if [ "$problems" -gt 0 ]; then
+    exit 1
+fi
+
+exit 0

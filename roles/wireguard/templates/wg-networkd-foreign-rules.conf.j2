@@ -1,0 +1,30 @@
+# Managed by Ansible - roles/wireguard/templates/wg-networkd-foreign-rules.conf.j2.
+# Drop-in on /etc/systemd/networkd.conf.
+#
+# systemd-networkd defaults both of these to "yes": it tracks every `ip
+# rule`/route and removes any it does not recognise as its own, each time it
+# reconciles a link's state. wg-quick's own two `ip rule` entries (for
+# AllowedIPs = 0.0.0.0/0) and its route in the routing table it picks for
+# itself (the first free one counting up from 51820) are exactly that kind
+# of "foreign" state - networkd never created them, so
+# by default it deletes them on the next reconciliation it runs for any
+# managed link.
+#
+# That reconciliation runs far more often than "never": any veth going up or
+# down - a container restarting - is enough to make networkd re-evaluate, and
+# networkd-dispatcher's own interface-list reload on every such event (logged
+# as "Unknown index N seen, reloading interface list") multiplies it further.
+# A single crash-looping container is enough to strip wg-quick's rules within
+# minutes of boot - confirmed live on vpn-gwdg-01, where the tunnel stayed up
+# and kept handshaking the whole time while general traffic quietly stopped
+# going through it at all, because the `ip rule` that forced it there was
+# gone. That is a silent, total defeat of the kill switch's entire purpose:
+# traffic leaves the public interface in the clear, encrypted to nobody,
+# while every signal that would normally say so - interface state, handshake
+# age, transfer counters - keeps looking healthy.
+#
+# Both settings are global, not per-link, which is why this is
+# networkd.conf.d and not a .network file.
+[Network]
+ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
